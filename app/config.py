@@ -11,9 +11,21 @@ from pydantic_settings import BaseSettings, SettingsConfigDict
 
 
 class Settings(BaseSettings):
+    # 优先从环境变量读（docker compose env_file:已注入），避免容器内读 .env 文件的权限问题。
+    # 本地开发时若有 .env 文件也顺带读（仅当文件可读时）。
     model_config = SettingsConfigDict(
-        env_file=".env", env_file_encoding="utf-8", extra="ignore"
+        env_file=None, env_file_encoding="utf-8", extra="ignore"
     )
+    # 本地开发兜底：若 .env 文件存在且可读，手动加载（容器内只走环境变量）
+    try:
+        from dotenv import dotenv_values as _dv
+        _env_vals = _dv(".env")
+        if _env_vals:
+            for _k, _v in _env_vals.items():
+                if _v is not None and _k not in __import__("os").environ:
+                    __import__("os").environ[_k] = _v
+    except Exception:
+        pass
 
     # 运行环境
     app_env: str = "dev"

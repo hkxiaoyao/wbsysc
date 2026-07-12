@@ -20,9 +20,8 @@ services:
     # 同台部署：容器访问宿主 MySQL（DB_HOST 填 host.docker.internal）
     extra_hosts:
       - "host.docker.internal:host-gateway"
-    volumes:
-      # .env 挂载（含 ADMIN_PASSWORD / DB / 凭证主密钥）
-      - ./.env:/app/.env:ro
+    # 注意：不挂载 .env 文件进容器（避免容器内appuser读文件无权限 + MCP SDK读.env崩）
+    # env_file 已注入环境变量，pydantic-settings 直接从 env 读，绕开文件权限问题
     healthcheck:
       test: ["CMD", "curl", "-fs", "http://localhost:8001/health"]
       interval: 30s
