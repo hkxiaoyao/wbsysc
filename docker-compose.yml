@@ -1,0 +1,36 @@
+# 多租户生产编排
+# 用法：cp .env.prod.example .env.prod && docker compose --env-file .env.prod up -d
+services:
+  wbsysc:
+    build: .
+    image: wbsysc-gateway:latest
+    container_name: wbsysc-gateway
+    restart: unless-stopped
+    env_file:
+      - .env
+    # 生产由 Nginx 反代，容器内只暴露给宿主/内网
+    ports:
+      - "127.0.0.1:8001:8001"
+    # 同台部署：容器访问宿主 MySQL（DB_HOST 填 host.docker.internal）
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+    volumes:
+      # .env 挂载（含 ADMIN_PASSWORD / DB / 凭证主密钥）
+      - ./.env:/app/.env:ro
+    healthcheck:
+      test: ["CMD", "curl", "-fs", "http://localhost:8001/health"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 15s
+    logging:
+      driver: json-file
+      options:
+        max-size: "50m"
+        max-file: "5"
+    networks:
+      - wbsysc-net
+
+networks:
+  wbsysc-net:
+    driver: bridge

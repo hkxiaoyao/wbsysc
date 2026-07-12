@@ -1,0 +1,45 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+venv/
+.venv/
+env/
+ENV/
+*.egg-info/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+
+# 敏感配置（绝不提交）
+.env
+*.local
+secrets/
+credentials/
+
+# IDE
+.vscode/
+.idea/
+*.swp
+
+# OS
+.DS_Store
+Thumbs.db
+
+# 日志
+*.log
+logs/
+
+# 规格工作流临时（按需保留模板）
+# .spec-workflow/  # 如需提交规格可解开
+
+# 前端依赖与构建产物（Dockerfile 会重新构建，不入库）
+admin-ui/node_modules/
+admin-ui/dist/
+app/static/dist/
+
+# 构建产物
+build/
+dist/

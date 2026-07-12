@@ -1,0 +1,37 @@
+# systemd 服务单元（裸机/云主机部署，非 docker）
+# 路径：/etc/systemd/system/wbsysc.service
+# 启用：systemctl daemon-reload && systemctl enable --now wbsysc
+
+[Unit]
+Description=WeCom Data Relay MCP Gateway
+After=network-online.target mysql.service
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=wbsysc
+Group=wbsysc
+WorkingDirectory=/opt/wbsysc
+# .env 由 EnvironmentFile 注入；也可放工作目录由 pydantic-settings 自读
+EnvironmentFile=/opt/wbsysc/.env
+# 单 worker（MCP session 粘性）；生产可加 --loop uvloop --http httptools
+ExecStart=/opt/wbsysc/.venv/bin/uvicorn app.main:app \
+    --host 127.0.0.1 --port 8001 \
+    --workers 1 --no-access-log
+Restart=on-failure
+RestartSec=5s
+# 优雅停止：给同步任务留缓冲
+KillSignal=SIGINT
+TimeoutStopSec=20s
+
+# 资源限制（按需调）
+LimitNOFILE=65536
+MemoryMax=1G
+
+# 输出到 journald
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=wbsysc
+
+[Install]
+WantedBy=multi-user.target
