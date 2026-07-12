@@ -1,9 +1,15 @@
 # 多租户生产编排
-# 用法：cp .env.prod.example .env.prod && docker compose --env-file .env.prod up -d
+# 模式一（推荐）：拉 GHCR 镜像（GitHub Actions 已构建推送）
+#   docker compose -f docker-compose.yml up -d
+# 模式二：本机构建（无 GHCR 时）
+#   docker compose -f docker-compose.yml up -d --build
+# 通过 BUILD_MODE 控制：pull(默认,拉镜像) / build(本机构建)
 services:
   wbsysc:
-    build: .
-    image: wbsysc-gateway:latest
+    # 拉镜像模式：用 GHCR 推送的镜像
+    # 本机构建模式：注释下面 image 取消注释 build
+    image: ghcr.io/hkxiaoyao/wbsysc:latest
+    # build: .
     container_name: wbsysc-gateway
     restart: unless-stopped
     env_file:

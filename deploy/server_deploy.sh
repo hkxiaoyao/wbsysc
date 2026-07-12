@@ -81,8 +81,28 @@ echo "       FLUSH PRIVILEGES;"
 echo "  ③ /etc/mysql/my.cnf 或 mariadb.conf 的 bind-address 改 [IP] 后重启 mysql"
 echo ""
 
-echo "===== 4. 构建镜像（首次约 3-6 分钟） ====="
-docker compose build
+echo "===== 4. 拉取镜像（GitHub Actions 已构建推送到 GHCR） ====="
+# 先试拉（GHCR 公开 package 可匿名拉；私有需 docker login）
+if docker pull ghcr.io/hkxiaoyao/wbsysc:latest 2>&1 | tee /tmp/pull.log | tail -3; then
+  echo "✓ 镜像拉取成功"
+else
+  if grep -qE "unauthorized|forbidden|denied|not found" /tmp/pull.log; then
+    echo "⚠️  GHCR 镜像不可匿名访问。两种解决："
+    echo "  方式A(登录私有package): echo \$GHCR_TOKEN | docker login ghcr.io -u hkxiaoyao --password-stdin"
+    echo "    普通 package 改公开免登录: GitHub package 页→Package settings→Change visibility→Public"
+    echo "  方式B(本机构建): docker compose build"
+    echo "镜像可能还没构建过(需先 push 触发 GitHub Actions)。"
+    read -p "是否本机构建? [y/N] " yn
+    if [ "$yn" = "y" ] || [ "$yn" = "Y" ]; then
+      docker compose build
+    else
+      exit 1
+    fi
+  else
+    docker compose build   # 其他错误兜底本机构建
+  fi
+fi
+docker images | grep wbsysc | head -2
 
 echo ""
 echo "===== 5. 启动 ====="
