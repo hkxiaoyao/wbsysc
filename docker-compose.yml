@@ -14,9 +14,9 @@ services:
     restart: unless-stopped
     env_file:
       - .env
-    # 生产由 Nginx 反代，容器内只暴露给宿主/内网
+    # 生产由 Nginx 反代，但暂用 0.0.0.0 暴露（Nginx/防火墙层可再收紧）
     ports:
-      - "127.0.0.1:8001:8001"
+      - "8001:8001"
     # 同台部署：容器访问宿主 MySQL（DB_HOST 填 host.docker.internal）
     extra_hosts:
       - "host.docker.internal:host-gateway"
