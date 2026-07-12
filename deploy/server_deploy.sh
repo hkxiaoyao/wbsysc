@@ -1,13 +1,19 @@
 #!/bin/bash
 # ============================================================
 # 企微中转 MCP Gateway - 服务器部署脚本
-# 目标机：Linux，MySQL 与应用同台，部署到 /root/app/websysc
-# 用法：在服务器上 bash deploy/server_deploy.sh
+# 目标机：Linux，MySQL 与应用同台
+# 用法：在代码根目录执行 bash deploy/server_deploy.sh
+# 脚本自动定位代码所在目录，无需手动指定路径
 # ============================================================
 set -e
 
-APP_DIR=/root/app/websysc
+# 自动定位：取脚本所在目录的上一层（即代码根目录）
+SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
+APP_DIR="$(cd "$SCRIPT_DIR/.." && pwd)"
 
+echo "代码目录: $APP_DIR"
+
+echo ""
 echo "===== 1. 检查 Docker ====="
 if ! command -v docker &>/dev/null; then
   echo "Docker 未安装，开始安装..."
@@ -19,89 +25,90 @@ fi
 
 if ! docker compose version &>/dev/null; then
   echo "docker compose 插件缺失，安装..."
-  yum install -y docker-compose-plugin 2>/dev/null || apt-get install -y docker-compose-plugin
+  apt-get install -y docker-compose-plugin 2>/dev/null || yum install -y docker-compose-plugin 2>/dev/null
 fi
 
 echo ""
-echo "===== 2. 代码目录 ====="
-mkdir -p /root/app
-cd /root/app
-
-# ===== 3. 代码上传 =====
-# 方式一（推荐）：从 git 仓库拉
-# git clone <你的私有仓库> websysc
-#
-# 方式二（无git）：从开发机 scp 上传
-# 在开发机执行：
-#   scp -r D:/app/wbsysc/app D:/app/wbsysc/admin-ui D:/app/wbsysc/sql \
-#        D:/app/wbsysc/requirements.txt D:/app/wbsysc/Dockerfile \
-#        D:/app/wbsysc/docker-compose.yml D:/app/wbsysc/.dockerignore \
-#        D:/app/wbsysc/.env.prod.example D:/app/wbsysc/deploy \
-#        root@211.159.172.117:/root/app/websysc/
-#
-# 下面的步骤假设代码已在 $APP_DIR
-
+echo "===== 2. 检查代码 ====="
 if [ ! -f "$APP_DIR/Dockerfile" ]; then
-  echo "❌ $APP_DIR 未发现代码，请先按上面方式上传代码"
+  echo "❌ 当前目录未发现 Dockerfile"
+  echo "   请确认在代码根目录执行：cd wbsysc && bash deploy/server_deploy.sh"
+  echo "   当前识别的代码目录: $APP_DIR"
   exit 1
 fi
+echo "✓ 代码就绪"
 
-cd $APP_DIR
+cd "$APP_DIR"
 
 echo ""
-echo "===== 4. 配置环境 ====="
+echo "===== 3. 配置环境 ====="
 if [ ! -f .env ]; then
+  echo "首次运行：生成 .env 模板，请编辑填入真实值后重新运行本脚本"
   cp .env.prod.example .env
-  echo "已生成 .env，请编辑填入真实值后重新运行本脚本"
-  echo "必填项：DB_PASSWORD / ADMIN_PASSWORD / CREDENTIAL_KEY"
-  echo "  CREDENTIAL_KEY 生成: python3 -c \"import secrets;print(secrets.token_urlsafe(48))\""
+  echo ""
+  echo "必填项：DB_PASSWORD / ADMIN_PASSWORD"
+  echo "  ADMIN_PASSWORD = 管理后台登录强密码"
+  echo "  DB_PASSWORD    = MySQL websysc 账户密码（需与 MySQL 一致）"
+  echo "  DB_HOST 已默认 host.docker.internal（同台部署容器访问宿主MySQL）"
+  echo "  CREDENTIAL_KEY 留空，下次运行自动生成"
+  echo ""
+  echo "编辑：vim $APP_DIR/.env"
   exit 0
 fi
+
+# DB_HOST 同台部署用 host.docker.internal（compose 已配 extra_hosts）
+sed -i 's|^DB_HOST=.*|DB_HOST=host.docker.internal|' .env 2>/dev/null || true
 
 # 生成 CREDENTIAL_KEY 若空
 if grep -q "^CREDENTIAL_KEY=$" .env; then
   KEY=$(python3 -c "import secrets;print(secrets.token_urlsafe(48))" 2>/dev/null || openssl rand -base64 48)
   sed -i "s|^CREDENTIAL_KEY=.*|CREDENTIAL_KEY=$KEY|" .env
-  echo "已自动生成 CREDENTIAL_KEY"
+  echo "✓ 已自动生成 CREDENTIAL_KEY"
 fi
 
-# DB_HOST 同台部署用 host.docker.internal（compose 已配 extra_hosts 映射到宿主）
-# MySQL 需 bind-address=0.0.0.0（不能只监听 127.0.0.1），且授权 wbsysc_app@'%' 或 @'172.%'
-sed -i 's|^DB_HOST=.*|DB_HOST=host.docker.internal|' .env 2>/dev/null || true
-
 chmod 600 .env
+echo "✓ .env 已就绪"
 
 echo ""
-echo "===== 4.1 MySQL 访问检查（同台关键） ====="
-echo "需确认宿主 MySQL："
-echo "  ① bind-address = 0.0.0.0（不能只 127.0.0.1）"
-echo "  ② 授权 wbsysc 账户能从容器网段登录："
-echo "     GRANT ... TO 'wbsysc'@'172.%' IDENTIFIED BY '密码';  -- Docker 默认网段"
-echo "     或 TO 'wbsysc'@'%';"
-echo "如报 1130/2003 连接失败，先在宿主跑：mysql -uwebsysc -p -h 127.0.0.1 验证账户通"
-
+echo "===== 3.1 MySQL 同台访问检查（关键） ====="
+echo "容器访问宿主 MySQL 需要："
+echo "  ① MySQL bind-address = 0.0.0.0（非仅 [IP]）"
+echo "  ② 授权 websysc 账户可从容器网段登录："
+echo "     mysql -uroot -p 执行:"
+echo "       ALTER USER 'websysc'@'%' IDENTIFIED BY '你的强密码';"
+echo "       GRANT ALL PRIVILEGES ON *.* TO 'websysc'@'%' WITH GRANT OPTION;"
+echo "       FLUSH PRIVILEGES;"
+echo "  ③ /etc/mysql/my.cnf 或 mariadb.conf 的 bind-address 改 [IP] 后重启 mysql"
 echo ""
-echo "===== 5. 构建镜像（首次约 3-6 分钟） ====="
+
+echo "===== 4. 构建镜像（首次约 3-6 分钟） ====="
 docker compose build
 
 echo ""
-echo "===== 6. 启动 ====="
+echo "===== 5. 启动 ====="
 docker compose up -d
 
 echo ""
-echo "===== 7. 等待健康检查 ====="
+echo "===== 6. 等待健康检查 ====="
 sleep 10
 docker compose ps
 
 echo ""
-echo "===== 8. 验证 ====="
-curl -s http://127.0.0.1:8001/health && echo "" || echo "健康检查未通过，查日志：docker compose logs"
+echo "===== 7. 验证 ====="
+if curl -fs http://127.0.0.1:8001/health 2>/dev/null; then
+  echo ""
+  echo "✅ 部署成功"
+else
+  echo "⚠️  健康检查未通过，查日志："
+  echo "    docker compose logs --tail=50"
+fi
 
 echo ""
 echo "===== 完成 ====="
-echo "管理后台: http://<服务器IP>:8001/admin/ui/  (HTTP，Nginx+HTTPS 需另配)"
-echo "MCP地址:  http://<服务器IP>:8001/mcp         (workbuddy 用 Bearer Token 连)"
-echo "注意: 首次需在容器内跑 tenant_init 接入第一个租户"
-echo "  docker compose exec wbsysc python -m app.tenant_init --tenant-id tenant1 \\"
-echo "    --corpid wwXXX --secret XXX --token <随机串> --contact-secret XXXX \\"
-echo "    --modules report,approval,checkin --display 测试客户1"
+echo "管理后台: http://<服务器IP>:8001/admin/ui/"
+echo "MCP地址:  http://<服务器IP>:8001/mcp   (workbuddy 用 Bearer Token 连)"
+echo ""
+echo "下一步：在容器内接入第一个租户"
+echo "  docker compose exec wbsysc python -m app.tenant_init \\"
+echo "    --tenant-id tenant1 --corpid wwXXX --secret XXX --token <随机串> \\"
+echo "    --contact-secret XXXX --modules report,approval,checkin --display 测试客户1"
