@@ -53,7 +53,7 @@ def create_app() -> FastAPI:
             "scheduler": _scheduler.running if _scheduler else False,
         }
 
-    # 管理后台前端静态文件（构建产物 app/static/dist）
+    # 管理后台前端静态文件（构建产物 app/static/dist）—— 必须在 mcp_glyph 之前注册
     import os
     from fastapi.staticfiles import StaticFiles
     dist_dir = os.path.join(os.path.dirname(__file__), "static", "dist")
@@ -67,7 +67,7 @@ def create_app() -> FastAPI:
     from starlette.routing import Mount
 
     mcp_glyph = Starlette(
-        routes=[Mount("/", app=mcp_app)],
+        routes=[Mount("/", app=mcp_app)],   # mcp_app 内部路由是 /mcp
         middleware=[
             Middleware(BearerTokenMiddleware),
             Middleware(
@@ -79,7 +79,9 @@ def create_app() -> FastAPI:
             ),
         ],
     )
-    app.mount("/", mcp_glyph)
+    # 关键：mcp_glyph 只挂到 /mcp，不挂根 /。
+    # 之前挂根 / 会捕获所有未匹配路径（含 /admin/ui 子资源），导致静态资源被 BearerTokenMiddleware 拦截报 401。
+    app.mount("/mcp", mcp_glyph)
 
     logger.info("MCP Gateway 挂载于 /mcp (Streamable HTTP)，含 Bearer Token 鉴权")
     logger.info("已注册工具: %s", list(mcp._tool_manager._tools.keys()))  # noqa: SLF001
