@@ -1,3 +1,7 @@
+import os
+import runpy
+from pathlib import Path
+
 import pytest
 from pydantic import ValidationError
 from sqlalchemy.engine import URL
@@ -20,15 +24,36 @@ def prod_settings(**overrides):
 @pytest.mark.parametrize(
     ("field", "value", "message"),
     [
-        ("credential_key", "", "CREDENTIAL_KEY"),
         ("admin_password", "CHANGE_ME", "ADMIN_PASSWORD"),
+        ("admin_password", "<强密码，登录管理后台用>", "ADMIN_PASSWORD"),
         ("db_password", "", "DB_PASSWORD"),
+        ("db_password", "<强密码，与开发库不同>", "DB_PASSWORD"),
         ("wecom_use_mock", True, "WECOM_USE_MOCK"),
     ],
 )
 def test_prod_rejects_unsafe_values(field, value, message):
     with pytest.raises(ValidationError, match=message):
         prod_settings(**{field: value})
+
+
+@pytest.mark.parametrize(
+    "value",
+    [
+        "",
+        "   ",
+        "<强随机串>",
+        "k" * 31,
+        "密" * 10,
+    ],
+)
+def test_prod_rejects_unsafe_credential_key(value):
+    with pytest.raises(ValidationError, match="CREDENTIAL_KEY"):
+        prod_settings(credential_key=value)
+
+
+def test_prod_accepts_credential_key_with_at_least_32_utf8_bytes():
+    settings = prod_settings(credential_key="密" * 11)
+    assert len(settings.credential_key.encode("utf-8")) == 33
 
 
 def test_dev_keeps_mock_and_empty_key_fallback():
@@ -40,3 +65,21 @@ def test_db_url_preserves_special_password_characters():
     settings = Settings(app_env="dev", db_password="p@ss:#/word")
     assert isinstance(settings.db_url, URL)
     assert settings.db_url.password == "p@ss:#/word"
+
+
+def test_smoke_import_does_not_mutate_proxy_environment(monkeypatch):
+    proxy_values = {
+        "HTTP_PROXY": "http://upper-http.test",
+        "HTTPS_PROXY": "http://upper-https.test",
+        "http_proxy": "http://lower-http.test",
+        "https_proxy": "http://lower-https.test",
+        "NO_PROXY": "example.test",
+    }
+    for key, value in proxy_values.items():
+        monkeypatch.setenv(key, value)
+    before_import = {key: os.environ.get(key) for key in proxy_values}
+
+    smoke_path = Path(__file__).with_name("test_smoke_client.py")
+    runpy.run_path(str(smoke_path), run_name="smoke_import_test")
+
+    assert {key: os.environ.get(key) for key in proxy_values} == before_import

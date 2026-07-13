@@ -10,11 +10,6 @@ import asyncio
 import os
 import sys
 
-# 强制禁代理（否则 localhost 走系统代理会 502）
-for k in ("HTTP_PROXY", "HTTPS_PROXY", "http_proxy", "https_proxy"):
-    os.environ.pop(k, None)
-os.environ["NO_PROXY"] = "localhost,127.0.0.1"
-
 from mcp.client.session import ClientSession
 from mcp.client.streamable_http import streamablehttp_client
 
@@ -82,6 +77,11 @@ async def test_list_tools_and_call():
 
 
 async def main():
+    # 手工执行时强制禁代理（否则 localhost 走系统代理会 502）。
+    for key in ("HTTP_PROXY", "HTTPS_PROXY", "http_proxy", "https_proxy"):
+        os.environ.pop(key, None)
+    os.environ["NO_PROXY"] = "localhost,127.0.0.1"
+
     ok1 = await test_auth_rejected()
     ok2 = await test_list_tools_and_call()
     print("\n=== 结果 ===")

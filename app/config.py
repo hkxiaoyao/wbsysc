@@ -79,8 +79,14 @@ class Settings(BaseSettings):
         if self.app_env.lower() != "prod":
             return self
         errors = []
-        if not self.credential_key:
-            errors.append("CREDENTIAL_KEY must be set in production")
+        credential_key = self.credential_key.strip()
+        if (
+            credential_key == "<强随机串>"
+            or len(credential_key.encode("utf-8")) < 32
+        ):
+            errors.append(
+                "CREDENTIAL_KEY must be a non-example value of at least 32 UTF-8 bytes in production"
+            )
         if not self.admin_password or self.admin_password in EXAMPLE_PASSWORDS:
             errors.append("ADMIN_PASSWORD must be a non-example value in production")
         if not self.db_password or self.db_password in EXAMPLE_PASSWORDS:
