@@ -45,6 +45,9 @@ class Settings(BaseSettings):
     # 格式 "tokenA:tenantA,tokenB:tenantB"
     mcp_tokens: str = ""
     mcp_base_url: str = "http://localhost:8000"
+    # MCP DNS 重绑定保护允许的 Host（逗号分隔）。空=关闭 Host 校验（适合反代+Bearer）
+    # 例: wbsysc.hacka.cn,mcp.example.com
+    mcp_allowed_hosts: str = ""
 
     # 企微
     wecom_use_mock: bool = True

@@ -9,7 +9,10 @@ from __future__ import annotations
 import json
 import time
 
+from urllib.parse import urlparse
+
 from mcp.server.fastmcp import FastMCP
+from mcp.server.transport_security import TransportSecuritySettings
 
 from .auth import current_ctx, require_tenant
 from .config import get_settings
@@ -19,9 +22,88 @@ from .wecom.mock import (
     MOCK_SMARTTABLE_RECORDS,
 )
 
+
+def _build_transport_security() -> TransportSecuritySettings:
+    """配置 MCP Host/Origin 校验。
+
+    FastMCP 默认 host=127.0.0.1 时会自动只放行 localhost，反代域名会报
+    Invalid Host header (421)。生产在 Nginx 后应显式放行对外域名，或关闭校验
+    （已有 Bearer Token 鉴权）。
+    """
+    s = get_settings()
+    hosts: list[str] = []
+    origins: list[str] = []
+
+    def _host_base(h: str) -> str:
+        h = (h or "").strip().lower().rstrip(".")
+        if h.endswith(":*"):
+            h = h[:-2]
+        if h.startswith("[") and "]" in h:
+            return h[1:h.index("]")]
+        # hostname 或 hostname:port
+        return h.split(":")[0]
+
+    def _is_local_host(h: str) -> bool:
+        return _host_base(h) in ("127.0.0.1", "localhost", "::1")
+
+    def _add_host(h: str) -> None:
+        h = (h or "").strip().lower().rstrip(".")
+        if not h:
+            return
+        if h not in hosts:
+            hosts.append(h)
+        # 兼容带端口的 Host 头
+        if not h.endswith(":*") and ":" not in h.strip("[]"):
+            star = f"{h}:*"
+            if star not in hosts:
+                hosts.append(star)
+        base = _host_base(h)
+        for scheme in ("https", "http"):
+            o = f"{scheme}://{base}"
+            if o not in origins:
+                origins.append(o)
+            star_o = f"{o}:*"
+            if star_o not in origins:
+                origins.append(star_o)
+
+    # 环境变量显式白名单
+    for part in (s.mcp_allowed_hosts or "").split(","):
+        _add_host(part)
+
+    # 从 MCP_BASE_URL 推导
+    if s.mcp_base_url:
+        try:
+            p = urlparse(s.mcp_base_url)
+            if p.hostname:
+                _add_host(p.hostname if not p.port else f"{p.hostname}:{p.port}")
+        except Exception:
+            pass
+
+    # 仅当配置了非本机域名时启用 Host 校验；否则关闭（反代+Bearer 默认可用）
+    external = [h for h in hosts if not _is_local_host(h)]
+    if not external:
+        return TransportSecuritySettings(enable_dns_rebinding_protection=False)
+
+    # 附带本机，方便本地联调
+    for h in ("127.0.0.1", "localhost", "[::1]"):
+        _add_host(h)
+
+    return TransportSecuritySettings(
+        enable_dns_rebinding_protection=True,
+        allowed_hosts=hosts,
+        allowed_origins=origins,
+    )
+
+
 # streamable_http_path="/"：外层 main.py 会 mount 到 /mcp，
 # 若这里仍用默认 "/mcp"，最终变成 /mcp/mcp，WorkBuddy POST /mcp 会 405。
-mcp = FastMCP("wecom-mcp-gateway", streamable_http_path="/")
+# host 不用 127.0.0.1，避免 FastMCP 自动把 allowed_hosts 锁死为 localhost。
+mcp = FastMCP(
+    "wecom-mcp-gateway",
+    streamable_http_path="/",
+    host="0.0.0.0",
+    transport_security=_build_transport_security(),
+)
 
 
 def _use_mock() -> bool:
