@@ -62,6 +62,7 @@ def init_tenant(tenant_id: str, corpid: str, secret: str, mcp_token: str,
             "ADD COLUMN IF NOT EXISTS enabled_modules VARCHAR(64) NOT NULL DEFAULT 'report,approval,checkin'",
             "ADD COLUMN IF NOT EXISTS checkin_userids TEXT NULL",
             "ADD COLUMN IF NOT EXISTS contact_secret_encrypted VARBINARY(512) NULL",
+            "ADD COLUMN IF NOT EXISTS trusted_domain VARCHAR(255) NOT NULL DEFAULT ''",
         ]:
             try:
                 conn.execute(text(f"ALTER TABLE tenant_config {col_ddl}"))

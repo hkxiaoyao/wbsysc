@@ -1,14 +1,16 @@
 import { useEffect, useState } from 'react'
-import { Table, Button, Modal, Form, Input, InputNumber, Select, Switch, Space, Tag, message, Typography } from 'antd'
-import { PlusOutlined, ReloadOutlined, ThunderboltOutlined, EditOutlined, DeleteOutlined, CopyOutlined } from '@ant-design/icons'
+import { Table, Button, Modal, Form, Input, InputNumber, Select, Switch, Space, Tag, message, Typography, Upload } from 'antd'
+import { PlusOutlined, ReloadOutlined, ThunderboltOutlined, EditOutlined, DeleteOutlined, CopyOutlined, GlobalOutlined, UploadOutlined } from '@ant-design/icons'
 import api from '../api.js'
 
-const { Text, Paragraph } = Typography
+const { Text, Paragraph, Link } = Typography
 const MODULES = ['report', 'approval', 'checkin']
 
 function buildMcpConfig(row) {
-  // 用当前站点 origin 拼 MCP 地址，适配直连/反代
-  const origin = window.location.origin
+  // 优先租户可信域名（反代后对外域名），否则当前访问 origin
+  const origin = row.trusted_domain
+    ? `https://${row.trusted_domain}`
+    : window.location.origin
   const serverKey = row.tenant_id || 'wecom-gateway'
   return {
     mcpServers: {
@@ -29,6 +31,9 @@ export default function Tenants() {
   const [modalOpen, setModalOpen] = useState(false)
   const [editing, setEditing] = useState(null)
   const [mcpModal, setMcpModal] = useState({ open: false, title: '', text: '' })
+  const [domainModal, setDomainModal] = useState({
+    open: false, tenant: null, domain: '', fileList: [], uploading: false, info: null,
+  })
   const [form] = Form.useForm()
 
   const load = async () => {
@@ -58,6 +63,7 @@ export default function Tenants() {
       enabled_modules: (row.enabled_modules || '').split(',').filter(Boolean),
       secret: '',          // 编辑时密钥留空=不改
       contact_secret: '',
+      trusted_domain: row.trusted_domain || '',
     })
     setModalOpen(true)
   }
@@ -68,6 +74,7 @@ export default function Tenants() {
       ...v,
       enabled_modules: (v.enabled_modules || []).join(','),
       checkin_userids: v.checkin_userids || '',
+      trusted_domain: (v.trusted_domain || '').trim(),
     }
     try {
       if (editing) {
@@ -119,6 +126,83 @@ export default function Tenants() {
     })
   }
 
+  const openDomain = async (row) => {
+    setDomainModal({
+      open: true,
+      tenant: row,
+      domain: row.trusted_domain || '',
+      fileList: [],
+      uploading: false,
+      info: null,
+    })
+    try {
+      const r = await api.get(`/admin/tenants/${row.tenant_id}/domain-verify`)
+      setDomainModal((s) => ({
+        ...s,
+        domain: r.data.trusted_domain || row.trusted_domain || '',
+        info: r.data,
+      }))
+    } catch (e) {
+      // 列表字段已有基础信息，查询失败不阻断
+    }
+  }
+
+  const uploadDomainVerify = async () => {
+    const { tenant, domain, fileList } = domainModal
+    if (!tenant) return
+    if (!fileList.length) {
+      message.warning('请选择企微下载的校验文件（.txt）')
+      return
+    }
+    const raw = fileList[0].originFileObj || fileList[0]
+    const fd = new FormData()
+    fd.append('file', raw, raw.name)
+    if (domain) fd.append('trusted_domain', domain.trim())
+    setDomainModal((s) => ({ ...s, uploading: true }))
+    try {
+      const r = await api.post(`/admin/tenants/${tenant.tenant_id}/domain-verify`, fd, {
+        headers: { 'Content-Type': 'multipart/form-data' },
+      })
+      message.success(r.data.msg || '上传成功')
+      setDomainModal((s) => ({
+        ...s,
+        uploading: false,
+        fileList: [],
+        domain: r.data.trusted_domain || s.domain,
+        info: {
+          trusted_domain: r.data.trusted_domain,
+          verify_filename: r.data.verify_filename,
+          verify_url: r.data.verify_url,
+          has_file: true,
+        },
+      }))
+      load()
+    } catch (e) {
+      setDomainModal((s) => ({ ...s, uploading: false }))
+      message.error('上传失败: ' + (e.response?.data?.detail || e.message))
+    }
+  }
+
+  const removeDomainVerify = () => {
+    const { tenant } = domainModal
+    if (!tenant) return
+    Modal.confirm({
+      title: '删除校验文件？',
+      content: '删除后根路径将无法访问该文件；可信域名配置会保留。',
+      okType: 'danger',
+      onOk: async () => {
+        await api.delete(`/admin/tenants/${tenant.tenant_id}/domain-verify`)
+        message.success('已删除')
+        setDomainModal((s) => ({
+          ...s,
+          info: { ...(s.info || {}), has_file: false, verify_filename: '', verify_url: '' },
+          fileList: [],
+        }))
+        load()
+      },
+    })
+  }
+
   const copyText = async (text) => {
     try {
       if (navigator.clipboard?.writeText) {
@@ -158,14 +242,26 @@ export default function Tenants() {
       )
     },
     {
+      title: '可信域名', key: 'domain', width: 180,
+      render: (_, r) => (
+        <Space direction="vertical" size={0}>
+          <Text style={{ fontSize: 12 }}>{r.trusted_domain || '—'}</Text>
+          {r.verify_filename
+            ? <Tag color="green" style={{ margin: 0 }}>{r.verify_filename}</Tag>
+            : <Tag style={{ margin: 0 }}>无校验文件</Tag>}
+        </Space>
+      )
+    },
+    {
       title: '状态', dataIndex: 'enabled', key: 'enabled', width: 80,
       render: (v) => <Tag color={v ? 'green' : 'default'}>{v ? '启用' : '禁用'}</Tag>
     },
     {
-      title: '操作', key: 'op', width: 300,
+      title: '操作', key: 'op', width: 360,
       render: (_, r) => (
         <Space size={4} wrap>
           <Button size="small" icon={<CopyOutlined />} onClick={() => openMcpConfig(r)}>MCP配置</Button>
+          <Button size="small" icon={<GlobalOutlined />} onClick={() => openDomain(r)}>域名</Button>
           <Button size="small" icon={<ThunderboltOutlined />} onClick={() => syncNow(r)}>同步</Button>
           <Button size="small" icon={<EditOutlined />} onClick={() => openEdit(r)}>编辑</Button>
           <Button size="small" danger icon={<DeleteOutlined />} onClick={() => remove(r)} />
@@ -216,6 +312,10 @@ export default function Tenants() {
             extra="无通讯录secret时用；有则优先自动拉">
             <Input.TextArea rows={2} placeholder="userA,userB" />
           </Form.Item>
+          <Form.Item name="trusted_domain" label="可信域名（可选）"
+            extra="反代后的对外域名，如 mcp.example.com；也可在列表「域名」里上传校验文件">
+            <Input placeholder="mcp.example.com" />
+          </Form.Item>
           <Form.Item name="enabled" label="启用" valuePropName="checked">
             <Switch />
           </Form.Item>
@@ -235,7 +335,7 @@ export default function Tenants() {
         ]}
       >
         <Paragraph type="secondary" style={{ marginBottom: 8 }}>
-          粘贴到 WorkBuddy / CodeBuddy 的 MCP 配置中。URL 基于当前访问域名自动生成。
+          粘贴到 WorkBuddy / CodeBuddy 的 MCP 配置中。优先用租户可信域名，否则用当前访问域名。
         </Paragraph>
         <pre style={{
           background: '#f5f5f5',
@@ -248,6 +348,76 @@ export default function Tenants() {
           lineHeight: 1.5,
           margin: 0,
         }}>{mcpModal.text}</pre>
+      </Modal>
+
+      <Modal
+        title={domainModal.tenant
+          ? `可信域名 · ${domainModal.tenant.display_name || domainModal.tenant.tenant_id}`
+          : '可信域名'}
+        open={domainModal.open}
+        onCancel={() => setDomainModal({ open: false, tenant: null, domain: '', fileList: [], uploading: false, info: null })}
+        width={640}
+        footer={[
+          domainModal.info?.has_file
+            ? <Button key="del" danger onClick={removeDomainVerify}>删除校验文件</Button>
+            : null,
+          <Button key="close" onClick={() => setDomainModal({ open: false, tenant: null, domain: '', fileList: [], uploading: false, info: null })}>
+            关闭
+          </Button>,
+          <Button key="up" type="primary" icon={<UploadOutlined />} loading={domainModal.uploading} onClick={uploadDomainVerify}>
+            上传并覆盖
+          </Button>,
+        ]}
+      >
+        <Paragraph type="secondary">
+          企微「应用主页/可信域名」校验：把域名反代到本服务后，上传企微提供的校验文件。
+          新上传会替换该租户旧文件；公网访问 <Text code>https://域名/文件名.txt</Text> 即可通过。
+        </Paragraph>
+        <Form layout="vertical">
+          <Form.Item label="可信域名" extra="不要带 https://，例如 mcp.example.com">
+            <Input
+              value={domainModal.domain}
+              onChange={(e) => setDomainModal((s) => ({ ...s, domain: e.target.value }))}
+              placeholder="mcp.example.com"
+            />
+          </Form.Item>
+          <Form.Item label="校验文件" extra="仅 .txt / .html，UTF-8 文本，≤64KB；同租户新文件覆盖旧文件">
+            <Upload
+              maxCount={1}
+              beforeUpload={() => false}
+              fileList={domainModal.fileList}
+              onChange={({ fileList }) => setDomainModal((s) => ({ ...s, fileList }))}
+              accept=".txt,.html,.htm,text/plain,text/html"
+            >
+              <Button icon={<UploadOutlined />}>选择文件</Button>
+            </Upload>
+          </Form.Item>
+        </Form>
+        {domainModal.info?.has_file && (
+          <div style={{ background: '#f6ffed', border: '1px solid #b7eb8f', borderRadius: 6, padding: 12 }}>
+            <div>当前文件：<Text code>{domainModal.info.verify_filename}</Text></div>
+            <div style={{ marginTop: 4 }}>
+              访问地址：
+              {domainModal.info.verify_url
+                ? <Link href={domainModal.info.verify_url.startsWith('http')
+                  ? domainModal.info.verify_url
+                  : `${window.location.origin}${domainModal.info.verify_url}`} target="_blank">
+                    {domainModal.info.verify_url.startsWith('http')
+                      ? domainModal.info.verify_url
+                      : `${window.location.origin}${domainModal.info.verify_url}`}
+                  </Link>
+                : '—'}
+            </div>
+            <div style={{ marginTop: 8 }}>
+              <Button size="small" icon={<CopyOutlined />} onClick={() => {
+                const u = domainModal.info.verify_url?.startsWith('http')
+                  ? domainModal.info.verify_url
+                  : `${window.location.origin}${domainModal.info.verify_url || ''}`
+                copyText(u)
+              }}>复制访问 URL</Button>
+            </div>
+          </div>
+        )}
       </Modal>
     </div>
   )

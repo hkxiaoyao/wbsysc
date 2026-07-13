@@ -11,13 +11,20 @@ import secrets
 import time
 from typing import Optional
 
-from fastapi import APIRouter, HTTPException, Request, Response
+from fastapi import APIRouter, File, Form, HTTPException, Request, Response, UploadFile
 from pydantic import BaseModel
 from sqlalchemy import text
 
 from .config import get_settings
 from .crypto import encrypt_secret, decrypt_secret
 from .db import get_engine, ensure_schema
+from .domain_verify import (
+    delete_verify_by_tenant,
+    ensure_domain_tables,
+    get_verify_by_tenant,
+    normalize_domain,
+    save_verify_file,
+)
 from .tenant import _hash_corpid, reload_tenants
 from .wecom.dispatch import run_sync_all
 
@@ -99,36 +106,51 @@ class TenantUpsert(BaseModel):
     sync_interval_min: int = 30
     enabled_modules: str = "report,approval,checkin"
     checkin_userids: str = ""
+    trusted_domain: str = ""  # 反代对外域名，如 mcp.example.com
     enabled: bool = True
+
+
+def _tenant_item(r) -> dict:
+    """list/create 共用的租户序列化 + 校验文件信息"""
+    item = {
+        "tenant_id": r[0], "display_name": r[1], "corpid": r[2],
+        "mcp_token": r[3], "schema_name": r[4],
+        "sync_interval_min": r[5], "enabled_modules": r[6],
+        "checkin_userids": r[7],
+        "has_contact_secret": bool(r[8]),
+        "has_secret": bool(r[9]),
+        "enabled": bool(r[10]),
+        "created_at": str(r[11]), "updated_at": str(r[12]),
+        "trusted_domain": (r[13] if len(r) > 13 else "") or "",
+        "verify_filename": "",
+        "verify_url": "",
+    }
+    vf = get_verify_by_tenant(item["tenant_id"])
+    if vf:
+        item["verify_filename"] = vf["filename"]
+        # 优先可信域名；否则前端用当前 origin 拼
+        if item["trusted_domain"]:
+            item["verify_url"] = f"https://{item['trusted_domain']}/{vf['filename']}"
+        else:
+            item["verify_url"] = f"/{vf['filename']}"
+    return item
 
 
 @router.get("/tenants")
 def list_tenants(request: Request):
     """列出所有租户（secret 字段不回传明文，仅返回是否已配置）"""
     _require_auth(request)
+    ensure_domain_tables()
     sql = text("""SELECT tenant_id, display_name, corpid, mcp_token, schema_name,
                          sync_interval_min, enabled_modules, checkin_userids,
                          IFNULL(contact_secret_encrypted IS NOT NULL, 0) AS has_contact_secret,
                          IFNULL(secret_encrypted IS NOT NULL, 0) AS has_secret,
-                         enabled, created_at, updated_at
+                         enabled, created_at, updated_at,
+                         IFNULL(trusted_domain, '') AS trusted_domain
                   FROM tenant_config ORDER BY created_at""")
     with get_engine().connect() as conn:
         rows = conn.execute(sql).fetchall()
-    return {
-        "items": [
-            {
-                "tenant_id": r[0], "display_name": r[1], "corpid": r[2],
-                "mcp_token": r[3], "schema_name": r[4],
-                "sync_interval_min": r[5], "enabled_modules": r[6],
-                "checkin_userids": r[7],
-                "has_contact_secret": bool(r[8]),
-                "has_secret": bool(r[9]),
-                "enabled": bool(r[10]),
-                "created_at": str(r[11]), "updated_at": str(r[12]),
-            }
-            for r in rows
-        ]
-    }
+    return {"items": [_tenant_item(r) for r in rows]}
 
 
 @router.post("/tenants")
@@ -137,6 +159,11 @@ def create_tenant(body: TenantUpsert, request: Request):
     _require_auth(request)
     if not body.secret:
         raise HTTPException(400, "新增租户必须填 secret")
+    ensure_domain_tables()
+    try:
+        trusted_domain = normalize_domain(body.trusted_domain) if body.trusted_domain else ""
+    except ValueError as e:
+        raise HTTPException(400, str(e))
     eng = get_engine()
     schema_name = f"wbd_{_hash_corpid(body.corpid)}"
     enc = encrypt_secret(body.secret)
@@ -145,8 +172,9 @@ def create_tenant(body: TenantUpsert, request: Request):
     sql = text("""
         INSERT INTO tenant_config
             (tenant_id, display_name, corpid, secret_encrypted, mcp_token, schema_name,
-             sync_interval_min, enabled_modules, checkin_userids, contact_secret_encrypted, enabled)
-        VALUES (:t,:dn,:c,:se,:mt,:sn,:si,:em,:cu,:cs,:en)
+             sync_interval_min, enabled_modules, checkin_userids, contact_secret_encrypted,
+             trusted_domain, enabled)
+        VALUES (:t,:dn,:c,:se,:mt,:sn,:si,:em,:cu,:cs,:td,:en)
     """)
     try:
         with eng.begin() as conn:
@@ -154,21 +182,26 @@ def create_tenant(body: TenantUpsert, request: Request):
                 "t": body.tenant_id, "dn": body.display_name, "c": body.corpid,
                 "se": enc, "mt": body.mcp_token, "sn": schema_name, "si": body.sync_interval_min,
                 "em": body.enabled_modules, "cu": body.checkin_userids or None,
-                "cs": contact_enc, "en": 1 if body.enabled else 0,
+                "cs": contact_enc, "td": trusted_domain, "en": 1 if body.enabled else 0,
             })
     except Exception as e:
         raise HTTPException(400, f"写入失败(可能租户ID/corpid/token重复): {e}")
 
     ensure_schema(schema_name)   # 建该租户 schema + 业务表
     reload_tenants()
-    return {"ok": True, "schema_name": schema_name}
+    return {"ok": True, "schema_name": schema_name, "trusted_domain": trusted_domain}
 
 
 @router.put("/tenants/{tenant_id}")
 def update_tenant(tenant_id: str, body: TenantUpsert, request: Request):
     """编辑租户：留空的 secret/contact_secret 不修改（保持原值）"""
     _require_auth(request)
+    ensure_domain_tables()
     eng = get_engine()
+    try:
+        trusted_domain = normalize_domain(body.trusted_domain) if body.trusted_domain else ""
+    except ValueError as e:
+        raise HTTPException(400, str(e))
 
     # 先取现有加密值（secret/contact_secret 留空时保留）
     with eng.connect() as conn:
@@ -190,7 +223,8 @@ def update_tenant(tenant_id: str, body: TenantUpsert, request: Request):
         UPDATE tenant_config SET
             display_name=:dn, corpid=:c, secret_encrypted=:se, mcp_token=:mt,
             schema_name=:sn, sync_interval_min=:si, enabled_modules=:em,
-            checkin_userids=:cu, contact_secret_encrypted=:cs, enabled=:en
+            checkin_userids=:cu, contact_secret_encrypted=:cs,
+            trusted_domain=:td, enabled=:en
         WHERE tenant_id=:t
     """)
     with eng.begin() as conn:
@@ -199,11 +233,17 @@ def update_tenant(tenant_id: str, body: TenantUpsert, request: Request):
             "se": secret_enc, "mt": body.mcp_token, "sn": new_schema,
             "si": body.sync_interval_min, "em": body.enabled_modules,
             "cu": body.checkin_userids or None, "cs": contact_enc,
-            "en": 1 if body.enabled else 0,
+            "td": trusted_domain, "en": 1 if body.enabled else 0,
         })
+        # 同步校验文件上的域名展示字段
+        if trusted_domain:
+            conn.execute(
+                text("UPDATE domain_verify_file SET trusted_domain=:d WHERE tenant_id=:t"),
+                {"d": trusted_domain, "t": tenant_id},
+            )
     ensure_schema(new_schema)   # 新 schema 建表（若改了 corpid）
     reload_tenants()
-    return {"ok": True}
+    return {"ok": True, "trusted_domain": trusted_domain}
 
 
 @router.delete("/tenants/{tenant_id}")
@@ -214,6 +254,10 @@ def delete_tenant(tenant_id: str, request: Request):
         r = conn.execute(text("DELETE FROM tenant_config WHERE tenant_id=:t"), {"t": tenant_id})
     if r.rowcount == 0:
         raise HTTPException(404, "租户不存在")
+    try:
+        delete_verify_by_tenant(tenant_id)
+    except Exception:
+        pass
     reload_tenants()
     return {"ok": True}
 
@@ -222,7 +266,6 @@ def delete_tenant(tenant_id: str, request: Request):
 def trigger_sync(tenant_id: str, request: Request):
     """手动触发该租户同步（后台执行，立即返回）"""
     _require_auth(request)
-    import asyncio
     import threading
 
     # 单租户同步：在线程池跑 run_sync_one_tenant，不阻塞响应
@@ -247,3 +290,99 @@ def trigger_sync(tenant_id: str, request: Request):
 
     threading.Thread(target=_run, daemon=True).start()
     return {"ok": True, "msg": f"租户 {tenant_id} 同步已触发(后台执行)"}
+
+
+@router.get("/tenants/{tenant_id}/domain-verify")
+def get_domain_verify(tenant_id: str, request: Request):
+    """查询租户可信域名与校验文件"""
+    _require_auth(request)
+    ensure_domain_tables()
+    with get_engine().connect() as conn:
+        row = conn.execute(
+            text("SELECT IFNULL(trusted_domain,'') FROM tenant_config WHERE tenant_id=:t"),
+            {"t": tenant_id},
+        ).fetchone()
+    if not row:
+        raise HTTPException(404, "租户不存在")
+    vf = get_verify_by_tenant(tenant_id)
+    domain = row[0] or (vf or {}).get("trusted_domain") or ""
+    filename = (vf or {}).get("filename") or ""
+    verify_url = f"https://{domain}/{filename}" if domain and filename else (f"/{filename}" if filename else "")
+    return {
+        "tenant_id": tenant_id,
+        "trusted_domain": domain,
+        "verify_filename": filename,
+        "verify_url": verify_url,
+        "has_file": bool(filename),
+        "updated_at": (vf or {}).get("updated_at") or "",
+    }
+
+
+@router.post("/tenants/{tenant_id}/domain-verify")
+async def upload_domain_verify(
+    tenant_id: str,
+    request: Request,
+    file: UploadFile = File(...),
+    trusted_domain: str = Form(""),
+):
+    """上传/覆盖企微可信域名校验文件；新文件会替换该租户旧文件"""
+    _require_auth(request)
+    ensure_domain_tables()
+    with get_engine().connect() as conn:
+        exists = conn.execute(
+            text("SELECT 1 FROM tenant_config WHERE tenant_id=:t"),
+            {"t": tenant_id},
+        ).fetchone()
+    if not exists:
+        raise HTTPException(404, "租户不存在")
+
+    raw_name = (file.filename or "").split("\\")[-1].split("/")[-1].strip()
+    if not raw_name:
+        raise HTTPException(400, "缺少文件名")
+    body = await file.read()
+    try:
+        text_body = body.decode("utf-8")
+    except UnicodeDecodeError:
+        # 企微校验文件通常是 ASCII/UTF-8；非文本拒绝
+        raise HTTPException(400, "校验文件必须是 UTF-8 文本")
+
+    try:
+        saved = save_verify_file(
+            filename=raw_name,
+            content=text_body,
+            tenant_id=tenant_id,
+            trusted_domain=trusted_domain,
+            content_type=file.content_type or "text/plain; charset=utf-8",
+        )
+    except ValueError as e:
+        raise HTTPException(400, str(e))
+
+    domain = saved.get("trusted_domain") or ""
+    # 若表单没传域名但租户已有域名，回填
+    if not domain:
+        with get_engine().connect() as conn:
+            r = conn.execute(
+                text("SELECT IFNULL(trusted_domain,'') FROM tenant_config WHERE tenant_id=:t"),
+                {"t": tenant_id},
+            ).fetchone()
+            domain = (r[0] if r else "") or ""
+
+    filename = saved["filename"]
+    verify_url = f"https://{domain}/{filename}" if domain else f"/{filename}"
+    return {
+        "ok": True,
+        "tenant_id": tenant_id,
+        "trusted_domain": domain,
+        "verify_filename": filename,
+        "verify_url": verify_url,
+        "msg": "已上传；同租户旧校验文件已替换",
+    }
+
+
+@router.delete("/tenants/{tenant_id}/domain-verify")
+def remove_domain_verify(tenant_id: str, request: Request):
+    """删除该租户的校验文件（不删 trusted_domain）"""
+    _require_auth(request)
+    if not delete_verify_by_tenant(tenant_id):
+        raise HTTPException(404, "该租户没有校验文件")
+    return {"ok": True}

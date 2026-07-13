@@ -54,13 +54,32 @@ def create_app() -> FastAPI:
         }
 
     # /admin 快捷入口 → 静态管理后台（避免访问 /admin 或 /admin/index.html 得到 404）
-    from fastapi.responses import RedirectResponse
+    from fastapi.responses import RedirectResponse, Response
 
     @app.get("/admin", include_in_schema=False)
     @app.get("/admin/", include_in_schema=False)
     @app.get("/admin/index.html", include_in_schema=False)
     async def admin_entry_redirect():
         return RedirectResponse(url="/admin/ui/", status_code=307)
+
+    # 企微可信域名校验文件：根路径 /xxx.txt 公开可访问（反代到本服务后企微可拉取）
+    from .domain_verify import get_verify_file, is_safe_verify_filename
+
+    @app.get("/{verify_filename}", include_in_schema=False)
+    async def serve_domain_verify_file(verify_filename: str):
+        # 仅放行安全文件名；避免吞掉 /health /mcp /admin 等（这些有更具体路由优先匹配）
+        if not is_safe_verify_filename(verify_filename):
+            from fastapi import HTTPException
+            raise HTTPException(404, "Not Found")
+        item = get_verify_file(verify_filename)
+        if not item:
+            from fastapi import HTTPException
+            raise HTTPException(404, "Not Found")
+        return Response(
+            content=item["content"],
+            media_type=item.get("content_type") or "text/plain; charset=utf-8",
+            headers={"Cache-Control": "no-store"},
+        )
 
     # 管理后台前端静态文件（构建产物 app/static/dist）—— 必须在 mcp_glyph 之前注册
     import os
