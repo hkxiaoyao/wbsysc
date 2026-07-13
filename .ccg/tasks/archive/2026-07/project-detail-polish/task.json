@@ -1,12 +1,12 @@
 {
   "id": "project-detail-polish",
   "title": "检查项目并完善细节",
-  "status": "in_progress",
+  "status": "completed",
   "complexity": "L+",
   "risk": "medium",
   "domain": "fullstack",
-  "currentPhase": "implementation",
-  "nextAction": "并行实施 Task 1 与 Task 2",
+  "currentPhase": "completed",
+  "nextAction": "归档任务并合并分支",
   "createdAt": "2026-07-13T06:42:15Z",
-  "branch": "main"
+  "branch": "codex/gateway-hardening"
 }
