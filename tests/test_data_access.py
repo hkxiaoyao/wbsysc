@@ -106,14 +106,21 @@ def test_direct_reports_do_not_query_database(monkeypatch):
 
 def test_capped_report_sync_reads_latest_segment_first(monkeypatch):
     windows = []
+    records = [
+        ("old", report_sync.MONTH - 1),
+        ("new", report_sync.MONTH * 2 - 1),
+    ]
 
     def list_records(corpid, secret, start, end, cursor, limit, filters):
         windows.append((start, end))
-        identifier = "new" if start >= report_sync.MONTH else "old"
+        identifiers = [
+            identifier for identifier, timestamp in records
+            if start <= timestamp < end
+        ]
         return {
             "errcode": 0,
             "errmsg": "ok",
-            "journaluuid_list": [identifier],
+            "journaluuid_list": identifiers,
             "endflag": 1,
             "next_cursor": 0,
         }
@@ -130,14 +137,21 @@ def test_capped_report_sync_reads_latest_segment_first(monkeypatch):
 
 def test_unbounded_report_sync_keeps_full_old_to_new_window(monkeypatch):
     windows = []
+    records = [
+        ("old", report_sync.MONTH - 1),
+        ("new", report_sync.MONTH * 2 - 1),
+    ]
 
     def list_records(corpid, secret, start, end, cursor, limit, filters):
         windows.append((start, end))
-        identifier = "new" if start >= report_sync.MONTH else "old"
+        identifiers = [
+            identifier for identifier, timestamp in records
+            if start <= timestamp < end
+        ]
         return {
             "errcode": 0,
             "errmsg": "ok",
-            "journaluuid_list": [identifier],
+            "journaluuid_list": identifiers,
             "endflag": 1,
             "next_cursor": 0,
         }
@@ -157,14 +171,21 @@ def test_unbounded_report_sync_keeps_full_old_to_new_window(monkeypatch):
 
 def test_capped_approval_sync_reads_latest_segment_first(monkeypatch):
     windows = []
+    records = [
+        ("old", approval_sync.SPAN - 1),
+        ("new", approval_sync.SPAN * 2 - 1),
+    ]
 
     def list_approvals(corpid, secret, start, end, cursor, size, filters):
         windows.append((start, end))
-        identifier = "new" if start >= approval_sync.SPAN else "old"
+        identifiers = [
+            identifier for identifier, timestamp in records
+            if start <= timestamp < end
+        ]
         return {
             "errcode": 0,
             "errmsg": "ok",
-            "sp_no_list": [identifier],
+            "sp_no_list": identifiers,
             "new_next_cursor": "",
         }
 
@@ -180,14 +201,21 @@ def test_capped_approval_sync_reads_latest_segment_first(monkeypatch):
 
 def test_unbounded_approval_sync_keeps_full_old_to_new_window(monkeypatch):
     windows = []
+    records = [
+        ("old", approval_sync.SPAN - 1),
+        ("new", approval_sync.SPAN * 2 - 1),
+    ]
 
     def list_approvals(corpid, secret, start, end, cursor, size, filters):
         windows.append((start, end))
-        identifier = "new" if start >= approval_sync.SPAN else "old"
+        identifiers = [
+            identifier for identifier, timestamp in records
+            if start <= timestamp < end
+        ]
         return {
             "errcode": 0,
             "errmsg": "ok",
-            "sp_no_list": [identifier],
+            "sp_no_list": identifiers,
             "new_next_cursor": "",
         }
 
@@ -202,6 +230,105 @@ def test_unbounded_approval_sync_keeps_full_old_to_new_window(monkeypatch):
         (0, approval_sync.SPAN),
         (approval_sync.SPAN, approval_sync.SPAN * 2),
     ]
+
+
+def test_capped_report_min_window_truncates_in_api_order(monkeypatch):
+    def list_records(corpid, secret, start, end, cursor, limit, filters):
+        if cursor == 0:
+            return {
+                "errcode": 0,
+                "errmsg": "ok",
+                "journaluuid_list": ["first-page"],
+                "endflag": 0,
+                "next_cursor": 1,
+            }
+        return {
+            "errcode": 0,
+            "errmsg": "ok",
+            "journaluuid_list": ["second-page"],
+            "endflag": 1,
+            "next_cursor": 0,
+        }
+
+    monkeypatch.setattr(report_sync.api, "list_report_records", list_records)
+
+    result = report_sync.sync_reports_window(
+        "ww123", "secret", 100, 150, max_records=1
+    )
+
+    assert result == ["first-page"]
+
+
+def test_capped_approval_min_window_truncates_in_api_order(monkeypatch):
+    def list_approvals(corpid, secret, start, end, cursor, size, filters):
+        if cursor == "":
+            return {
+                "errcode": 0,
+                "errmsg": "ok",
+                "sp_no_list": ["first-page"],
+                "new_next_cursor": "1",
+            }
+        return {
+            "errcode": 0,
+            "errmsg": "ok",
+            "sp_no_list": ["second-page"],
+            "new_next_cursor": "",
+        }
+
+    monkeypatch.setattr(approval_sync.api, "list_approvals", list_approvals)
+
+    result = approval_sync.sync_approvals_window(
+        "ww123", "secret", 100, 150, max_records=1
+    )
+
+    assert result == ["first-page"]
+
+
+def test_capped_report_rejects_repeated_pagination_cursor(monkeypatch):
+    calls = 0
+
+    def list_records(corpid, secret, start, end, cursor, limit, filters):
+        nonlocal calls
+        calls += 1
+        if calls > 2:
+            raise AssertionError("pagination loop was not stopped")
+        return {
+            "errcode": 0,
+            "errmsg": "ok",
+            "journaluuid_list": [f"record-{calls}"],
+            "endflag": 0,
+            "next_cursor": 7,
+        }
+
+    monkeypatch.setattr(report_sync.api, "list_report_records", list_records)
+
+    with pytest.raises(RuntimeError, match="游标重复"):
+        report_sync.sync_reports_window(
+            "ww123", "secret", 100, 150, max_records=1
+        )
+
+
+def test_capped_approval_rejects_repeated_pagination_cursor(monkeypatch):
+    calls = 0
+
+    def list_approvals(corpid, secret, start, end, cursor, size, filters):
+        nonlocal calls
+        calls += 1
+        if calls > 2:
+            raise AssertionError("pagination loop was not stopped")
+        return {
+            "errcode": 0,
+            "errmsg": "ok",
+            "sp_no_list": [f"record-{calls}"],
+            "new_next_cursor": "repeated",
+        }
+
+    monkeypatch.setattr(approval_sync.api, "list_approvals", list_approvals)
+
+    with pytest.raises(RuntimeError, match="游标重复"):
+        approval_sync.sync_approvals_window(
+            "ww123", "secret", 100, 150, max_records=1
+        )
 
 
 def test_direct_reports_sort_newest_and_apply_limit(monkeypatch):
@@ -243,24 +370,30 @@ def test_direct_approvals_sort_newest_and_apply_limit(monkeypatch):
 
 
 def test_direct_reports_choose_newest_detail_from_unsorted_pages(monkeypatch):
+    records = [
+        ("older-on-first-page", 100),
+        ("newer-on-second-page", 200),
+    ]
+    detail_calls = []
+
     def list_records(corpid, secret, start, end, cursor, limit, filters):
-        if cursor == 0:
-            return {
-                "errcode": 0,
-                "errmsg": "ok",
-                "journaluuid_list": ["older-on-first-page"],
-                "endflag": 0,
-                "next_cursor": 7,
-            }
+        eligible = [
+            identifier for identifier, timestamp in records
+            if start <= timestamp < end
+        ]
+        offset = int(cursor or 0)
+        page = eligible[offset:offset + 1]
+        next_cursor = offset + 1 if offset + 1 < len(eligible) else 0
         return {
             "errcode": 0,
             "errmsg": "ok",
-            "journaluuid_list": ["newer-on-second-page"],
-            "endflag": 1,
-            "next_cursor": 0,
+            "journaluuid_list": page,
+            "endflag": 0 if next_cursor else 1,
+            "next_cursor": next_cursor,
         }
 
     def get_detail(corpid, secret, identifier):
+        detail_calls.append(identifier)
         report_time = 200 if identifier == "newer-on-second-page" else 100
         return {
             "errcode": 0,
@@ -272,30 +405,38 @@ def test_direct_reports_choose_newest_detail_from_unsorted_pages(monkeypatch):
     monkeypatch.setattr(report_sync.api, "get_report_detail", get_detail)
 
     result = data_access.list_reports(
-        ctx("direct"), 1, report_sync.MONTH, 1
+        ctx("direct"), 1, 300, 1
     )
 
     assert result["count"] == 1
     assert result["records"][0]["journaluuid"] == "newer-on-second-page"
+    assert detail_calls == ["newer-on-second-page"]
 
 
 def test_direct_approvals_choose_newest_detail_from_unsorted_pages(monkeypatch):
+    records = [
+        ("older-on-first-page", 100),
+        ("newer-on-second-page", 200),
+    ]
+    detail_calls = []
+
     def list_approvals(corpid, secret, start, end, cursor, size, filters):
-        if cursor == "":
-            return {
-                "errcode": 0,
-                "errmsg": "ok",
-                "sp_no_list": ["older-on-first-page"],
-                "new_next_cursor": "cursor-2",
-            }
+        eligible = [
+            identifier for identifier, timestamp in records
+            if start <= timestamp < end
+        ]
+        offset = int(cursor or 0)
+        page = eligible[offset:offset + 1]
+        next_cursor = str(offset + 1) if offset + 1 < len(eligible) else ""
         return {
             "errcode": 0,
             "errmsg": "ok",
-            "sp_no_list": ["newer-on-second-page"],
-            "new_next_cursor": "",
+            "sp_no_list": page,
+            "new_next_cursor": next_cursor,
         }
 
     def get_detail(corpid, secret, identifier):
+        detail_calls.append(identifier)
         apply_time = 200 if identifier == "newer-on-second-page" else 100
         return {
             "errcode": 0,
@@ -307,11 +448,12 @@ def test_direct_approvals_choose_newest_detail_from_unsorted_pages(monkeypatch):
     monkeypatch.setattr(approval_sync.api, "get_approval_detail", get_detail)
 
     result = data_access.list_approvals(
-        ctx("direct"), 1, approval_sync.SPAN, 1
+        ctx("direct"), 1, 300, 1
     )
 
     assert result["count"] == 1
     assert result["records"][0]["sp_no"] == "newer-on-second-page"
+    assert detail_calls == ["newer-on-second-page"]
 
 
 def test_direct_checkins_raise_when_every_api_attempt_fails(monkeypatch):
@@ -477,34 +619,34 @@ def test_partial_checkin_errors_do_not_expose_exception_text(monkeypatch):
         assert secret not in serialized
 
 
-def test_direct_reports_latest_segment_all_pages_then_detail_sort(monkeypatch):
-    list_calls = []
+def test_direct_reports_capped_detail_failure_stays_partial(monkeypatch):
+    records = [
+        ("older-candidate", report_sync.MONTH + 100),
+        ("failed-latest", report_sync.MONTH * 2 - 100),
+    ]
     detail_calls = []
 
     def list_records(corpid, secret, start, end, cursor, limit, filters):
-        list_calls.append((start, end, cursor))
-        if start < report_sync.MONTH:
-            raise AssertionError("older report segment must not be requested")
-        if cursor == 0:
-            return {
-                "errcode": 0,
-                "journaluuid_list": ["latest-segment-older-detail"],
-                "endflag": 0,
-                "next_cursor": 7,
-            }
+        identifiers = [
+            identifier for identifier, timestamp in records
+            if start <= timestamp < end
+        ]
         return {
             "errcode": 0,
-            "journaluuid_list": ["latest-segment-newest-detail"],
+            "errmsg": "ok",
+            "journaluuid_list": identifiers,
             "endflag": 1,
             "next_cursor": 0,
         }
 
     def get_detail(corpid, secret, identifier):
         detail_calls.append(identifier)
-        report_time = 200 if identifier.endswith("newest-detail") else 100
+        if identifier == "failed-latest":
+            return {"errcode": 40001, "errmsg": "invalid credential"}
         return {
             "errcode": 0,
-            "info": {"journaluuid": identifier, "report_time": report_time},
+            "errmsg": "ok",
+            "info": {"journaluuid": identifier, "report_time": report_sync.MONTH + 100},
         }
 
     monkeypatch.setattr(report_sync.api, "list_report_records", list_records)
@@ -514,45 +656,40 @@ def test_direct_reports_latest_segment_all_pages_then_detail_sort(monkeypatch):
         ctx("direct"), 0, report_sync.MONTH * 2, 1
     )
 
-    assert list_calls == [
-        (report_sync.MONTH, report_sync.MONTH * 2, 0),
-        (report_sync.MONTH, report_sync.MONTH * 2, 7),
-    ]
-    assert detail_calls == [
-        "latest-segment-older-detail",
-        "latest-segment-newest-detail",
-    ]
-    assert [record["journaluuid"] for record in result["records"]] == [
-        "latest-segment-newest-detail"
-    ]
+    assert detail_calls == ["failed-latest"]
+    assert result["count"] == 1
+    assert result["partial_count"] == 1
+    assert result["records"][0]["journaluuid"] == "failed-latest"
+    assert result["records"][0]["_partial"] is True
 
 
-def test_direct_approvals_latest_segment_all_pages_then_detail_sort(monkeypatch):
-    list_calls = []
+def test_direct_approvals_capped_detail_failure_stays_partial(monkeypatch):
+    records = [
+        ("older-candidate", approval_sync.SPAN + 100),
+        ("failed-latest", approval_sync.SPAN * 2 - 100),
+    ]
     detail_calls = []
 
     def list_approvals(corpid, secret, start, end, cursor, size, filters):
-        list_calls.append((start, end, cursor))
-        if start < approval_sync.SPAN:
-            raise AssertionError("older approval segment must not be requested")
-        if cursor == "":
-            return {
-                "errcode": 0,
-                "sp_no_list": ["latest-segment-older-detail"],
-                "new_next_cursor": "cursor-2",
-            }
+        identifiers = [
+            identifier for identifier, timestamp in records
+            if start <= timestamp < end
+        ]
         return {
             "errcode": 0,
-            "sp_no_list": ["latest-segment-newest-detail"],
+            "errmsg": "ok",
+            "sp_no_list": identifiers,
             "new_next_cursor": "",
         }
 
     def get_detail(corpid, secret, identifier):
         detail_calls.append(identifier)
-        apply_time = 200 if identifier.endswith("newest-detail") else 100
+        if identifier == "failed-latest":
+            return {"errcode": 301055, "errmsg": "not authorized"}
         return {
             "errcode": 0,
-            "info": {"sp_no": identifier, "apply_time": apply_time},
+            "errmsg": "ok",
+            "info": {"sp_no": identifier, "apply_time": approval_sync.SPAN + 100},
         }
 
     monkeypatch.setattr(approval_sync.api, "list_approvals", list_approvals)
@@ -562,17 +699,11 @@ def test_direct_approvals_latest_segment_all_pages_then_detail_sort(monkeypatch)
         ctx("direct"), 0, approval_sync.SPAN * 2, 1
     )
 
-    assert list_calls == [
-        (approval_sync.SPAN, approval_sync.SPAN * 2, ""),
-        (approval_sync.SPAN, approval_sync.SPAN * 2, "cursor-2"),
-    ]
-    assert detail_calls == [
-        "latest-segment-older-detail",
-        "latest-segment-newest-detail",
-    ]
-    assert [record["sp_no"] for record in result["records"]] == [
-        "latest-segment-newest-detail"
-    ]
+    assert detail_calls == ["failed-latest"]
+    assert result["count"] == 1
+    assert result["partial_count"] == 1
+    assert result["records"][0]["sp_no"] == "failed-latest"
+    assert result["records"][0]["_partial"] is True
 
 
 def test_background_checkin_fetch_remains_tolerant(monkeypatch):
