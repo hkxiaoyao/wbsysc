@@ -9,7 +9,7 @@ from __future__ import annotations
 import hashlib
 import secrets
 import time
-from typing import Optional
+from typing import Literal, Optional
 
 from fastapi import APIRouter, File, Form, HTTPException, Request, Response, UploadFile
 from pydantic import BaseModel
@@ -101,7 +101,9 @@ class TenantUpsert(BaseModel):
     # 编辑时可不传 secret/contact_secret（留空=不修改）
     secret: Optional[str] = None
     contact_secret: Optional[str] = None
-    mcp_token: str
+    # 新建时必填；编辑时留空表示保留现有 Token。
+    mcp_token: str = ""
+    data_mode: Literal["stored", "direct"] = "stored"
     display_name: str = ""
     sync_interval_min: int = 30
     enabled_modules: str = "report,approval,checkin"
@@ -114,7 +116,9 @@ def _tenant_item(r) -> dict:
     """list/create 共用的租户序列化 + 校验文件信息"""
     item = {
         "tenant_id": r[0], "display_name": r[1], "corpid": r[2],
-        "mcp_token": r[3], "schema_name": r[4],
+        "has_mcp_token": bool(r[3]),
+        "mcp_token_hint": r[3][-4:] if r[3] else "",
+        "schema_name": r[4],
         "sync_interval_min": r[5], "enabled_modules": r[6],
         "checkin_userids": r[7],
         "has_contact_secret": bool(r[8]),
@@ -122,6 +126,7 @@ def _tenant_item(r) -> dict:
         "enabled": bool(r[10]),
         "created_at": str(r[11]), "updated_at": str(r[12]),
         "trusted_domain": (r[13] if len(r) > 13 else "") or "",
+        "data_mode": (r[14] if len(r) > 14 else "stored") or "stored",
         "verify_filename": "",
         "verify_url": "",
     }
@@ -147,13 +152,14 @@ def list_tenants(request: Request):
         import logging
         logging.getLogger("wecom-gateway").warning("ensure_domain_tables failed: %s", e)
 
-    # 优先带 trusted_domain；列尚未加上时回退旧 SQL，避免 500
+    # 优先带 trusted_domain/data_mode；列尚未加上时回退旧 SQL，避免 500
     sql_full = text("""SELECT tenant_id, display_name, corpid, mcp_token, schema_name,
                          sync_interval_min, enabled_modules, checkin_userids,
                          IFNULL(contact_secret_encrypted IS NOT NULL, 0) AS has_contact_secret,
                          IFNULL(secret_encrypted IS NOT NULL, 0) AS has_secret,
                          enabled, created_at, updated_at,
-                         IFNULL(trusted_domain, '') AS trusted_domain
+                         IFNULL(trusted_domain, '') AS trusted_domain,
+                         IFNULL(data_mode, 'stored') AS data_mode
                   FROM tenant_config ORDER BY created_at""")
     sql_legacy = text("""SELECT tenant_id, display_name, corpid, mcp_token, schema_name,
                          sync_interval_min, enabled_modules, checkin_userids,
@@ -174,7 +180,9 @@ def list_tenants(request: Request):
             # 校验文件表异常时仍返回基础租户信息
             items.append({
                 "tenant_id": r[0], "display_name": r[1], "corpid": r[2],
-                "mcp_token": r[3], "schema_name": r[4],
+                "has_mcp_token": bool(r[3]),
+                "mcp_token_hint": r[3][-4:] if r[3] else "",
+                "schema_name": r[4],
                 "sync_interval_min": r[5], "enabled_modules": r[6],
                 "checkin_userids": r[7],
                 "has_contact_secret": bool(r[8]),
@@ -182,10 +190,29 @@ def list_tenants(request: Request):
                 "enabled": bool(r[10]),
                 "created_at": str(r[11]), "updated_at": str(r[12]),
                 "trusted_domain": (r[13] if len(r) > 13 else "") or "",
+                "data_mode": (r[14] if len(r) > 14 else "stored") or "stored",
                 "verify_filename": "",
                 "verify_url": "",
             })
     return {"items": items}
+
+
+@router.get("/tenants/{tenant_id}/mcp-config")
+def get_mcp_config(tenant_id: str, request: Request):
+    """鉴权后按需返回单个租户的 MCP 连接配置。"""
+    _require_auth(request)
+    with get_engine().connect() as conn:
+        row = conn.execute(text(
+            "SELECT tenant_id, mcp_token, IFNULL(trusted_domain, '') "
+            "FROM tenant_config WHERE tenant_id=:t"
+        ), {"t": tenant_id}).fetchone()
+    if not row:
+        raise HTTPException(404, "租户不存在")
+    return {
+        "tenant_id": row[0],
+        "mcp_token": row[1],
+        "trusted_domain": row[2] or "",
+    }
 
 
 @router.post("/tenants")
@@ -194,6 +221,8 @@ def create_tenant(body: TenantUpsert, request: Request):
     _require_auth(request)
     if not body.secret:
         raise HTTPException(400, "新增租户必须填 secret")
+    if not body.mcp_token:
+        raise HTTPException(400, "新增租户必须填 MCP Token")
     ensure_domain_tables()
     try:
         trusted_domain = normalize_domain(body.trusted_domain) if body.trusted_domain else ""
@@ -208,8 +237,8 @@ def create_tenant(body: TenantUpsert, request: Request):
         INSERT INTO tenant_config
             (tenant_id, display_name, corpid, secret_encrypted, mcp_token, schema_name,
              sync_interval_min, enabled_modules, checkin_userids, contact_secret_encrypted,
-             trusted_domain, enabled)
-        VALUES (:t,:dn,:c,:se,:mt,:sn,:si,:em,:cu,:cs,:td,:en)
+             trusted_domain, data_mode, enabled)
+        VALUES (:t,:dn,:c,:se,:mt,:sn,:si,:em,:cu,:cs,:td,:dm,:en)
     """)
     try:
         with eng.begin() as conn:
@@ -217,7 +246,8 @@ def create_tenant(body: TenantUpsert, request: Request):
                 "t": body.tenant_id, "dn": body.display_name, "c": body.corpid,
                 "se": enc, "mt": body.mcp_token, "sn": schema_name, "si": body.sync_interval_min,
                 "em": body.enabled_modules, "cu": body.checkin_userids or None,
-                "cs": contact_enc, "td": trusted_domain, "en": 1 if body.enabled else 0,
+                "cs": contact_enc, "td": trusted_domain, "dm": body.data_mode,
+                "en": 1 if body.enabled else 0,
             })
     except Exception as e:
         raise HTTPException(400, f"写入失败(可能租户ID/corpid/token重复): {e}")
@@ -238,16 +268,18 @@ def update_tenant(tenant_id: str, body: TenantUpsert, request: Request):
     except ValueError as e:
         raise HTTPException(400, str(e))
 
-    # 先取现有加密值（secret/contact_secret 留空时保留）
+    # 先取现有加密值与 Token（编辑时留空均保留）。
     with eng.connect() as conn:
         cur = conn.execute(text(
-            "SELECT secret_encrypted, contact_secret_encrypted FROM tenant_config WHERE tenant_id=:t"
+            "SELECT secret_encrypted, contact_secret_encrypted, mcp_token "
+            "FROM tenant_config WHERE tenant_id=:t"
         ), {"t": tenant_id}).fetchone()
     if not cur:
         raise HTTPException(404, "租户不存在")
 
     secret_enc = cur[0]
     contact_enc = cur[1]
+    mcp_token = body.mcp_token or cur[2]
     if body.secret:
         secret_enc = encrypt_secret(body.secret)
     if body.contact_secret:
@@ -259,16 +291,17 @@ def update_tenant(tenant_id: str, body: TenantUpsert, request: Request):
             display_name=:dn, corpid=:c, secret_encrypted=:se, mcp_token=:mt,
             schema_name=:sn, sync_interval_min=:si, enabled_modules=:em,
             checkin_userids=:cu, contact_secret_encrypted=:cs,
-            trusted_domain=:td, enabled=:en
+            trusted_domain=:td, data_mode=:dm, enabled=:en
         WHERE tenant_id=:t
     """)
     with eng.begin() as conn:
         conn.execute(sql, {
             "t": tenant_id, "dn": body.display_name, "c": body.corpid,
-            "se": secret_enc, "mt": body.mcp_token, "sn": new_schema,
+            "se": secret_enc, "mt": mcp_token, "sn": new_schema,
             "si": body.sync_interval_min, "em": body.enabled_modules,
             "cu": body.checkin_userids or None, "cs": contact_enc,
-            "td": trusted_domain, "en": 1 if body.enabled else 0,
+            "td": trusted_domain, "dm": body.data_mode,
+            "en": 1 if body.enabled else 0,
         })
         # 同步校验文件上的域名展示字段
         if trusted_domain:
@@ -324,6 +357,8 @@ def trigger_sync(
     t = tenants.get(tenant_id)
     if not t:
         raise HTTPException(404, "租户不存在或已禁用")
+    if t.data_mode == "direct":
+        raise HTTPException(409, "企微直连模式不支持同步")
 
     days = max(1, min(int(lookback_days or 30), FULL_WINDOW_DAYS))
     do_force = bool(force) or bool(reset_cursor)
@@ -363,6 +398,8 @@ def sync_diagnose(tenant_id: str, request: Request, lookback_days: int = 90):
     t = tenants.get(tenant_id)
     if not t:
         raise HTTPException(404, "租户不存在或已禁用")
+    if t.data_mode == "direct":
+        raise HTTPException(409, "企微直连模式不支持同步诊断")
     days = max(1, min(int(lookback_days or 90), FULL_WINDOW_DAYS))
     result = diagnose_report_pull(t, lookback_days=days)
     # 附带库内条数，方便对比「企微N条 vs 库M条」

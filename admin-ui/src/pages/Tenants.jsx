@@ -30,6 +30,8 @@ export default function Tenants() {
   const [loading, setLoading] = useState(false)
   const [modalOpen, setModalOpen] = useState(false)
   const [editing, setEditing] = useState(null)
+  const [saving, setSaving] = useState(false)
+  const [mcpLoadingTenant, setMcpLoadingTenant] = useState(null)
   const [mcpModal, setMcpModal] = useState({ open: false, title: '', text: '' })
   const [domainModal, setDomainModal] = useState({
     open: false, tenant: null, domain: '', fileList: [], uploading: false, info: null,
@@ -51,7 +53,12 @@ export default function Tenants() {
   const openCreate = () => {
     setEditing(null)
     form.resetFields()
-    form.setFieldsValue({ enabled_modules: MODULES, sync_interval_min: 30, enabled: true })
+    form.setFieldsValue({
+      enabled_modules: MODULES,
+      sync_interval_min: 30,
+      enabled: true,
+      data_mode: 'stored',
+    })
     setModalOpen(true)
   }
 
@@ -63,20 +70,23 @@ export default function Tenants() {
       enabled_modules: (row.enabled_modules || '').split(',').filter(Boolean),
       secret: '',          // 编辑时密钥留空=不改
       contact_secret: '',
+      mcp_token: '',
       trusted_domain: row.trusted_domain || '',
     })
     setModalOpen(true)
   }
 
   const submit = async () => {
-    const v = await form.validateFields()
-    const payload = {
-      ...v,
-      enabled_modules: (v.enabled_modules || []).join(','),
-      checkin_userids: v.checkin_userids || '',
-      trusted_domain: (v.trusted_domain || '').trim(),
-    }
+    if (saving) return
+    setSaving(true)
     try {
+      const v = await form.validateFields()
+      const payload = {
+        ...v,
+        enabled_modules: (v.enabled_modules || []).join(','),
+        checkin_userids: v.checkin_userids || '',
+        trusted_domain: (v.trusted_domain || '').trim(),
+      }
       if (editing) {
         await api.put(`/admin/tenants/${editing.tenant_id}`, payload)
         message.success('已更新')
@@ -87,7 +97,11 @@ export default function Tenants() {
       setModalOpen(false)
       load()
     } catch (e) {
-      message.error('保存失败: ' + (e.response?.data?.detail || e.message))
+      if (!e.errorFields) {
+        message.error('保存失败: ' + (e.response?.data?.detail || e.message))
+      }
+    } finally {
+      setSaving(false)
     }
   }
 
@@ -188,17 +202,26 @@ export default function Tenants() {
     }
   }
 
-  const openMcpConfig = (row) => {
-    if (!row.mcp_token) {
+  const openMcpConfig = async (row) => {
+    if (mcpLoadingTenant) return
+    if (!row.has_mcp_token) {
       message.warning('该租户未配置 MCP Token')
       return
     }
-    const text = JSON.stringify(buildMcpConfig(row), null, 2)
-    setMcpModal({
-      open: true,
-      title: `MCP 配置 · ${row.display_name || row.tenant_id}`,
-      text,
-    })
+    setMcpLoadingTenant(row.tenant_id)
+    try {
+      const r = await api.get(`/admin/tenants/${row.tenant_id}/mcp-config`)
+      const text = JSON.stringify(buildMcpConfig({ ...row, ...r.data }), null, 2)
+      setMcpModal({
+        open: true,
+        title: `MCP 配置 · ${row.display_name || row.tenant_id}`,
+        text,
+      })
+    } catch (e) {
+      message.error('读取 MCP 配置失败: ' + (e.response?.data?.detail || e.message))
+    } finally {
+      setMcpLoadingTenant(null)
+    }
   }
 
   const openDomain = async (row) => {
@@ -308,6 +331,12 @@ export default function Tenants() {
     },
     { title: '间隔(分)', dataIndex: 'sync_interval_min', key: 'interval', width: 80 },
     {
+      title: '数据模式', dataIndex: 'data_mode', key: 'data_mode', width: 110,
+      render: (v) => v === 'direct'
+        ? <Tag color="purple">企微直连</Tag>
+        : <Tag color="blue">缓存模式</Tag>,
+    },
+    {
       title: '凭证', key: 'cred',
       render: (_, r) => (
         <Space size={4}>
@@ -335,11 +364,17 @@ export default function Tenants() {
       title: '操作', key: 'op', width: 480,
       render: (_, r) => (
         <Space size={4} wrap>
-          <Button size="small" icon={<CopyOutlined />} onClick={() => openMcpConfig(r)}>MCP配置</Button>
+          <Button
+            size="small"
+            icon={<CopyOutlined />}
+            loading={mcpLoadingTenant === r.tenant_id}
+            disabled={!!mcpLoadingTenant && mcpLoadingTenant !== r.tenant_id}
+            onClick={() => openMcpConfig(r)}
+          >MCP配置</Button>
           <Button size="small" icon={<GlobalOutlined />} onClick={() => openDomain(r)}>域名</Button>
-          <Button size="small" icon={<ThunderboltOutlined />} onClick={() => syncNow(r)}>同步</Button>
-          <Button size="small" type="dashed" onClick={() => openForceSync(r)}>全量回拨</Button>
-          <Button size="small" onClick={() => diagnoseSync(r)}>诊断</Button>
+          <Button size="small" icon={<ThunderboltOutlined />} disabled={r.data_mode === 'direct'} onClick={() => syncNow(r)}>同步</Button>
+          <Button size="small" type="dashed" disabled={r.data_mode === 'direct'} onClick={() => openForceSync(r)}>全量回拨</Button>
+          <Button size="small" disabled={r.data_mode === 'direct'} onClick={() => diagnoseSync(r)}>诊断</Button>
           <Button size="small" icon={<EditOutlined />} onClick={() => openEdit(r)}>编辑</Button>
           <Button size="small" danger icon={<DeleteOutlined />} onClick={() => remove(r)} />
         </Space>
@@ -355,10 +390,11 @@ export default function Tenants() {
         <Text type="secondary">点「MCP配置」可一键复制 WorkBuddy 连接 JSON</Text>
       </Space>
       <Table rowKey="tenant_id" columns={columns} dataSource={data} loading={loading} size="middle"
-        pagination={false} scroll={{ x: 1100 }} />
+        pagination={false} scroll={{ x: 1200 }} />
 
       <Modal title={editing ? '编辑租户' : '新增租户'} open={modalOpen} onOk={submit}
-        onCancel={() => setModalOpen(false)} width={620} okText="保存" cancelText="取消">
+        onCancel={() => setModalOpen(false)} width={620} okText="保存" cancelText="取消"
+        confirmLoading={saving}>
         <Form form={form} layout="vertical">
           <Form.Item name="tenant_id" label="租户ID" rules={[{ required: true }]}>
             <Input disabled={!!editing} placeholder="如 customerA" />
@@ -367,9 +403,9 @@ export default function Tenants() {
           <Form.Item name="corpid" label="企业CorpID" rules={[{ required: true }]}>
             <Input placeholder="wwXXXXXXXX" />
           </Form.Item>
-          <Form.Item name="mcp_token" label="MCP连接Token(workbuddy用)" rules={[{ required: true }]}
-            extra="给客户配在 workbuddy 的 MCP Server headers；也可用列表「MCP配置」一键复制">
-            <Input placeholder="长随机串" />
+          <Form.Item name="mcp_token" label="MCP连接Token(workbuddy用)" rules={[{ required: !editing }]}
+            extra={editing ? '留空=保留现有 Token' : '给客户配在 workbuddy 的 MCP Server headers；也可用列表「MCP配置」一键复制'}>
+            <Input.Password placeholder={editing ? '****（不改留空）' : '长随机串'} />
           </Form.Item>
           <Form.Item name="secret" label="自建应用Secret"
             extra={editing ? '留空=不修改' : '必填'}>
@@ -378,6 +414,13 @@ export default function Tenants() {
           <Form.Item name="contact_secret" label="通讯录同步Secret（可选）"
             extra="配置后自动拉全企业userid喂打卡；留空=不改">
             <Input.Password placeholder={editing ? '****（不改留空）' : ''} />
+          </Form.Item>
+          <Form.Item name="data_mode" label="数据模式" rules={[{ required: true }]}
+            extra="缓存模式定时写入 MySQL；企微直连每次实时请求且不保存业务数据">
+            <Select options={[
+              { value: 'stored', label: '缓存模式（MySQL）' },
+              { value: 'direct', label: '企微直连（不保存业务数据）' },
+            ]} />
           </Form.Item>
           <Form.Item name="enabled_modules" label="启用模块" rules={[{ required: true }]}>
             <Select mode="multiple" options={MODULES.map(m => ({ value: m, label: m }))} />
