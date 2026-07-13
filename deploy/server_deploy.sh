@@ -223,8 +223,12 @@ if curl -fs http://127.0.0.1:8001/health 2>/dev/null; then
   echo ""
   echo "✅ 部署成功"
 else
-  echo "⚠️  健康检查未通过，查日志："
-  echo "    docker compose logs --tail=50"
+  echo "❌ 健康检查未通过，部署失败"
+  echo "===== 容器状态 ====="
+  docker compose ps || true
+  echo "===== 最近日志 ====="
+  docker compose logs --tail=50 || true
+  exit 1
 fi
 
 echo ""
