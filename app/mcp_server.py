@@ -137,11 +137,14 @@ def _run_real(tool, target, params, started_at, call):
             else ("error" if result.get("errcode") else "ok")
         )
     except Exception as exc:
+        logger.warning(
+            "MCP data access failed tool=%s: %s", tool, type(exc).__name__
+        )
         result = {
             "tenant": ctx.tenant_id,
             "source": "wecom" if ctx.data_mode == "direct" else "db",
             "errcode": 502,
-            "errmsg": str(exc),
+            "errmsg": "数据访问失败",
         }
         status = "error"
     _audit(tool, target, params, status, int((time.time() - started_at) * 1000))
