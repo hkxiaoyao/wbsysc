@@ -286,8 +286,16 @@ def create_tenant(body: TenantUpsert, request: Request):
                 "cs": contact_enc, "td": trusted_domain, "dm": body.data_mode,
                 "en": 1 if body.enabled else 0,
             })
-    except Exception as e:
-        raise HTTPException(400, f"写入失败(可能租户ID/corpid/token重复): {e}")
+    except Exception as exc:
+        logger.warning(
+            "tenant create write failed tenant=%s error_type=%s",
+            body.tenant_id,
+            type(exc).__name__,
+        )
+        raise HTTPException(
+            400,
+            "写入失败，可能租户 ID、企业 ID 或 MCP Token 重复",
+        ) from None
 
     ensure_schema(schema_name)   # 建该租户 schema + 业务表
     reload_tenants()

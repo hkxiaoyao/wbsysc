@@ -235,6 +235,44 @@ def test_create_tenant_writes_data_mode(monkeypatch):
     assert executed["values"]["dm"] == "direct"
 
 
+def test_create_tenant_redacts_database_error_details(monkeypatch, caplog):
+    leaked = "mysql://admin:db-secret@host/db?access_token=token-secret"
+
+    class Connection:
+        def __enter__(self):
+            return self
+
+        def __exit__(self, exc_type, exc, traceback):
+            return False
+
+        def execute(self, statement, values):
+            raise RuntimeError(leaked)
+
+    class Engine:
+        def begin(self):
+            return Connection()
+
+    monkeypatch.setattr(admin, "_require_auth", lambda request: None)
+    monkeypatch.setattr(admin, "ensure_domain_tables", lambda: None)
+    monkeypatch.setattr(admin, "get_engine", lambda: Engine())
+    monkeypatch.setattr(admin, "encrypt_secret", lambda value: f"enc:{value}")
+    body = admin.TenantUpsert(
+        tenant_id="tenant-a",
+        corpid="ww123",
+        secret="app-secret",
+        mcp_token="token-1234567890",
+    )
+
+    with pytest.raises(HTTPException) as exc:
+        admin.create_tenant(body, SimpleNamespace(cookies={}, headers={}))
+
+    assert exc.value.status_code == 400
+    assert exc.value.detail == "写入失败，可能租户 ID、企业 ID 或 MCP Token 重复"
+    assert leaked not in exc.value.detail
+    assert leaked not in caplog.text
+    assert "RuntimeError" in caplog.text
+
+
 def test_update_tenant_keeps_existing_token_when_blank(monkeypatch):
     executed = {}
 
