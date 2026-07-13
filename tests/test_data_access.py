@@ -226,6 +226,78 @@ def test_direct_approvals_sort_newest_and_apply_limit(monkeypatch):
     assert [record["sp_no"] for record in result["records"]] == ["new"]
 
 
+def test_direct_reports_choose_newest_detail_from_unsorted_pages(monkeypatch):
+    def list_records(corpid, secret, start, end, cursor, limit, filters):
+        if cursor == 0:
+            return {
+                "errcode": 0,
+                "errmsg": "ok",
+                "journaluuid_list": ["older-on-first-page"],
+                "endflag": 0,
+                "next_cursor": 7,
+            }
+        return {
+            "errcode": 0,
+            "errmsg": "ok",
+            "journaluuid_list": ["newer-on-second-page"],
+            "endflag": 1,
+            "next_cursor": 0,
+        }
+
+    def get_detail(corpid, secret, identifier):
+        report_time = 200 if identifier == "newer-on-second-page" else 100
+        return {
+            "errcode": 0,
+            "errmsg": "ok",
+            "info": {"journaluuid": identifier, "report_time": report_time},
+        }
+
+    monkeypatch.setattr(report_sync.api, "list_report_records", list_records)
+    monkeypatch.setattr(report_sync.api, "get_report_detail", get_detail)
+
+    result = data_access.list_reports(
+        ctx("direct"), 1, report_sync.MONTH, 1
+    )
+
+    assert result["count"] == 1
+    assert result["records"][0]["journaluuid"] == "newer-on-second-page"
+
+
+def test_direct_approvals_choose_newest_detail_from_unsorted_pages(monkeypatch):
+    def list_approvals(corpid, secret, start, end, cursor, size, filters):
+        if cursor == "":
+            return {
+                "errcode": 0,
+                "errmsg": "ok",
+                "sp_no_list": ["older-on-first-page"],
+                "new_next_cursor": "cursor-2",
+            }
+        return {
+            "errcode": 0,
+            "errmsg": "ok",
+            "sp_no_list": ["newer-on-second-page"],
+            "new_next_cursor": "",
+        }
+
+    def get_detail(corpid, secret, identifier):
+        apply_time = 200 if identifier == "newer-on-second-page" else 100
+        return {
+            "errcode": 0,
+            "errmsg": "ok",
+            "info": {"sp_no": identifier, "apply_time": apply_time},
+        }
+
+    monkeypatch.setattr(approval_sync.api, "list_approvals", list_approvals)
+    monkeypatch.setattr(approval_sync.api, "get_approval_detail", get_detail)
+
+    result = data_access.list_approvals(
+        ctx("direct"), 1, approval_sync.SPAN, 1
+    )
+
+    assert result["count"] == 1
+    assert result["records"][0]["sp_no"] == "newer-on-second-page"
+
+
 def test_direct_checkins_raise_when_every_api_attempt_fails(monkeypatch):
     context = ctx("direct")
     context.contact_secret = ""

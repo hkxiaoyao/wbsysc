@@ -66,12 +66,12 @@ def sync_approvals_window(
                 if sp not in seen:
                     seen.add(sp)
                     result.append(sp)
-                    if max_records is not None and len(result) >= max_records:
-                        return result
             next_cursor = resp.get("new_next_cursor", "")
             if not sp_list or not next_cursor:
                 break
             cursor = next_cursor
+        if max_records is not None and len(result) >= max_records:
+            return result
 
     if not result:
         logger.warning(

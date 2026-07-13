@@ -64,8 +64,6 @@ def sync_reports_window(
                 if u not in seen:
                     seen.add(u)
                     result.append(u)
-                    if max_records is not None and len(result) >= max_records:
-                        return result
             # 官方：endflag=1 表示已无数据；空列表且无 next_cursor 也结束
             # 不要仅因 uuids 为空就 break（兼容异常分页）
             next_cursor = resp.get("next_cursor", 0)
@@ -76,6 +74,8 @@ def sync_reports_window(
             if not next_cursor:
                 break
             cursor = next_cursor
+        if max_records is not None and len(result) >= max_records:
+            return result
 
     if not result:
         logger.warning(
