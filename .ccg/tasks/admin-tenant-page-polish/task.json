@@ -1,0 +1,12 @@
+{
+  "id": "admin-tenant-page-polish",
+  "title": "优化租户管理页面",
+  "status": "in_progress",
+  "complexity": "M",
+  "risk": "medium",
+  "domain": "frontend",
+  "currentPhase": "analysis",
+  "nextAction": "等待用户审阅页面优化设计规格",
+  "createdAt": "2026-07-13T14:39:52Z",
+  "branch": "main"
+}
