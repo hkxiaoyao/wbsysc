@@ -1,7 +1,7 @@
 """
 MCP Server - 暴露给 workbuddy 的 tools（多租户版）
 - mock 模式：返回脱敏 mock 数据
-- 真实模式：按当前 token 绑定的租户 schema 读库（强制隔离）
+- 真实模式：stored 读租户 schema，direct 实时请求企微
 - 调用写审计日志到对应租户 schema
 """
 from __future__ import annotations
@@ -136,6 +136,17 @@ def _run_real(tool, target, params, started_at, call):
             if result.get("partial_count")
             else ("error" if result.get("errcode") else "ok")
         )
+    except data_access.PublicDataAccessError as exc:
+        logger.warning(
+            "MCP data access failed tool=%s: %s", tool, type(exc).__name__
+        )
+        result = {
+            "tenant": ctx.tenant_id,
+            "source": exc.source,
+            "errcode": exc.errcode,
+            "errmsg": exc.public_message,
+        }
+        status = "error"
     except Exception as exc:
         logger.warning(
             "MCP data access failed tool=%s: %s", tool, type(exc).__name__
@@ -154,7 +165,9 @@ def _run_real(tool, target, params, started_at, call):
 # ============= 汇报类 =============
 @mcp.tool()
 def wecom_list_reports(starttime: int, endtime: int, limit: int = 100) -> str:
-    """列出企业微信汇报记录（读已落库数据，按租户 schema 隔离）
+    """列出企业微信汇报记录。
+
+    stored 模式读取租户 schema；direct 模式实时请求企业微信。
 
     Args:
         starttime/endtime: Unix 秒; limit: ≤100
@@ -174,7 +187,7 @@ def wecom_list_reports(starttime: int, endtime: int, limit: int = 100) -> str:
 
 @mcp.tool()
 def wecom_get_report(journaluuid: str) -> str:
-    """获取汇报详情（读该租户 schema 内的完整 detail_json）"""
+    """获取汇报详情；stored 读租户 schema，direct 实时请求企业微信。"""
     t0 = time.time()
     tenant = require_tenant()
 
@@ -191,7 +204,7 @@ def wecom_get_report(journaluuid: str) -> str:
 # ============= 审批类 =============
 @mcp.tool()
 def wecom_list_approvals(starttime: int, endtime: int, limit: int = 100) -> str:
-    """列出企业微信审批记录（读已落库数据，按租户 schema 隔离）"""
+    """列出审批记录；stored 读租户 schema，direct 实时请求企业微信。"""
     t0 = time.time()
     tenant = require_tenant()
 
@@ -207,7 +220,7 @@ def wecom_list_approvals(starttime: int, endtime: int, limit: int = 100) -> str:
 
 @mcp.tool()
 def wecom_get_approval_detail(sp_no: str) -> str:
-    """获取审批详情（读该租户 schema 内的完整 detail_json）"""
+    """获取审批详情；stored 读租户 schema，direct 实时请求企业微信。"""
     t0 = time.time()
     tenant = require_tenant()
 
@@ -224,7 +237,9 @@ def wecom_get_approval_detail(sp_no: str) -> str:
 # ============= 打卡类 =============
 @mcp.tool()
 def wecom_list_checkins(starttime: int, endtime: int, limit: int = 100) -> str:
-    """列出企业微信打卡记录（读已落库数据，按租户 schema 隔离）
+    """列出企业微信打卡记录。
+
+    stored 模式读取租户 schema；direct 模式实时请求企业微信。
 
     Args:
         starttime/endtime: Unix 秒（打卡时间范围）; limit: ≤100

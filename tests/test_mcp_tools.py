@@ -53,6 +53,19 @@ def test_registered_tool_names_and_signatures_remain_compatible():
     } == EXPECTED_TOOL_SIGNATURES
 
 
+def test_real_data_tool_docstrings_describe_stored_and_direct_modes():
+    for name in (
+        "wecom_list_reports",
+        "wecom_get_report",
+        "wecom_list_approvals",
+        "wecom_get_approval_detail",
+        "wecom_list_checkins",
+    ):
+        doc = getattr(mcp_server, name).__doc__ or ""
+        assert "stored" in doc, name
+        assert "direct" in doc, name
+
+
 @pytest.mark.parametrize(
     ("tool_name", "accessor_name", "args"),
     [
@@ -184,6 +197,62 @@ def test_direct_accessor_failure_redacts_secrets_and_does_not_fall_back(
     for secret in ("corp-secret", "token-value", "db-password"):
         assert secret not in response
         assert secret not in caplog.text
+
+
+def test_public_wecom_failure_returns_controlled_error_and_audits_error(
+    monkeypatch, use_tenant_ctx, caplog
+):
+    use_tenant_ctx("direct")
+    sensitive = (
+        "secret=corp-secret access_token=token-value "
+        "mysql+pymysql://root:db-password@db/gateway [40014]"
+    )
+    audits = []
+    monkeypatch.setattr(mcp_server, "_use_mock", lambda: False)
+    monkeypatch.setattr(
+        mcp_server.data_access,
+        "sync_reports_window",
+        lambda *args, **kwargs: (_ for _ in ()).throw(RuntimeError(sensitive)),
+    )
+    monkeypatch.setattr(mcp_server, "_audit", lambda *values: audits.append(values))
+
+    with caplog.at_level("WARNING", logger="app.mcp_server"):
+        response = mcp_server.wecom_list_reports(1, 2, 10)
+
+    assert json.loads(response) == {
+        "tenant": "tenant-a",
+        "source": "wecom",
+        "errcode": 40014,
+        "errmsg": "企微汇报请求失败",
+    }
+    assert len(audits) == 1
+    assert audits[0][3] == "error"
+    assert "PublicDataAccessError" in caplog.text
+    for secret in ("corp-secret", "token-value", "db-password"):
+        assert secret not in response
+        assert secret not in caplog.text
+
+
+def test_missing_checkin_identity_returns_actionable_public_error(
+    monkeypatch, use_tenant_ctx, caplog
+):
+    use_tenant_ctx("direct")
+    audits = []
+    monkeypatch.setattr(mcp_server, "_use_mock", lambda: False)
+    monkeypatch.setattr(mcp_server, "_audit", lambda *values: audits.append(values))
+
+    with caplog.at_level("WARNING", logger="app.mcp_server"):
+        result = json.loads(mcp_server.wecom_list_checkins(1, 2, 10))
+
+    assert result == {
+        "tenant": "tenant-a",
+        "source": "wecom",
+        "errcode": 400,
+        "errmsg": "直连打卡需要配置通讯录 Secret 或手工 userid",
+    }
+    assert len(audits) == 1
+    assert audits[0][3] == "error"
+    assert "PublicDataAccessError" in caplog.text
 
 
 @pytest.mark.parametrize(

@@ -38,12 +38,18 @@ def test_direct_reports_keep_failed_detail_as_partial(monkeypatch):
         data_access,
         "fetch_report_detail",
         lambda corpid, secret, value: {"journaluuid": "r1", "report_time": 100}
-        if value == "r1" else {"errcode": 40001, "errmsg": "invalid credential"},
+        if value == "r1" else {
+            "errcode": 40001,
+            "errmsg": "access_token=token-value secret=corp-secret",
+        },
     )
     result = data_access.list_reports(ctx("direct"), 1, 200, 20)
     assert result["source"] == "wecom"
     assert result["partial_count"] == 1
     assert result["records"][1]["_partial"] is True
+    assert result["records"][1]["errmsg"] == "企微汇报详情请求失败"
+    assert "token-value" not in repr(result)
+    assert "corp-secret" not in repr(result)
 
 
 def test_direct_limit_is_bounded_to_100(monkeypatch):
@@ -62,19 +68,29 @@ def test_direct_approval_detail_failure_is_partial(monkeypatch):
     monkeypatch.setattr(
         data_access,
         "fetch_approval_detail",
-        lambda *args: {"errcode": 301055, "errmsg": "not authorized"},
+        lambda *args: {
+            "errcode": 301055,
+            "errmsg": "access_token=token-value secret=corp-secret",
+        },
     )
     result = data_access.list_approvals(ctx("direct"), 1, 200, 20)
     assert result["partial_count"] == 1
     assert result["records"][0]["sp_no"] == "sp1"
+    assert result["records"][0]["errmsg"] == "企微审批详情请求失败"
+    assert "token-value" not in repr(result)
+    assert "corp-secret" not in repr(result)
 
 
 def test_direct_checkins_require_userids(monkeypatch):
     context = ctx("direct")
     context.contact_secret = ""
     context.checkin_userids = []
-    with pytest.raises(ValueError, match="userid"):
+    with pytest.raises(data_access.PublicDataAccessError) as caught:
         data_access.list_checkins(context, 1, 200, 20)
+    assert caught.value.errcode == 400
+    assert caught.value.source == "wecom"
+    assert "通讯录 Secret" in caught.value.public_message
+    assert "userid" in caught.value.public_message
 
 
 def test_direct_reports_do_not_query_database(monkeypatch):
@@ -312,8 +328,11 @@ def test_direct_checkins_raise_when_every_api_attempt_fails(monkeypatch):
         },
     )
 
-    with pytest.raises(RuntimeError, match="全部失败"):
+    with pytest.raises(data_access.PublicDataAccessError) as caught:
         data_access.list_checkins(context, 1, 200, 20)
+    assert caught.value.errcode == 301021
+    assert caught.value.source == "wecom"
+    assert caught.value.public_message == "企微打卡请求失败"
 
 
 def test_direct_checkins_handle_null_error_message(monkeypatch):
@@ -326,8 +345,10 @@ def test_direct_checkins_handle_null_error_message(monkeypatch):
         lambda *args: {"errcode": 301021, "errmsg": None, "checkindata": []},
     )
 
-    with pytest.raises(RuntimeError, match="打卡数据不可用"):
+    with pytest.raises(data_access.PublicDataAccessError) as caught:
         data_access.list_checkins(context, 1, 200, 20)
+    assert caught.value.errcode == 301021
+    assert caught.value.public_message == "企微打卡请求失败"
 
 
 def test_direct_checkins_report_partial_api_failures(monkeypatch):
@@ -359,6 +380,199 @@ def test_direct_checkins_report_partial_api_failures(monkeypatch):
     assert result["count"] == 1
     assert result["partial_count"] == 1
     assert result["errors"][0]["userid"] == "bad"
+
+
+@pytest.mark.parametrize(
+    ("accessor_name", "dependency_name", "expected_message"),
+    [
+        ("list_reports", "sync_reports_window", "企微汇报请求失败"),
+        ("list_approvals", "sync_approvals_window", "企微审批请求失败"),
+        ("list_checkins", "fetch_all_userids", "企微打卡请求失败"),
+    ],
+)
+def test_known_direct_source_failures_raise_safe_public_errors(
+    monkeypatch, accessor_name, dependency_name, expected_message
+):
+    sensitive = (
+        "secret=corp-secret access_token=token-value "
+        "mysql+pymysql://root:db-password@db/gateway [40014]"
+    )
+    monkeypatch.setattr(
+        data_access,
+        dependency_name,
+        lambda *args, **kwargs: (_ for _ in ()).throw(RuntimeError(sensitive)),
+    )
+
+    with pytest.raises(data_access.PublicDataAccessError) as caught:
+        getattr(data_access, accessor_name)(ctx("direct"), 1, 200, 20)
+
+    error = caught.value
+    assert error.errcode == 40014
+    assert error.source == "wecom"
+    assert error.public_message == expected_message
+    assert error.__context__ is None
+    for secret in ("corp-secret", "token-value", "db-password"):
+        assert secret not in str(error)
+        assert secret not in repr(error.__dict__)
+
+
+@pytest.mark.parametrize(
+    ("accessor_name", "dependency_name", "identifier", "expected_message"),
+    [
+        ("get_report", "fetch_report_detail", "r1", "企微汇报请求失败"),
+        ("get_approval", "fetch_approval_detail", "sp1", "企微审批请求失败"),
+    ],
+)
+def test_direct_detail_errors_become_safe_public_errors(
+    monkeypatch, accessor_name, dependency_name, identifier, expected_message
+):
+    monkeypatch.setattr(
+        data_access,
+        dependency_name,
+        lambda *args: {
+            "errcode": 40014,
+            "errmsg": "access_token=token-value secret=corp-secret",
+        },
+    )
+
+    with pytest.raises(data_access.PublicDataAccessError) as caught:
+        getattr(data_access, accessor_name)(ctx("direct"), identifier)
+
+    assert caught.value.errcode == 40014
+    assert caught.value.source == "wecom"
+    assert caught.value.public_message == expected_message
+    assert "token-value" not in str(caught.value)
+    assert "corp-secret" not in str(caught.value)
+
+
+def test_partial_checkin_errors_do_not_expose_exception_text(monkeypatch):
+    context = ctx("direct")
+    context.contact_secret = ""
+    context.checkin_userids = ["bad", "good"]
+
+    def get_checkin_data(corpid, secret, start, end, userids, data_type):
+        if userids == ["bad"]:
+            raise RuntimeError(
+                "secret=corp-secret access_token=token-value "
+                "mysql://root:db-password@db/gateway"
+            )
+        return {
+            "errcode": 0,
+            "errmsg": "ok",
+            "checkindata": [{"userid": "good", "checkin_time": 100}],
+        }
+
+    monkeypatch.setattr(checkin_sync.api, "get_checkin_data", get_checkin_data)
+
+    result = data_access.list_checkins(context, 1, 200, 20)
+
+    assert result["partial_count"] == 1
+    assert result["errors"] == [{
+        "userid": "bad",
+        "errcode": None,
+        "errmsg": "企微打卡请求失败",
+    }]
+    serialized = repr(result)
+    for secret in ("corp-secret", "token-value", "db-password"):
+        assert secret not in serialized
+
+
+def test_direct_reports_latest_segment_all_pages_then_detail_sort(monkeypatch):
+    list_calls = []
+    detail_calls = []
+
+    def list_records(corpid, secret, start, end, cursor, limit, filters):
+        list_calls.append((start, end, cursor))
+        if start < report_sync.MONTH:
+            raise AssertionError("older report segment must not be requested")
+        if cursor == 0:
+            return {
+                "errcode": 0,
+                "journaluuid_list": ["latest-segment-older-detail"],
+                "endflag": 0,
+                "next_cursor": 7,
+            }
+        return {
+            "errcode": 0,
+            "journaluuid_list": ["latest-segment-newest-detail"],
+            "endflag": 1,
+            "next_cursor": 0,
+        }
+
+    def get_detail(corpid, secret, identifier):
+        detail_calls.append(identifier)
+        report_time = 200 if identifier.endswith("newest-detail") else 100
+        return {
+            "errcode": 0,
+            "info": {"journaluuid": identifier, "report_time": report_time},
+        }
+
+    monkeypatch.setattr(report_sync.api, "list_report_records", list_records)
+    monkeypatch.setattr(report_sync.api, "get_report_detail", get_detail)
+
+    result = data_access.list_reports(
+        ctx("direct"), 0, report_sync.MONTH * 2, 1
+    )
+
+    assert list_calls == [
+        (report_sync.MONTH, report_sync.MONTH * 2, 0),
+        (report_sync.MONTH, report_sync.MONTH * 2, 7),
+    ]
+    assert detail_calls == [
+        "latest-segment-older-detail",
+        "latest-segment-newest-detail",
+    ]
+    assert [record["journaluuid"] for record in result["records"]] == [
+        "latest-segment-newest-detail"
+    ]
+
+
+def test_direct_approvals_latest_segment_all_pages_then_detail_sort(monkeypatch):
+    list_calls = []
+    detail_calls = []
+
+    def list_approvals(corpid, secret, start, end, cursor, size, filters):
+        list_calls.append((start, end, cursor))
+        if start < approval_sync.SPAN:
+            raise AssertionError("older approval segment must not be requested")
+        if cursor == "":
+            return {
+                "errcode": 0,
+                "sp_no_list": ["latest-segment-older-detail"],
+                "new_next_cursor": "cursor-2",
+            }
+        return {
+            "errcode": 0,
+            "sp_no_list": ["latest-segment-newest-detail"],
+            "new_next_cursor": "",
+        }
+
+    def get_detail(corpid, secret, identifier):
+        detail_calls.append(identifier)
+        apply_time = 200 if identifier.endswith("newest-detail") else 100
+        return {
+            "errcode": 0,
+            "info": {"sp_no": identifier, "apply_time": apply_time},
+        }
+
+    monkeypatch.setattr(approval_sync.api, "list_approvals", list_approvals)
+    monkeypatch.setattr(approval_sync.api, "get_approval_detail", get_detail)
+
+    result = data_access.list_approvals(
+        ctx("direct"), 0, approval_sync.SPAN * 2, 1
+    )
+
+    assert list_calls == [
+        (approval_sync.SPAN, approval_sync.SPAN * 2, ""),
+        (approval_sync.SPAN, approval_sync.SPAN * 2, "cursor-2"),
+    ]
+    assert detail_calls == [
+        "latest-segment-older-detail",
+        "latest-segment-newest-detail",
+    ]
+    assert [record["sp_no"] for record in result["records"]] == [
+        "latest-segment-newest-detail"
+    ]
 
 
 def test_background_checkin_fetch_remains_tolerant(monkeypatch):

@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import re
+
 from . import db
 from .auth import TenantCtx
 from .wecom.approval_sync import fetch_approval_detail, sync_approvals_window
@@ -8,16 +10,47 @@ from .wecom.contact import fetch_all_userids
 from .wecom.sync import fetch_report_detail, sync_reports_window
 
 
+class PublicDataAccessError(Exception):
+    """可安全返回给 MCP 调用方的数据访问错误。"""
+
+    def __init__(self, errcode: int, public_message: str, source: str):
+        super().__init__(public_message)
+        self.errcode = int(errcode)
+        self.public_message = public_message
+        self.source = source
+
+
 def _limit(value: int) -> int:
     return max(1, min(int(value or 100), 100))
 
 
-def _wecom_partial(identifier: str, response: dict) -> dict:
+def _safe_errcode(value, default: int = 502) -> int:
+    try:
+        return int(value)
+    except (TypeError, ValueError):
+        return default
+
+
+def _known_wecom_call(call, public_message: str):
+    errcode = None
+    try:
+        return call()
+    except PublicDataAccessError:
+        raise
+    except Exception as exc:
+        match = re.search(r"\[(-?\d+)\]", str(exc))
+        if not match:
+            raise
+        errcode = int(match.group(1))
+    raise PublicDataAccessError(errcode, public_message, "wecom")
+
+
+def _wecom_partial(identifier: str, response: dict, public_message: str) -> dict:
     return {
         "id": identifier,
         "_partial": True,
-        "errcode": response.get("errcode"),
-        "errmsg": response.get("errmsg", "detail unavailable"),
+        "errcode": _safe_errcode(response.get("errcode")),
+        "errmsg": public_message,
     }
 
 
@@ -41,14 +74,17 @@ def list_reports(ctx: TenantCtx, starttime: int, endtime: int, limit: int) -> di
             "partial_count": sum(bool(record["_partial"]) for record in records),
         }
 
-    identifiers = sync_reports_window(
-        ctx.corpid, ctx.secret, starttime, endtime, max_records=size
+    identifiers = _known_wecom_call(
+        lambda: sync_reports_window(
+            ctx.corpid, ctx.secret, starttime, endtime, max_records=size
+        ),
+        "企微汇报请求失败",
     )
     records = []
     for identifier in identifiers:
         detail = fetch_report_detail(ctx.corpid, ctx.secret, identifier)
         if detail.get("errcode") not in (None, 0):
-            partial = _wecom_partial(identifier, detail)
+            partial = _wecom_partial(identifier, detail, "企微汇报详情请求失败")
             partial["journaluuid"] = identifier
             records.append(partial)
             continue
@@ -76,7 +112,9 @@ def get_report(ctx: TenantCtx, journaluuid: str) -> dict:
         return {"source": "db", "detail": detail}
     detail = fetch_report_detail(ctx.corpid, ctx.secret, journaluuid)
     if detail.get("errcode") not in (None, 0):
-        return {"source": "wecom", **detail}
+        raise PublicDataAccessError(
+            _safe_errcode(detail.get("errcode")), "企微汇报请求失败", "wecom"
+        )
     return {"source": "wecom", "detail": detail}
 
 
@@ -101,14 +139,17 @@ def list_approvals(ctx: TenantCtx, starttime: int, endtime: int, limit: int) -> 
             "partial_count": sum(bool(record["_partial"]) for record in records),
         }
 
-    identifiers = sync_approvals_window(
-        ctx.corpid, ctx.secret, starttime, endtime, max_records=size
+    identifiers = _known_wecom_call(
+        lambda: sync_approvals_window(
+            ctx.corpid, ctx.secret, starttime, endtime, max_records=size
+        ),
+        "企微审批请求失败",
     )
     records = []
     for identifier in identifiers:
         detail = fetch_approval_detail(ctx.corpid, ctx.secret, identifier)
         if detail.get("errcode") not in (None, 0):
-            partial = _wecom_partial(identifier, detail)
+            partial = _wecom_partial(identifier, detail, "企微审批详情请求失败")
             partial["sp_no"] = identifier
             records.append(partial)
             continue
@@ -145,7 +186,9 @@ def get_approval(ctx: TenantCtx, sp_no: str) -> dict:
         return {"source": "db", "detail": detail}
     detail = fetch_approval_detail(ctx.corpid, ctx.secret, sp_no)
     if detail.get("errcode") not in (None, 0):
-        return {"source": "wecom", **detail}
+        raise PublicDataAccessError(
+            _safe_errcode(detail.get("errcode")), "企微审批请求失败", "wecom"
+        )
     return {"source": "wecom", "detail": detail}
 
 
@@ -169,22 +212,28 @@ def list_checkins(ctx: TenantCtx, starttime: int, endtime: int, limit: int) -> d
             "partial_count": 0,
         }
 
-    userids = (
-        fetch_all_userids(ctx.corpid, ctx.contact_secret)
-        if ctx.contact_secret
-        else list(ctx.checkin_userids)
-    )
+    if ctx.contact_secret:
+        userids = _known_wecom_call(
+            lambda: fetch_all_userids(ctx.corpid, ctx.contact_secret),
+            "企微打卡请求失败",
+        )
+    else:
+        userids = list(ctx.checkin_userids)
     if not userids:
-        raise ValueError("直连打卡需要通讯录 Secret 或手工 userid")
+        raise PublicDataAccessError(
+            400,
+            "直连打卡需要配置通讯录 Secret 或手工 userid",
+            "wecom",
+        )
     fetch_result = fetch_checkin_records_with_stats(
         ctx.corpid, ctx.secret, starttime, endtime, userids
     )
     if fetch_result.attempted and fetch_result.failed == fetch_result.attempted:
         first_error = fetch_result.errors[0] if fetch_result.errors else {}
-        raise RuntimeError(
-            "直连打卡拉取全部失败 "
-            f"({fetch_result.failed}/{fetch_result.attempted}): "
-            f"[{first_error.get('errcode')}] {first_error.get('errmsg', '未知错误')}"
+        raise PublicDataAccessError(
+            _safe_errcode(first_error.get("errcode")),
+            "企微打卡请求失败",
+            "wecom",
         )
     records = fetch_result.records
     records.sort(
@@ -192,11 +241,20 @@ def list_checkins(ctx: TenantCtx, starttime: int, endtime: int, limit: int) -> d
         reverse=True,
     )
     selected = records[:size]
+    public_errors = [{
+        "userid": error.get("userid", ""),
+        "errcode": (
+            _safe_errcode(error.get("errcode"))
+            if error.get("errcode") is not None
+            else None
+        ),
+        "errmsg": "企微打卡请求失败",
+    } for error in fetch_result.errors]
     return {
         "tenant": ctx.tenant_id,
         "source": "wecom",
         "count": len(selected),
         "records": selected,
         "partial_count": fetch_result.failed,
-        "errors": fetch_result.errors,
+        "errors": public_errors,
     }
