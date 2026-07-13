@@ -1,0 +1,346 @@
+.tenant-workbench {
+  --tenant-ink: #17323d;
+  --tenant-stored: #167d95;
+  --tenant-direct: #7356a3;
+  --tenant-canvas: #eef3f5;
+  --tenant-running: #2c8c68;
+  min-height: calc(100vh - 64px);
+  margin: -24px;
+  padding: 24px;
+  color: var(--tenant-ink);
+  background: var(--tenant-canvas);
+}
+
+.tenant-heading {
+  display: flex;
+  align-items: flex-start;
+  justify-content: space-between;
+  gap: 24px;
+  margin-bottom: 20px;
+}
+
+.tenant-heading h1 {
+  margin: 4px 0;
+  color: var(--tenant-ink);
+  font-size: clamp(28px, 3vw, 40px);
+  line-height: 1.08;
+  letter-spacing: -0.035em;
+}
+
+.tenant-heading .ant-typography {
+  margin-bottom: 0;
+}
+
+.tenant-eyebrow {
+  color: var(--tenant-stored);
+  font: 700 11px/1.2 ui-monospace, SFMono-Regular, Consolas, monospace;
+  letter-spacing: 0.14em;
+}
+
+.tenant-status-rail {
+  display: grid;
+  grid-template-columns: repeat(4, minmax(0, 1fr));
+  overflow: hidden;
+  margin-bottom: 16px;
+  border: 1px solid #d7e1e5;
+  border-radius: 12px;
+  background: #fff;
+}
+
+.status-rail-item {
+  position: relative;
+  display: flex;
+  align-items: baseline;
+  justify-content: space-between;
+  gap: 12px;
+  min-height: 76px;
+  padding: 18px 20px 16px;
+  border-right: 1px solid #e3eaed;
+}
+
+.status-rail-item:last-child {
+  border-right: 0;
+}
+
+.status-rail-item::before {
+  position: absolute;
+  inset: 0 auto 0 0;
+  width: 3px;
+  background: #9badb4;
+  content: '';
+}
+
+.status-rail-item--running::before {
+  background: var(--tenant-running);
+}
+
+.status-rail-item--direct::before {
+  background: var(--tenant-direct);
+}
+
+.status-rail-item--attention::before {
+  background: #c77a2b;
+}
+
+.status-rail-item span {
+  color: #61757e;
+  font-size: 13px;
+}
+
+.status-rail-item strong {
+  color: var(--tenant-ink);
+  font: 700 28px/1 ui-monospace, SFMono-Regular, Consolas, monospace;
+}
+
+.tenant-panel {
+  overflow: hidden;
+  border: 1px solid #d7e1e5;
+  border-radius: 14px;
+  background: #fff;
+}
+
+.tenant-toolbar {
+  display: grid;
+  grid-template-columns: minmax(240px, 1fr) 160px 150px auto;
+  gap: 10px;
+  padding: 14px;
+  border-bottom: 1px solid #e3eaed;
+  background: #f8fafb;
+}
+
+.tenant-panel > .ant-alert {
+  margin: 12px 14px 0;
+}
+
+.tenant-panel .ant-table-wrapper {
+  padding: 0 14px 14px;
+}
+
+.tenant-panel .ant-table-thead > tr > th {
+  color: #60727a;
+  font-size: 12px;
+  font-weight: 700;
+  letter-spacing: 0.035em;
+}
+
+.tenant-panel .ant-table-tbody > tr > td:first-child {
+  position: relative;
+  padding-left: 20px;
+}
+
+.tenant-panel .ant-table-tbody > .tenant-table-row > td:first-child::before {
+  position: absolute;
+  inset: 8px auto 8px 0;
+  width: 4px;
+  border-radius: 0 3px 3px 0;
+  background: var(--tenant-stored);
+  content: '';
+}
+
+.tenant-panel .ant-table-tbody > .tenant-table-row--direct > td:first-child::before {
+  background: var(--tenant-direct);
+}
+
+.tenant-identity,
+.tenant-company,
+.tenant-policy,
+.tenant-status {
+  display: flex;
+  flex-direction: column;
+  align-items: flex-start;
+  gap: 5px;
+  min-width: 0;
+}
+
+.tenant-code {
+  max-width: 100%;
+  overflow: hidden;
+  color: #687b83;
+  font: 12px/1.45 ui-monospace, SFMono-Regular, Consolas, monospace;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.tenant-company > .ant-typography:nth-child(2),
+.tenant-policy .ant-typography:last-child,
+.tenant-status .ant-typography {
+  font-size: 12px;
+}
+
+.tenant-company .ant-tag {
+  margin-inline-end: 0;
+  font-size: 11px;
+}
+
+.mode-tag {
+  margin: 0;
+  border-color: transparent;
+  font-weight: 600;
+}
+
+.mode-tag--stored {
+  color: #0e6679;
+  background: #e4f3f6;
+}
+
+.mode-tag--direct {
+  color: #62428d;
+  background: #f0eafa;
+}
+
+.tenant-menu-label {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+}
+
+.tenant-menu-label small {
+  max-width: 230px;
+  color: #8a969b;
+  font-size: 11px;
+  line-height: 1.35;
+  white-space: normal;
+}
+
+.tenant-workbench .ant-btn:focus-visible,
+.tenant-workbench .ant-input-affix-wrapper:focus-visible,
+.tenant-workbench .ant-select-selector:focus-visible {
+  outline: 2px solid var(--tenant-stored);
+  outline-offset: 2px;
+}
+
+.tenant-editor .ant-drawer-header {
+  border-bottom-color: #dfe7ea;
+}
+
+.tenant-editor .ant-drawer-body {
+  background: #eef3f5;
+}
+
+.tenant-editor .ant-drawer-footer {
+  padding: 12px 24px;
+  border-top-color: #dfe7ea;
+  background: #fff;
+}
+
+.tenant-editor-footer {
+  display: flex;
+  justify-content: flex-end;
+  gap: 10px;
+}
+
+.tenant-form-section {
+  margin-bottom: 14px;
+  padding: 20px 20px 4px;
+  border: 1px solid #d8e2e6;
+  border-radius: 12px;
+  background: #fff;
+}
+
+.tenant-form-section__heading {
+  margin-bottom: 18px;
+  padding-left: 12px;
+  border-left: 3px solid #167d95;
+}
+
+.tenant-form-section__heading h2 {
+  margin: 0;
+  color: #17323d;
+  font-size: 16px;
+  line-height: 1.3;
+}
+
+.tenant-form-section__heading p {
+  margin: 3px 0 0;
+  color: #70828a;
+  font-size: 12px;
+}
+
+.tenant-form-grid {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 0 14px;
+}
+
+.tenant-form-grid .ant-input-number {
+  width: 100%;
+}
+
+@media (max-width: 900px) {
+  .tenant-status-rail {
+    grid-template-columns: repeat(2, minmax(0, 1fr));
+  }
+
+  .status-rail-item:nth-child(2) {
+    border-right: 0;
+  }
+
+  .status-rail-item:nth-child(-n + 2) {
+    border-bottom: 1px solid #e3eaed;
+  }
+}
+
+@media (max-width: 760px) {
+  .tenant-toolbar {
+    grid-template-columns: 1fr 1fr;
+  }
+
+  .tenant-toolbar > .ant-input-affix-wrapper {
+    grid-column: 1 / -1;
+  }
+
+  .tenant-toolbar > .ant-btn {
+    grid-column: 1 / -1;
+  }
+}
+
+@media (max-width: 640px) {
+  .tenant-workbench {
+    padding: 18px 16px 24px;
+  }
+
+  .tenant-heading {
+    align-items: stretch;
+    flex-direction: column;
+    gap: 14px;
+  }
+
+  .tenant-heading > .ant-btn {
+    width: 100%;
+  }
+
+  .status-rail-item {
+    min-height: 68px;
+    padding: 14px;
+  }
+
+  .status-rail-item strong {
+    font-size: 23px;
+  }
+
+  .tenant-panel .ant-table-wrapper {
+    padding-inline: 8px;
+  }
+
+  .tenant-form-grid {
+    grid-template-columns: 1fr;
+  }
+
+  .tenant-form-section {
+    padding-inline: 14px;
+  }
+
+  .tenant-editor .ant-drawer-content-wrapper {
+    width: calc(100vw - 12px) !important;
+  }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .tenant-workbench *,
+  .tenant-workbench *::before,
+  .tenant-workbench *::after {
+    scroll-behavior: auto !important;
+    transition-duration: 0.01ms !important;
+    animation-duration: 0.01ms !important;
+  }
+}

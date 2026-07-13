@@ -33,6 +33,7 @@ import {
 } from '@ant-design/icons'
 import api from '../api.js'
 import { EMPTY_FILTERS, filterTenants, getDirectModeReason, getTenantStats } from './tenantsView.js'
+import './Tenants.css'
 
 const { Text, Paragraph, Link } = Typography
 const MODULES = ['report', 'approval', 'checkin']
@@ -72,6 +73,7 @@ export default function Tenants() {
     open: false, tenant: null, domain: '', fileList: [], uploading: false, info: null,
   })
   const [form] = Form.useForm()
+  const [modal, modalContextHolder] = Modal.useModal()
 
   const stats = useMemo(() => getTenantStats(data), [data])
   const visibleTenants = useMemo(() => filterTenants(data, filters), [data, filters])
@@ -131,7 +133,7 @@ export default function Tenants() {
       closeEditor()
       return
     }
-    Modal.confirm({
+    modal.confirm({
       title: '放弃未保存的修改？',
       content: '当前租户配置已发生变化，关闭后这些修改不会保留。',
       okText: '放弃修改',
@@ -171,7 +173,7 @@ export default function Tenants() {
   }
 
   const remove = (row) => {
-    Modal.confirm({
+    modal.confirm({
       title: `删除租户 ${row.tenant_id}?`,
       content: '仅删除配置，历史数据schema保留(需另行手动删)。',
       okType: 'danger',
@@ -218,7 +220,7 @@ export default function Tenants() {
 
   const openForceSync = (row) => {
     let days = 90
-    Modal.confirm({
+    modal.confirm({
       title: `强制全量回拨同步 · ${row.tenant_id}`,
       content: (
         <div>
@@ -251,7 +253,7 @@ export default function Tenants() {
         params: { lookback_days: 90 },
       })
       const d = r.data || {}
-      Modal.info({
+      modal.info({
         title: `同步诊断 · ${row.tenant_id}`,
         width: 560,
         content: (
@@ -369,7 +371,7 @@ export default function Tenants() {
   const removeDomainVerify = () => {
     const { tenant } = domainModal
     if (!tenant) return
-    Modal.confirm({
+    modal.confirm({
       title: '删除校验文件？',
       content: '删除后根路径将无法访问该文件；可信域名配置会保留。',
       okType: 'danger',
@@ -510,6 +512,7 @@ export default function Tenants() {
 
   return (
     <>
+      {modalContextHolder}
       <main className="tenant-workbench">
         <header className="tenant-heading">
           <div>

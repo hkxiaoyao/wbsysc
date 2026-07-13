@@ -636,7 +636,7 @@ git commit -m "feat: move tenant configuration into drawer"
 - Consumes: Class names emitted by `Tenants.jsx`.
 - Produces: Approved operations-console palette, continuous status rail, row mode signature, responsive table/tooling, and nearly full-width mobile drawer.
 
-- [ ] **Step 1: Add the complete page stylesheet**
+- [x] **Step 1: Add the complete page stylesheet**
 
 Create `admin-ui/src/pages/Tenants.css`:
 
@@ -795,16 +795,17 @@ Create `admin-ui/src/pages/Tenants.css`:
 }
 ```
 
-- [ ] **Step 2: Run build and Ant Design lint**
+- [x] **Step 2: Run build and Ant Design lint**
 
 ```powershell
-cd D:\app\wbsysc\admin-ui
+cd D:\app\wbsysc\.worktrees\admin-tenant-page-polish\admin-ui
 pnpm run build
+antd lint src/pages/Tenants.jsx --format json
 ```
 
-Expected: build exits `0` without JSX, import, or deprecated-API warnings. Verify the component source against the queried Ant Design 5.29.3 APIs and complete the keyboard/accessibility checks in Task 5 before committing.
+Expected: build exits `0`; Ant Design lint returns `0` issues across deprecated, accessibility, usage, and performance categories.
 
-- [ ] **Step 3: Commit the visual system**
+- [x] **Step 3: Commit the visual system**
 
 ```powershell
 git add admin-ui/src/pages/Tenants.css admin-ui/src/pages/Tenants.jsx
@@ -828,10 +829,11 @@ git commit -m "style: polish tenant operations console"
 - [ ] **Step 1: Run all deterministic checks from a clean command sequence**
 
 ```powershell
-cd D:\app\wbsysc\admin-ui
+cd D:\app\wbsysc\.worktrees\admin-tenant-page-polish\admin-ui
 node --test src/pages/tenantsView.test.js
 pnpm run build
-cd D:\app\wbsysc
+antd lint src/pages/Tenants.jsx --format json
+cd D:\app\wbsysc\.worktrees\admin-tenant-page-polish
 git diff --check
 git status --short
 ```
