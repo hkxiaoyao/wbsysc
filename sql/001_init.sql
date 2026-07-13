@@ -42,6 +42,23 @@ CREATE TABLE IF NOT EXISTS `wecom_approval` (
   KEY `idx_tenant_status` (`tenant_id`,`sp_status`)
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COMMENT='企微审批记录';
 
+CREATE TABLE IF NOT EXISTS `wecom_checkin` (
+  `id` BIGINT NOT NULL AUTO_INCREMENT,
+  `tenant_id` VARCHAR(64) NOT NULL,
+  `userid` VARCHAR(64) NOT NULL,
+  `checkin_type` VARCHAR(32) NOT NULL DEFAULT '',
+  `checkin_time` BIGINT NOT NULL DEFAULT 0,
+  `exception_type` VARCHAR(128) NOT NULL DEFAULT '',
+  `location_title` VARCHAR(256) NOT NULL DEFAULT '',
+  `group_name` VARCHAR(128) NOT NULL DEFAULT '',
+  `detail_json` JSON DEFAULT NULL,
+  `synced_at` DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
+  PRIMARY KEY (`id`),
+  UNIQUE KEY `uk_user_time` (`userid`, `checkin_time`, `checkin_type`),
+  KEY `idx_time` (`checkin_time`),
+  KEY `idx_user_time` (`userid`, `checkin_time`)
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COMMENT='企微打卡记录';
+
 CREATE TABLE IF NOT EXISTS `sync_cursor` (
   `tenant_id`    VARCHAR(64)  NOT NULL,
   `data_source`  VARCHAR(32)  NOT NULL COMMENT 'report/approval',

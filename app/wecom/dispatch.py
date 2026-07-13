@@ -385,6 +385,10 @@ def run_sync_tenant(
     reset_cursor: bool = False,
 ) -> dict:
     """在租户级互斥锁内同步；reset 与本轮同步共享同一锁。"""
+    if t.data_mode == "direct":
+        logger.info("跳过直连租户核心同步 tenant=%s", t.tenant_id)
+        return {"skipped": "direct_mode"}
+
     base_entry: dict = {
         "lookback_days": lookback_days,
         "force": force,

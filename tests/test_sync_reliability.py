@@ -2,6 +2,7 @@ from contextlib import contextmanager
 from types import SimpleNamespace
 
 import pytest
+from sqlalchemy import create_engine, text
 from sqlalchemy.pool import NullPool
 
 from app import db
@@ -314,6 +315,54 @@ def test_partial_upserts_guard_existing_complete_rows(monkeypatch):
     assert connection.params[1]["partial"] == 1
     assert connection.params[2]["partial"] == 0
     assert connection.params[3]["partial"] == 0
+
+
+def test_partial_records_use_source_window_end_for_limit_ordering(monkeypatch):
+    engine = create_engine("sqlite://")
+    with engine.begin() as connection:
+        connection.exec_driver_sql("ATTACH DATABASE ':memory:' AS wbd_x")
+        connection.exec_driver_sql("""
+            CREATE TABLE wbd_x.wecom_report (
+                journaluuid TEXT, template_id TEXT, template_name TEXT,
+                report_time INTEGER, submitter_userid TEXT, detail_json TEXT,
+                source_window_start INTEGER, source_window_end INTEGER,
+                is_partial INTEGER
+            )
+        """)
+        connection.exec_driver_sql("""
+            CREATE TABLE wbd_x.wecom_approval (
+                sp_no TEXT, sp_name TEXT, sp_status INTEGER, template_id TEXT,
+                apply_time INTEGER, applyer_userid TEXT, detail_json TEXT,
+                source_window_start INTEGER, source_window_end INTEGER,
+                is_partial INTEGER
+            )
+        """)
+        connection.execute(
+            text("""INSERT INTO wbd_x.wecom_report VALUES
+                ('full-new','t','',140,'u',NULL,0,0,0),
+                ('full-old','t','',130,'u',NULL,0,0,0),
+                ('partial-latest','','',0,'',NULL,120,180,1)""")
+        )
+        connection.execute(
+            text("""INSERT INTO wbd_x.wecom_approval VALUES
+                ('full-new','',1,'t',140,'u',NULL,0,0,0),
+                ('full-old','',1,'t',130,'u',NULL,0,0,0),
+                ('partial-latest','',0,'',0,'',NULL,120,180,1)""")
+        )
+    monkeypatch.setattr(db, "get_engine", lambda: engine)
+
+    reports = db.query_reports_by_window("wbd_x", 0, 200, limit=2)
+    approvals = db.query_approvals_by_window("wbd_x", 0, 200, limit=2)
+
+    assert [row["journaluuid"] for row in reports] == [
+        "partial-latest",
+        "full-new",
+    ]
+    assert [row["sp_no"] for row in approvals] == [
+        "partial-latest",
+        "full-new",
+    ]
+    engine.dispose()
 
 
 def checkin_tenant():

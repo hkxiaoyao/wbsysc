@@ -22,6 +22,7 @@ from fastapi import FastAPI
 from starlette.middleware import Middleware
 from starlette.middleware.cors import CORSMiddleware
 
+from . import db
 from .auth import BearerTokenMiddleware
 from .config import get_settings
 from .mcp_server import mcp
@@ -144,9 +145,12 @@ async def lifespan(app):
     global _scheduler
     settings = get_settings()
 
-    # 1. MCP 会话管理器
+    # 1. 启动迁移必须先于 MCP 会话、租户加载和调度器；失败直接阻止启动。
+    db.run_startup_migrations()
+
+    # 2. MCP 会话管理器
     async with mcp.session_manager.run():
-        # 2. APScheduler 定时同步
+        # 3. APScheduler 定时同步
         _scheduler = AsyncIOScheduler(timezone="Asia/Shanghai")
         # 间隔（分钟）；汇报、审批分别用各自配置，这里合并为同步轮次
         min_interval = max(1, min(

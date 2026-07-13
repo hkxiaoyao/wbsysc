@@ -27,6 +27,27 @@ _lock_engine: Optional[Engine] = None
 # 各租户 schema 的业务表名（所有 schema 结构相同）
 BIZ_TABLES = ["wecom_report", "wecom_approval", "wecom_checkin", "sync_cursor", "audit_log"]
 
+_TENANT_COLUMN_DEFINITIONS = {
+    "enabled_modules": "VARCHAR(64) NOT NULL DEFAULT 'report,approval,checkin'",
+    "checkin_userids": "TEXT NULL",
+    "contact_secret_encrypted": "VARBINARY(512) NULL",
+    "trusted_domain": "VARCHAR(255) NOT NULL DEFAULT ''",
+    "data_mode": "VARCHAR(16) NOT NULL DEFAULT 'stored'",
+}
+
+_BUSINESS_COLUMN_DEFINITIONS = {
+    "wecom_report": {
+        "source_window_start": "BIGINT NOT NULL DEFAULT 0",
+        "source_window_end": "BIGINT NOT NULL DEFAULT 0",
+        "is_partial": "TINYINT NOT NULL DEFAULT 0",
+    },
+    "wecom_approval": {
+        "source_window_start": "BIGINT NOT NULL DEFAULT 0",
+        "source_window_end": "BIGINT NOT NULL DEFAULT 0",
+        "is_partial": "TINYINT NOT NULL DEFAULT 0",
+    },
+}
+
 
 def get_engine() -> Engine:
     global _engine
@@ -63,6 +84,15 @@ def _q(schema: str, table: str) -> str:
     return f"`{schema}`.`{table}`"
 
 
+def _valid_tenant_schema(schema: str) -> bool:
+    return (
+        isinstance(schema, str)
+        and schema.startswith("wbd_")
+        and len(schema) <= 64
+        and schema.replace("_", "").isalnum()
+    )
+
+
 @contextmanager
 def tenant_sync_lock(schema: str, timeout: int = 0) -> Iterator[bool]:
     """用独立物理连接持有租户级同步互斥锁，不占主 QueuePool。"""
@@ -96,18 +126,67 @@ def tenant_sync_lock(schema: str, timeout: int = 0) -> Iterator[bool]:
                     raise RuntimeError(f"failed to release tenant sync lock: {schema}")
 
 
+def ensure_central_columns() -> None:
+    """以 MySQL 5.7 兼容方式补齐 tenant_config 运行期所需列。"""
+    with get_engine().begin() as conn:
+        for column, definition in _TENANT_COLUMN_DEFINITIONS.items():
+            exists = conn.execute(
+                text("""SELECT COUNT(*) FROM information_schema.COLUMNS
+                        WHERE TABLE_SCHEMA=DATABASE()
+                          AND TABLE_NAME='tenant_config'
+                          AND COLUMN_NAME=:column"""),
+                {"column": column},
+            ).scalar()
+            if not exists:
+                conn.execute(text(
+                    f"ALTER TABLE tenant_config ADD COLUMN `{column}` {definition}"
+                ))
+
+
+def get_tenant_schema_names() -> List[str]:
+    """中心列迁移完成后枚举合法租户 schema。"""
+    sql = text("""SELECT DISTINCT schema_name FROM tenant_config
+                  WHERE schema_name REGEXP '^wbd_[0-9A-Za-z_]+$'""")
+    with get_engine().connect() as conn:
+        rows = conn.execute(sql).fetchall()
+    return [row[0] for row in rows if _valid_tenant_schema(row[0])]
+
+
 def ensure_schema(schema_name: str) -> None:
-    """建租户 schema + 业务表（首次接入租户调用。需 DB_USER 有 CREATE 权限）"""
+    """创建或修复租户 schema 的完整业务表结构。"""
+    if not _valid_tenant_schema(schema_name):
+        raise ValueError(f"非法租户schema: {schema_name}")
     eng = get_engine()
     with eng.begin() as conn:
         conn.execute(text(f"CREATE SCHEMA IF NOT EXISTS `{schema_name}`"))
         for ddl in _BIZ_DDLS:
             conn.execute(text(ddl.format(schema=schema_name)))
-    init_cursor_sql = text(f"""INSERT IGNORE INTO `{schema_name}`.`sync_cursor`
-        (tenant_id, data_source, filter_key, last_value) VALUES
-        ('{schema_name}','report','',''),('{schema_name}','approval','','')""")
-    with eng.begin() as conn:
-        conn.execute(init_cursor_sql)
+        for table, columns in _BUSINESS_COLUMN_DEFINITIONS.items():
+            for column, definition in columns.items():
+                exists = conn.execute(
+                    text("""SELECT COUNT(*) FROM information_schema.COLUMNS
+                            WHERE TABLE_SCHEMA=:schema
+                              AND TABLE_NAME=:table
+                              AND COLUMN_NAME=:column"""),
+                    {"schema": schema_name, "table": table, "column": column},
+                ).scalar()
+                if not exists:
+                    conn.execute(text(
+                        f"ALTER TABLE `{schema_name}`.`{table}` "
+                        f"ADD COLUMN `{column}` {definition}"
+                    ))
+        conn.execute(text(f"""INSERT IGNORE INTO `{schema_name}`.`sync_cursor`
+            (tenant_id, data_source, filter_key, last_value) VALUES
+            ('{schema_name}','report','',''),
+            ('{schema_name}','approval','',''),
+            ('{schema_name}','checkin','','')"""))
+
+
+def run_startup_migrations() -> None:
+    """启动时先升级中心表，再逐租户创建或修复业务 schema。"""
+    ensure_central_columns()
+    for schema_name in get_tenant_schema_names():
+        ensure_schema(schema_name)
 
 
 # ----- 汇报落库 -----
@@ -174,7 +253,9 @@ def query_reports_by_window(schema: str, starttime: int, endtime: int, limit: in
                    ) OR (
                      is_partial=1 AND source_window_start<:e AND source_window_end>:s
                    )
-                   ORDER BY report_time DESC LIMIT :n""")
+                   ORDER BY CASE WHEN is_partial=1
+                                 THEN source_window_end ELSE report_time END DESC
+                   LIMIT :n""")
     with get_engine().connect() as conn:
         rows = conn.execute(sql, {"s": starttime, "e": endtime, "n": limit})
         return [dict(r._mapping) for r in rows]
@@ -245,7 +326,9 @@ def query_approvals_by_window(schema: str, starttime: int, endtime: int, limit: 
                    ) OR (
                      is_partial=1 AND source_window_start<:e AND source_window_end>:s
                    )
-                   ORDER BY apply_time DESC LIMIT :n""")
+                   ORDER BY CASE WHEN is_partial=1
+                                 THEN source_window_end ELSE apply_time END DESC
+                   LIMIT :n""")
     with get_engine().connect() as conn:
         rows = conn.execute(sql, {"s": starttime, "e": endtime, "n": limit})
         return [dict(r._mapping) for r in rows]

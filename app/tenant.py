@@ -12,6 +12,7 @@ from dataclasses import dataclass
 from typing import Dict, Literal, Optional
 
 from sqlalchemy import text
+from sqlalchemy.exc import OperationalError
 
 from .crypto import decrypt_secret
 from .db import get_engine
@@ -36,17 +37,43 @@ class _TenantCtx:
     data_mode: Literal["stored", "direct"] = "stored"
 
 
+def _is_missing_data_mode_column_error(exc: Exception) -> bool:
+    if not isinstance(exc, OperationalError):
+        return False
+    args = getattr(exc.orig, "args", ())
+    code = args[0] if args else None
+    message = " ".join(str(value) for value in args).lower()
+    return code == 1054 and "unknown column" in message and "data_mode" in message
+
+
 def _load_all() -> Dict[str, _TenantCtx]:
     """全量加载启用的租户到缓存"""
     sql = text("""SELECT tenant_id, corpid, secret_encrypted, mcp_token,
                          schema_name, sync_interval_min,
                          enabled_modules, checkin_userids,
                          contact_secret_encrypted,
-                         IFNULL(data_mode, 'stored')
+                         IFNULL(data_mode, 'stored') AS data_mode
                   FROM tenant_config WHERE enabled=1""")
+    legacy_sql = text("""SELECT tenant_id, corpid, secret_encrypted, mcp_token,
+                                schema_name, sync_interval_min,
+                                enabled_modules, checkin_userids,
+                                contact_secret_encrypted
+                         FROM tenant_config WHERE enabled=1""")
     out: Dict[str, _TenantCtx] = {}
     with get_engine().connect() as conn:
-        rows = conn.execute(sql).fetchall()
+        try:
+            rows = conn.execute(sql).fetchall()
+            has_data_mode = True
+        except OperationalError as exc:
+            if not _is_missing_data_mode_column_error(exc):
+                raise
+            logger.warning(
+                "tenant loader falling back to stored mode because data_mode "
+                "column is missing: %s",
+                exc,
+            )
+            rows = conn.execute(legacy_sql).fetchall()
+            has_data_mode = False
     for r in rows:
         tenant_id = r[0]
         try:
@@ -77,7 +104,8 @@ def _load_all() -> Dict[str, _TenantCtx]:
             )
         mods = {m.strip() for m in (r[6] or "").split(",") if m.strip()}
         uids = [u.strip() for u in (r[7] or "").split(",") if u.strip()] if r[7] else []
-        data_mode = r[9] if r[9] in {"stored", "direct"} else "stored"
+        data_mode_value = r[9] if has_data_mode else "stored"
+        data_mode = data_mode_value if data_mode_value in {"stored", "direct"} else "stored"
         ctx = _TenantCtx(
             tenant_id=tenant_id, corpid=r[1], secret=secret,
             schema_name=r[4] or f"wbd_{_hash_corpid(r[1])}",
