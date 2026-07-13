@@ -2,6 +2,7 @@ import pytest
 
 from app.auth import TenantCtx
 from app import data_access
+from app.wecom import approval_sync, checkin_sync, sync as report_sync
 
 
 def ctx(mode):
@@ -85,3 +86,229 @@ def test_direct_reports_do_not_query_database(monkeypatch):
     monkeypatch.setattr(data_access, "sync_reports_window", lambda *args, **kwargs: [])
     result = data_access.list_reports(ctx("direct"), 1, 200, 20)
     assert result["source"] == "wecom"
+
+
+def test_capped_report_sync_reads_latest_segment_first(monkeypatch):
+    windows = []
+
+    def list_records(corpid, secret, start, end, cursor, limit, filters):
+        windows.append((start, end))
+        identifier = "new" if start >= report_sync.MONTH else "old"
+        return {
+            "errcode": 0,
+            "errmsg": "ok",
+            "journaluuid_list": [identifier],
+            "endflag": 1,
+            "next_cursor": 0,
+        }
+
+    monkeypatch.setattr(report_sync.api, "list_report_records", list_records)
+
+    result = report_sync.sync_reports_window(
+        "ww123", "secret", 0, report_sync.MONTH * 2, max_records=1
+    )
+
+    assert result == ["new"]
+    assert windows == [(report_sync.MONTH, report_sync.MONTH * 2)]
+
+
+def test_unbounded_report_sync_keeps_full_old_to_new_window(monkeypatch):
+    windows = []
+
+    def list_records(corpid, secret, start, end, cursor, limit, filters):
+        windows.append((start, end))
+        identifier = "new" if start >= report_sync.MONTH else "old"
+        return {
+            "errcode": 0,
+            "errmsg": "ok",
+            "journaluuid_list": [identifier],
+            "endflag": 1,
+            "next_cursor": 0,
+        }
+
+    monkeypatch.setattr(report_sync.api, "list_report_records", list_records)
+
+    result = report_sync.sync_reports_window(
+        "ww123", "secret", 0, report_sync.MONTH * 2
+    )
+
+    assert result == ["old", "new"]
+    assert windows == [
+        (0, report_sync.MONTH),
+        (report_sync.MONTH, report_sync.MONTH * 2),
+    ]
+
+
+def test_capped_approval_sync_reads_latest_segment_first(monkeypatch):
+    windows = []
+
+    def list_approvals(corpid, secret, start, end, cursor, size, filters):
+        windows.append((start, end))
+        identifier = "new" if start >= approval_sync.SPAN else "old"
+        return {
+            "errcode": 0,
+            "errmsg": "ok",
+            "sp_no_list": [identifier],
+            "new_next_cursor": "",
+        }
+
+    monkeypatch.setattr(approval_sync.api, "list_approvals", list_approvals)
+
+    result = approval_sync.sync_approvals_window(
+        "ww123", "secret", 0, approval_sync.SPAN * 2, max_records=1
+    )
+
+    assert result == ["new"]
+    assert windows == [(approval_sync.SPAN, approval_sync.SPAN * 2)]
+
+
+def test_unbounded_approval_sync_keeps_full_old_to_new_window(monkeypatch):
+    windows = []
+
+    def list_approvals(corpid, secret, start, end, cursor, size, filters):
+        windows.append((start, end))
+        identifier = "new" if start >= approval_sync.SPAN else "old"
+        return {
+            "errcode": 0,
+            "errmsg": "ok",
+            "sp_no_list": [identifier],
+            "new_next_cursor": "",
+        }
+
+    monkeypatch.setattr(approval_sync.api, "list_approvals", list_approvals)
+
+    result = approval_sync.sync_approvals_window(
+        "ww123", "secret", 0, approval_sync.SPAN * 2
+    )
+
+    assert result == ["old", "new"]
+    assert windows == [
+        (0, approval_sync.SPAN),
+        (approval_sync.SPAN, approval_sync.SPAN * 2),
+    ]
+
+
+def test_direct_reports_sort_newest_and_apply_limit(monkeypatch):
+    monkeypatch.setattr(
+        data_access, "sync_reports_window", lambda *args, **kwargs: ["old", "new"]
+    )
+    monkeypatch.setattr(
+        data_access,
+        "fetch_report_detail",
+        lambda corpid, secret, identifier: {
+            "journaluuid": identifier,
+            "report_time": 200 if identifier == "new" else 100,
+        },
+    )
+
+    result = data_access.list_reports(ctx("direct"), 1, 300, 1)
+
+    assert result["count"] == 1
+    assert [record["journaluuid"] for record in result["records"]] == ["new"]
+
+
+def test_direct_approvals_sort_newest_and_apply_limit(monkeypatch):
+    monkeypatch.setattr(
+        data_access, "sync_approvals_window", lambda *args, **kwargs: ["old", "new"]
+    )
+    monkeypatch.setattr(
+        data_access,
+        "fetch_approval_detail",
+        lambda corpid, secret, identifier: {
+            "sp_no": identifier,
+            "apply_time": 200 if identifier == "new" else 100,
+        },
+    )
+
+    result = data_access.list_approvals(ctx("direct"), 1, 300, 1)
+
+    assert result["count"] == 1
+    assert [record["sp_no"] for record in result["records"]] == ["new"]
+
+
+def test_direct_checkins_raise_when_every_api_attempt_fails(monkeypatch):
+    context = ctx("direct")
+    context.contact_secret = ""
+    context.checkin_userids = ["bad-a", "bad-b"]
+    monkeypatch.setattr(
+        checkin_sync.api,
+        "get_checkin_data",
+        lambda *args: {
+            "errcode": 301021,
+            "errmsg": "userid is outside the visible range",
+            "checkindata": [],
+        },
+    )
+
+    with pytest.raises(RuntimeError, match="全部失败"):
+        data_access.list_checkins(context, 1, 200, 20)
+
+
+def test_direct_checkins_handle_null_error_message(monkeypatch):
+    context = ctx("direct")
+    context.contact_secret = ""
+    context.checkin_userids = ["bad"]
+    monkeypatch.setattr(
+        checkin_sync.api,
+        "get_checkin_data",
+        lambda *args: {"errcode": 301021, "errmsg": None, "checkindata": []},
+    )
+
+    with pytest.raises(RuntimeError, match="打卡数据不可用"):
+        data_access.list_checkins(context, 1, 200, 20)
+
+
+def test_direct_checkins_report_partial_api_failures(monkeypatch):
+    context = ctx("direct")
+    context.contact_secret = ""
+    context.checkin_userids = ["bad", "good"]
+
+    def get_checkin_data(corpid, secret, start, end, userids, data_type):
+        if userids == ["bad"]:
+            return {
+                "errcode": 301021,
+                "errmsg": "userid is outside the visible range",
+                "checkindata": [],
+            }
+        return {
+            "errcode": 0,
+            "errmsg": "ok",
+            "checkindata": [{
+                "userid": "good",
+                "checkin_time": 100,
+                "checkin_type": "上班打卡",
+            }],
+        }
+
+    monkeypatch.setattr(checkin_sync.api, "get_checkin_data", get_checkin_data)
+
+    result = data_access.list_checkins(context, 1, 200, 20)
+
+    assert result["count"] == 1
+    assert result["partial_count"] == 1
+    assert result["errors"][0]["userid"] == "bad"
+
+
+def test_background_checkin_fetch_remains_tolerant(monkeypatch):
+    good_record = {
+        "userid": "good",
+        "checkin_time": 100,
+        "checkin_type": "上班打卡",
+    }
+
+    def get_checkin_data(corpid, secret, start, end, userids, data_type):
+        if userids == ["bad"]:
+            return {
+                "errcode": 301021,
+                "errmsg": "userid is outside the visible range",
+                "checkindata": [],
+            }
+        return {"errcode": 0, "errmsg": "ok", "checkindata": [good_record]}
+
+    monkeypatch.setattr(checkin_sync.api, "get_checkin_data", get_checkin_data)
+
+    result = checkin_sync.fetch_checkin_records(
+        "ww123", "secret", 1, 200, ["bad", "good"]
+    )
+
+    assert result == [good_record]

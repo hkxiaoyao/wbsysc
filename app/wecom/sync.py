@@ -28,9 +28,21 @@ def sync_reports_window(
     result: list[str] = []
     first_resp_logged = False
 
-    seg_start = starttime
-    while seg_start < endtime:
-        seg_end = min(seg_start + MONTH, endtime)
+    segments: list[tuple[int, int]] = []
+    if max_records is None:
+        seg_start = starttime
+        while seg_start < endtime:
+            seg_end = min(seg_start + MONTH, endtime)
+            segments.append((seg_start, seg_end))
+            seg_start = seg_end
+    else:
+        seg_end = endtime
+        while seg_end > starttime:
+            seg_start = max(starttime, seg_end - MONTH)
+            segments.append((seg_start, seg_end))
+            seg_end = seg_start
+
+    for seg_start, seg_end in segments:
         cursor = 0
         while True:
             resp = api.list_report_records(corpid, secret, seg_start, seg_end, cursor, limit, filters)
@@ -64,7 +76,6 @@ def sync_reports_window(
             if not next_cursor:
                 break
             cursor = next_cursor
-        seg_start = seg_end
 
     if not result:
         logger.warning(

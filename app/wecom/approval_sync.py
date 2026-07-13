@@ -31,9 +31,21 @@ def sync_approvals_window(
     seen: set[str] = set()
     result: list[str] = []
     first_resp_logged = False
-    seg_start = starttime
-    while seg_start < endtime:
-        seg_end = min(seg_start + SPAN, endtime)
+    segments: list[tuple[int, int]] = []
+    if max_records is None:
+        seg_start = starttime
+        while seg_start < endtime:
+            seg_end = min(seg_start + SPAN, endtime)
+            segments.append((seg_start, seg_end))
+            seg_start = seg_end
+    else:
+        seg_end = endtime
+        while seg_end > starttime:
+            seg_start = max(starttime, seg_end - SPAN)
+            segments.append((seg_start, seg_end))
+            seg_end = seg_start
+
+    for seg_start, seg_end in segments:
         cursor = ""
         while True:
             resp = api.list_approvals(corpid, secret, seg_start, seg_end, cursor, size, flt)
@@ -60,7 +72,6 @@ def sync_approvals_window(
             if not sp_list or not next_cursor:
                 break
             cursor = next_cursor
-        seg_start = seg_end
 
     if not result:
         logger.warning(

@@ -3,7 +3,7 @@ from __future__ import annotations
 from . import db
 from .auth import TenantCtx
 from .wecom.approval_sync import fetch_approval_detail, sync_approvals_window
-from .wecom.checkin_sync import fetch_checkin_records
+from .wecom.checkin_sync import fetch_checkin_records_with_stats
 from .wecom.contact import fetch_all_userids
 from .wecom.sync import fetch_report_detail, sync_reports_window
 
@@ -53,6 +53,11 @@ def list_reports(ctx: TenantCtx, starttime: int, endtime: int, limit: int) -> di
             records.append(partial)
             continue
         records.append(detail)
+    records.sort(
+        key=lambda record: int(record.get("report_time", 0) or 0),
+        reverse=True,
+    )
+    records = records[:size]
     partial_count = sum(bool(record.get("_partial")) for record in records)
     return {
         "tenant": ctx.tenant_id,
@@ -117,6 +122,11 @@ def list_approvals(ctx: TenantCtx, starttime: int, endtime: int, limit: int) -> 
             "applyer": applyer.get("userid", "") if isinstance(applyer, dict) else applyer,
             "_partial": False,
         })
+    records.sort(
+        key=lambda record: int(record.get("apply_time", 0) or 0),
+        reverse=True,
+    )
+    records = records[:size]
     partial_count = sum(bool(record.get("_partial")) for record in records)
     return {
         "tenant": ctx.tenant_id,
@@ -166,9 +176,17 @@ def list_checkins(ctx: TenantCtx, starttime: int, endtime: int, limit: int) -> d
     )
     if not userids:
         raise ValueError("直连打卡需要通讯录 Secret 或手工 userid")
-    records = fetch_checkin_records(
+    fetch_result = fetch_checkin_records_with_stats(
         ctx.corpid, ctx.secret, starttime, endtime, userids
     )
+    if fetch_result.attempted and fetch_result.failed == fetch_result.attempted:
+        first_error = fetch_result.errors[0] if fetch_result.errors else {}
+        raise RuntimeError(
+            "直连打卡拉取全部失败 "
+            f"({fetch_result.failed}/{fetch_result.attempted}): "
+            f"[{first_error.get('errcode')}] {first_error.get('errmsg', '未知错误')}"
+        )
+    records = fetch_result.records
     records.sort(
         key=lambda record: int(record.get("checkin_time", 0) or 0),
         reverse=True,
@@ -179,5 +197,6 @@ def list_checkins(ctx: TenantCtx, starttime: int, endtime: int, limit: int) -> d
         "source": "wecom",
         "count": len(selected),
         "records": selected,
-        "partial_count": 0,
+        "partial_count": fetch_result.failed,
+        "errors": fetch_result.errors,
     }

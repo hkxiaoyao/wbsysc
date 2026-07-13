@@ -10,6 +10,7 @@
 from __future__ import annotations
 
 import logging
+from dataclasses import dataclass
 from typing import List
 
 from . import client as api
@@ -17,6 +18,76 @@ from . import client as api
 logger = logging.getLogger("wecom-sync")
 
 SPAN = 30 * 86400   # 企微打卡时间跨度上限
+
+
+@dataclass
+class CheckinFetchResult:
+    records: list[dict]
+    attempted: int
+    failed: int
+    errors: list[dict]
+
+
+def fetch_checkin_records_with_stats(
+    corpid: str, secret: str,
+    starttime: int, endtime: int,
+    useridlist: List[str],
+    opencheckindatatype: int = 3,
+) -> CheckinFetchResult:
+    """逐人拉取打卡，并保留失败统计供直连读取判断完整性。"""
+    records: list[dict] = []
+    attempted = 0
+    failed = 0
+    errors: list[dict] = []
+
+    seg_start = starttime
+    while seg_start < endtime:
+        seg_end = min(seg_start + SPAN, endtime)
+        for uid in useridlist:
+            attempted += 1
+            try:
+                resp = api.get_checkin_data(
+                    corpid,
+                    secret,
+                    seg_start,
+                    seg_end,
+                    [uid],
+                    opencheckindatatype,
+                )
+                errcode = resp.get("errcode")
+                if errcode not in (0, None):
+                    failed += 1
+                    errmsg = str(resp.get("errmsg") or "打卡数据不可用")
+                    error = {
+                        "userid": uid,
+                        "errcode": errcode,
+                        "errmsg": errmsg,
+                    }
+                    errors.append(error)
+                    logger.debug(
+                        "打卡拉取 %s: [%s] %s",
+                        uid,
+                        errcode,
+                        error["errmsg"][:40],
+                    )
+                    continue
+                records.extend(resp.get("checkindata", []) or [])
+            except Exception as exc:
+                failed += 1
+                errors.append({
+                    "userid": uid,
+                    "errcode": None,
+                    "errmsg": str(exc),
+                })
+                logger.debug("打卡拉取异常 %s: %s", uid, exc)
+        seg_start = seg_end
+
+    return CheckinFetchResult(
+        records=records,
+        attempted=attempted,
+        failed=failed,
+        errors=errors,
+    )
 
 
 def fetch_checkin_records(
@@ -31,27 +102,11 @@ def fetch_checkin_records(
     Returns:
         打卡记录列表
     """
-    result: list = []
-    if not useridlist:
-        return result
-
-    seg_start = starttime
-    while seg_start < endtime:
-        seg_end = min(seg_start + SPAN, endtime)
-        # 逐人拉取（useridlist 的人数通常 = 企业员工数，打卡接口 600次/分 足够）
-        for uid in useridlist:
-            try:
-                resp = api.get_checkin_data(corpid, secret, seg_start, seg_end,
-                                            [uid], opencheckindatatype)
-                ec = resp.get("errcode")
-                if ec not in (0, None):
-                    # 301021=人员不在可见范围；记debug不刷屏，其他人继续
-                    logger.debug("打卡拉取 %s: [%s] %s", uid, ec, resp.get("errmsg", "")[:40])
-                    continue
-                result.extend(resp.get("checkindata", []) or [])
-            except Exception as e:
-                logger.debug("打卡拉取异常 %s: %s", uid, e)
-                continue
-        seg_start = seg_end
-
-    return result
+    return fetch_checkin_records_with_stats(
+        corpid,
+        secret,
+        starttime,
+        endtime,
+        useridlist,
+        opencheckindatatype,
+    ).records
