@@ -13,7 +13,7 @@ from typing import Iterator
 from .. import db
 from ..tenant import get_all_tenants, _TenantCtx
 from .approval_sync import fetch_approval_detail, sync_approvals_window
-from .checkin_sync import fetch_checkin_records
+from .checkin_sync import fetch_checkin_records_with_stats
 from .contact import fetch_all_userids
 from .sync import fetch_report_detail, sync_reports_window
 
@@ -107,7 +107,16 @@ def _sync_one_checkin(t: _TenantCtx, lookback_days: int, force: bool = False) ->
     starttime, endtime = _window(t.schema_name, "checkin", lookback_days, force=force)
     # 打卡接口 endtime 不宜超过当前过多，收回 now
     endtime = min(endtime, int(time.time()))
-    stats = {"pulled": 0, "stored": 0, "err": 0, "starttime": starttime, "endtime": endtime}
+    stats = {
+        "pulled": 0,
+        "stored": 0,
+        "err": 0,
+        "write_err": 0,
+        "partial_count": 0,
+        "errors": [],
+        "starttime": starttime,
+        "endtime": endtime,
+    }
 
     if not t.secret:
         logger.error("打卡跳过 tenant=%s: 应用 secret 为空", t.tenant_id)
@@ -121,12 +130,18 @@ def _sync_one_checkin(t: _TenantCtx, lookback_days: int, force: bool = False) ->
         return {**stats, "error": "userid list 为空"}
 
     try:
-        records = fetch_checkin_records(t.corpid, t.secret, starttime, endtime, userids)
+        fetch_result = fetch_checkin_records_with_stats(
+            t.corpid, t.secret, starttime, endtime, userids
+        )
     except Exception as e:
         logger.error("打卡拉取失败 tenant=%s: %s", t.tenant_id, e)
         return {**stats, "error": str(e)}
 
+    records = fetch_result.records
     stats["pulled"] = len(records)
+    stats["partial_count"] = fetch_result.failed
+    stats["errors"] = fetch_result.errors
+    stats["err"] = fetch_result.failed
     if stats["pulled"] == 0:
         logger.warning(
             "打卡列表为空 tenant=%s userid_count=%s window=[%s,%s]",
@@ -140,7 +155,8 @@ def _sync_one_checkin(t: _TenantCtx, lookback_days: int, force: bool = False) ->
             except Exception as e:
                 logger.warning("打卡落库失败 %s: %s", rec.get("userid"), e)
                 stats["err"] += 1
-    if stats["err"] == 0:
+                stats["write_err"] += 1
+    if stats["partial_count"] == 0 and stats["write_err"] == 0:
         db.save_cursor(t.schema_name, "checkin", "", str(int(time.time())))
     logger.info("打卡 tenant=%s pulled=%s stored=%s err=%s window=[%s,%s]",
                 t.tenant_id, stats["pulled"], stats["stored"], stats["err"],
@@ -212,7 +228,16 @@ def _sync_one_report(t: _TenantCtx, lookback_days: int, force: bool = False) -> 
                 except Exception as e:
                     logger.warning("汇报详情拉取失败 %s: %s", ju[:16], e)
                     stats["err"] += 1
-                    continue
+                    info = {
+                        "journaluuid": ju,
+                        "journal_uuid": ju,
+                        "template_id": "",
+                        "template_name": "",
+                        "report_time": 0,
+                        "submitter": {},
+                        "_partial": True,
+                        "_partial_error": str(e),
+                    }
                 try:
                     db.upsert_report(
                         t.schema_name,
@@ -278,7 +303,16 @@ def _sync_one_approval(t: _TenantCtx, lookback_days: int, force: bool = False) -
                 except Exception as e:
                     logger.warning("审批详情拉取失败 %s: %s", sp, e)
                     stats["err"] += 1
-                    continue
+                    info = {
+                        "sp_no": sp,
+                        "sp_name": "",
+                        "sp_status": 0,
+                        "template_id": "",
+                        "apply_time": 0,
+                        "applyer": {},
+                        "_partial": True,
+                        "_partial_error": str(e),
+                    }
                 try:
                     db.upsert_approval(
                         t.schema_name,
@@ -350,23 +384,36 @@ def run_sync_tenant(
     force: bool = False,
     reset_cursor: bool = False,
 ) -> dict:
-    """同步单个租户。reset_cursor=True 时先把游标回拨到 now-lookback。"""
-    if reset_cursor:
-        reset_cursors(t.schema_name, lookback_days, t.enabled_modules)
-        force = True
-
-    entry: dict = {
+    """在租户级互斥锁内同步；reset 与本轮同步共享同一锁。"""
+    base_entry: dict = {
         "lookback_days": lookback_days,
         "force": force,
         "reset_cursor": reset_cursor,
     }
-    if "report" in t.enabled_modules:
-        entry["report"] = _sync_one_report(t, lookback_days, force=force)
-    if "approval" in t.enabled_modules:
-        entry["approval"] = _sync_one_approval(t, lookback_days, force=force)
-    if "checkin" in t.enabled_modules:
-        entry["checkin"] = _sync_one_checkin(t, lookback_days, force=force)
-    return entry
+    try:
+        with db.tenant_sync_lock(t.schema_name, timeout=0) as acquired:
+            if not acquired:
+                logger.warning("租户同步繁忙 schema=%s", t.schema_name)
+                return {
+                    **base_entry,
+                    "busy": True,
+                    "error": "tenant sync already running",
+                }
+            if reset_cursor:
+                reset_cursors(t.schema_name, lookback_days, t.enabled_modules)
+                force = True
+
+            entry = {**base_entry, "force": force, "busy": False}
+            if "report" in t.enabled_modules:
+                entry["report"] = _sync_one_report(t, lookback_days, force=force)
+            if "approval" in t.enabled_modules:
+                entry["approval"] = _sync_one_approval(t, lookback_days, force=force)
+            if "checkin" in t.enabled_modules:
+                entry["checkin"] = _sync_one_checkin(t, lookback_days, force=force)
+            return entry
+    except Exception as e:
+        logger.error("租户同步锁或同步执行失败 schema=%s: %s", t.schema_name, e)
+        return {**base_entry, "busy": False, "error": str(e)}
 
 
 def run_sync_all(lookback_days: int = BACKFILL_DAYS) -> dict:

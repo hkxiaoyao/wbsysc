@@ -10,8 +10,10 @@
 """
 from __future__ import annotations
 
+from contextlib import contextmanager
+import hashlib
 import json
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, Iterator, List, Optional
 
 from sqlalchemy import create_engine, text
 from sqlalchemy.engine import Engine
@@ -44,6 +46,28 @@ def _q(schema: str, table: str) -> str:
     # schema 名是系统生成(wbd_md5hash)，但仍做基本字符约束
     assert schema.replace("_", "").isalnum(), f"非法schema: {schema}"
     return f"`{schema}`.`{table}`"
+
+
+@contextmanager
+def tenant_sync_lock(schema: str, timeout: int = 0) -> Iterator[bool]:
+    """持有同一 MySQL 连接的租户级同步互斥锁。"""
+    assert schema.replace("_", "").isalnum(), f"非法schema: {schema}"
+    digest = hashlib.sha256(schema.encode("utf-8")).hexdigest()[:40]
+    lock_name = f"wbsysc:tenant-sync:{digest}"
+    with get_engine().connect() as conn:
+        acquired = conn.execute(
+            text("SELECT GET_LOCK(:name, :timeout)"),
+            {"name": lock_name, "timeout": max(0, int(timeout))},
+        ).scalar() == 1
+        try:
+            yield acquired
+        finally:
+            if acquired:
+                released = conn.execute(
+                    text("SELECT RELEASE_LOCK(:name)"), {"name": lock_name}
+                ).scalar()
+                if released != 1:
+                    raise RuntimeError(f"failed to release tenant sync lock: {schema}")
 
 
 def ensure_schema(schema_name: str) -> None:
@@ -83,11 +107,23 @@ def upsert_report(
              source_window_start, source_window_end, is_partial)
         VALUES (:t,:j,:tid,:tname,:rt,:su,:dj,:ws,:we,:partial)
         ON DUPLICATE KEY UPDATE
-            template_name=VALUES(template_name), report_time=VALUES(report_time),
-            submitter_userid=VALUES(submitter_userid), detail_json=VALUES(detail_json),
-            source_window_start=VALUES(source_window_start),
-            source_window_end=VALUES(source_window_end), is_partial=VALUES(is_partial),
-            synced_at=NOW()
+            template_id=IF(is_partial=0 AND VALUES(is_partial)=1,
+                           template_id, VALUES(template_id)),
+            template_name=IF(is_partial=0 AND VALUES(is_partial)=1,
+                             template_name, VALUES(template_name)),
+            report_time=IF(is_partial=0 AND VALUES(is_partial)=1,
+                           report_time, VALUES(report_time)),
+            submitter_userid=IF(is_partial=0 AND VALUES(is_partial)=1,
+                                submitter_userid, VALUES(submitter_userid)),
+            detail_json=IF(is_partial=0 AND VALUES(is_partial)=1,
+                           detail_json, VALUES(detail_json)),
+            source_window_start=IF(is_partial=0 AND VALUES(is_partial)=1,
+                                   source_window_start, VALUES(source_window_start)),
+            source_window_end=IF(is_partial=0 AND VALUES(is_partial)=1,
+                                 source_window_end, VALUES(source_window_end)),
+            synced_at=IF(is_partial=0 AND VALUES(is_partial)=1, synced_at, NOW()),
+            is_partial=IF(is_partial=0 AND VALUES(is_partial)=1,
+                          is_partial, VALUES(is_partial))
     """)
     with get_engine().begin() as conn:
         conn.execute(sql, {
@@ -141,12 +177,25 @@ def upsert_approval(
              source_window_start, source_window_end, is_partial)
         VALUES (:t,:sp,:sn,:ss,:tid,:at,:au,:dj,:ws,:we,:partial)
         ON DUPLICATE KEY UPDATE
-            sp_name=VALUES(sp_name), sp_status=VALUES(sp_status),
-            apply_time=VALUES(apply_time), applyer_userid=VALUES(applyer_userid),
-            detail_json=VALUES(detail_json),
-            source_window_start=VALUES(source_window_start),
-            source_window_end=VALUES(source_window_end), is_partial=VALUES(is_partial),
-            synced_at=NOW()
+            sp_name=IF(is_partial=0 AND VALUES(is_partial)=1,
+                       sp_name, VALUES(sp_name)),
+            sp_status=IF(is_partial=0 AND VALUES(is_partial)=1,
+                         sp_status, VALUES(sp_status)),
+            template_id=IF(is_partial=0 AND VALUES(is_partial)=1,
+                           template_id, VALUES(template_id)),
+            apply_time=IF(is_partial=0 AND VALUES(is_partial)=1,
+                          apply_time, VALUES(apply_time)),
+            applyer_userid=IF(is_partial=0 AND VALUES(is_partial)=1,
+                              applyer_userid, VALUES(applyer_userid)),
+            detail_json=IF(is_partial=0 AND VALUES(is_partial)=1,
+                           detail_json, VALUES(detail_json)),
+            source_window_start=IF(is_partial=0 AND VALUES(is_partial)=1,
+                                   source_window_start, VALUES(source_window_start)),
+            source_window_end=IF(is_partial=0 AND VALUES(is_partial)=1,
+                                 source_window_end, VALUES(source_window_end)),
+            synced_at=IF(is_partial=0 AND VALUES(is_partial)=1, synced_at, NOW()),
+            is_partial=IF(is_partial=0 AND VALUES(is_partial)=1,
+                          is_partial, VALUES(is_partial))
     """)
     with get_engine().begin() as conn:
         conn.execute(sql, {
