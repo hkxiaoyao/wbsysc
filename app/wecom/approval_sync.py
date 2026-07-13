@@ -14,6 +14,27 @@ logger = logging.getLogger("wecom-sync")
 
 SPAN = 31 * 86400
 MIN_CAPPED_WINDOW = 60
+MAX_PAGES_PER_WINDOW = 1000
+
+
+def _cursor_as_int(value) -> int | None:
+    try:
+        return int(value)
+    except (TypeError, ValueError, OverflowError):
+        return None
+
+
+def _validate_next_cursor(current, next_cursor, seen_cursors: set) -> None:
+    if next_cursor in seen_cursors:
+        raise RuntimeError("拉取审批失败：分页游标重复")
+    current_number = _cursor_as_int(current)
+    next_number = _cursor_as_int(next_cursor)
+    if (
+        current_number is not None
+        and next_number is not None
+        and next_number <= current_number
+    ):
+        raise RuntimeError("拉取审批失败：分页游标倒退")
 
 
 def _fetch_approval_identifiers(
@@ -29,7 +50,11 @@ def _fetch_approval_identifiers(
     result: list[str] = []
     cursor = ""
     seen_cursors = {cursor}
+    page_count = 0
     while True:
+        if page_count >= MAX_PAGES_PER_WINDOW:
+            raise RuntimeError("拉取审批失败：分页超过安全上限")
+        page_count += 1
         resp = api.list_approvals(
             corpid, secret, starttime, endtime, cursor, size, filters
         )
@@ -45,8 +70,7 @@ def _fetch_approval_identifiers(
         next_cursor = resp.get("new_next_cursor", "")
         if not identifiers or not next_cursor:
             break
-        if next_cursor in seen_cursors:
-            raise RuntimeError(f"拉取审批失败：分页游标重复 {next_cursor}")
+        _validate_next_cursor(cursor, next_cursor, seen_cursors)
         seen_cursors.add(next_cursor)
         cursor = next_cursor
     return result
@@ -156,7 +180,12 @@ def sync_approvals_window(
 
     for seg_start, seg_end in segments:
         cursor = ""
+        seen_cursors = {cursor}
+        page_count = 0
         while True:
+            if page_count >= MAX_PAGES_PER_WINDOW:
+                raise RuntimeError("拉取审批失败：分页超过安全上限")
+            page_count += 1
             resp = api.list_approvals(corpid, secret, seg_start, seg_end, cursor, size, flt)
             if resp.get("errcode") not in (0, None):
                 raise RuntimeError(f"拉取审批失败 [{resp.get('errcode')}] {resp.get('errmsg')}")
@@ -178,6 +207,8 @@ def sync_approvals_window(
             next_cursor = resp.get("new_next_cursor", "")
             if not sp_list or not next_cursor:
                 break
+            _validate_next_cursor(cursor, next_cursor, seen_cursors)
+            seen_cursors.add(next_cursor)
             cursor = next_cursor
     if not result:
         logger.warning(

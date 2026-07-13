@@ -331,6 +331,102 @@ def test_capped_approval_rejects_repeated_pagination_cursor(monkeypatch):
         )
 
 
+def test_capped_report_rejects_descending_numeric_string_cursor(monkeypatch):
+    calls = 0
+
+    def list_records(corpid, secret, start, end, cursor, limit, filters):
+        nonlocal calls
+        calls += 1
+        if calls > 2:
+            raise AssertionError("descending pagination was not stopped")
+        return {
+            "errcode": 0,
+            "errmsg": "ok",
+            "journaluuid_list": [f"record-{calls}"],
+            "endflag": 0,
+            "next_cursor": "5" if calls == 1 else "4",
+        }
+
+    monkeypatch.setattr(report_sync.api, "list_report_records", list_records)
+
+    with pytest.raises(RuntimeError, match="游标倒退"):
+        report_sync.sync_reports_window(
+            "ww123", "secret", 100, 150, max_records=1
+        )
+
+
+def test_capped_approval_rejects_descending_numeric_string_cursor(monkeypatch):
+    calls = 0
+
+    def list_approvals(corpid, secret, start, end, cursor, size, filters):
+        nonlocal calls
+        calls += 1
+        if calls > 2:
+            raise AssertionError("descending pagination was not stopped")
+        return {
+            "errcode": 0,
+            "errmsg": "ok",
+            "sp_no_list": [f"record-{calls}"],
+            "new_next_cursor": "5" if calls == 1 else "4",
+        }
+
+    monkeypatch.setattr(approval_sync.api, "list_approvals", list_approvals)
+
+    with pytest.raises(RuntimeError, match="游标倒退"):
+        approval_sync.sync_approvals_window(
+            "ww123", "secret", 100, 150, max_records=1
+        )
+
+
+def test_capped_report_rejects_opaque_cursor_over_page_limit(monkeypatch):
+    calls = 0
+    monkeypatch.setattr(report_sync, "MAX_PAGES_PER_WINDOW", 2, raising=False)
+
+    def list_records(corpid, secret, start, end, cursor, limit, filters):
+        nonlocal calls
+        calls += 1
+        if calls > 2:
+            raise AssertionError("opaque pagination exceeded the page limit")
+        return {
+            "errcode": 0,
+            "errmsg": "ok",
+            "journaluuid_list": [f"record-{calls}"],
+            "endflag": 0,
+            "next_cursor": f"opaque-{calls}",
+        }
+
+    monkeypatch.setattr(report_sync.api, "list_report_records", list_records)
+
+    with pytest.raises(RuntimeError, match="分页超过安全上限"):
+        report_sync.sync_reports_window(
+            "ww123", "secret", 100, 150, max_records=1
+        )
+
+
+def test_capped_approval_rejects_opaque_cursor_over_page_limit(monkeypatch):
+    calls = 0
+    monkeypatch.setattr(approval_sync, "MAX_PAGES_PER_WINDOW", 2, raising=False)
+
+    def list_approvals(corpid, secret, start, end, cursor, size, filters):
+        nonlocal calls
+        calls += 1
+        if calls > 2:
+            raise AssertionError("opaque pagination exceeded the page limit")
+        return {
+            "errcode": 0,
+            "errmsg": "ok",
+            "sp_no_list": [f"record-{calls}"],
+            "new_next_cursor": f"opaque-{calls}",
+        }
+
+    monkeypatch.setattr(approval_sync.api, "list_approvals", list_approvals)
+
+    with pytest.raises(RuntimeError, match="分页超过安全上限"):
+        approval_sync.sync_approvals_window(
+            "ww123", "secret", 100, 150, max_records=1
+        )
+
+
 def test_direct_reports_sort_newest_and_apply_limit(monkeypatch):
     monkeypatch.setattr(
         data_access, "sync_reports_window", lambda *args, **kwargs: ["old", "new"]
