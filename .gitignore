@@ -43,3 +43,4 @@ app/static/dist/
 # 构建产物
 build/
 dist/
+.ace-tool/
