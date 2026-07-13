@@ -315,6 +315,10 @@ def run_sync_all(lookback_days: int = BACKFILL_DAYS) -> dict:
     for t in tenants:
         logger.info("-- 租户 %s (schema=%s modules=%s) --",
                     t.tenant_id, t.schema_name, t.enabled_modules)
+        if t.data_mode == "direct":
+            logger.info("跳过直连租户 tenant=%s", t.tenant_id)
+            result[t.tenant_id] = {"skipped": "direct_mode"}
+            continue
         try:
             result[t.tenant_id] = run_sync_tenant(t, lookback_days=lookback_days, force=False)
         except Exception as e:

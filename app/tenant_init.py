@@ -34,6 +34,7 @@ CREATE TABLE IF NOT EXISTS `tenant_config` (
   enabled_modules VARCHAR(64) NOT NULL DEFAULT 'report,approval,checkin' COMMENT '启用模块:report,approval,checkin',
   checkin_userids TEXT NULL COMMENT '打卡可见员工userid,逗号分隔(无通讯录secret时用)',
   contact_secret_encrypted VARBINARY(512) NULL COMMENT '通讯录同步secret(AES加密,可选,用于自动拉userid)',
+  data_mode VARCHAR(16) NOT NULL DEFAULT 'stored',
   enabled TINYINT NOT NULL DEFAULT 1,
   created_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
   updated_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
@@ -48,13 +49,17 @@ def init_tenant(tenant_id: str, corpid: str, secret: str, mcp_token: str,
                 display_name: str = "", sync_interval_min: int = 30,
                 modules: str = "report,approval,checkin",
                 checkin_userids: str = "",
-                contact_secret: str = "") -> str:
+                contact_secret: str = "",
+                data_mode: str = "stored") -> str:
     """初始化一个租户：写配置 + 建schema。返回 schema_name
 
     Args:
         secret: 自建应用secret
         contact_secret: 通讯录同步secret（可选，用于自动拉userid喂打卡）
     """
+    if data_mode not in {"stored", "direct"}:
+        raise ValueError("data_mode must be 'stored' or 'direct'")
+
     eng = get_engine()
     with eng.begin() as conn:
         conn.execute(text(_TENANT_CONFIG_DDL))
@@ -66,6 +71,8 @@ def init_tenant(tenant_id: str, corpid: str, secret: str, mcp_token: str,
                 "ADD COLUMN checkin_userids TEXT NULL",
             "contact_secret_encrypted":
                 "ADD COLUMN contact_secret_encrypted VARBINARY(512) NULL",
+            "data_mode":
+                "ADD COLUMN data_mode VARCHAR(16) NOT NULL DEFAULT 'stored'",
             "trusted_domain":
                 "ADD COLUMN trusted_domain VARCHAR(255) NOT NULL DEFAULT ''",
         }
@@ -89,20 +96,23 @@ def init_tenant(tenant_id: str, corpid: str, secret: str, mcp_token: str,
     sql = text("""
         INSERT INTO tenant_config
             (tenant_id, display_name, corpid, secret_encrypted, mcp_token, schema_name,
-             sync_interval_min, enabled_modules, checkin_userids, contact_secret_encrypted, enabled)
-        VALUES (:t,:dn,:c,:se,:mt,:sn,:si,:em,:cu,:cs,1)
+             sync_interval_min, enabled_modules, checkin_userids, contact_secret_encrypted,
+             data_mode, enabled)
+        VALUES (:t,:dn,:c,:se,:mt,:sn,:si,:em,:cu,:cs,:dm,1)
         ON DUPLICATE KEY UPDATE
             display_name=VALUES(display_name), corpid=VALUES(corpid),
             secret_encrypted=VALUES(secret_encrypted), mcp_token=VALUES(mcp_token),
             schema_name=VALUES(schema_name), sync_interval_min=VALUES(sync_interval_min),
             enabled_modules=VALUES(enabled_modules), checkin_userids=VALUES(checkin_userids),
-            contact_secret_encrypted=VALUES(contact_secret_encrypted)
+            contact_secret_encrypted=VALUES(contact_secret_encrypted),
+            data_mode=VALUES(data_mode)
     """)
     with eng.begin() as conn:
         conn.execute(sql, {
             "t": tenant_id, "dn": display_name, "c": corpid,
             "se": enc, "mt": mcp_token, "sn": schema_name, "si": sync_interval_min,
             "em": modules, "cu": checkin_userids or None, "cs": contact_enc,
+            "dm": data_mode,
         })
 
     ensure_schema(schema_name)

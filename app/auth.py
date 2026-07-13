@@ -22,7 +22,12 @@ from .tenant import get_tenant_by_token, reload_tenants
 class TenantCtx:
     tenant_id: str
     corpid: str
+    secret: str
     schema_name: str
+    contact_secret: str
+    checkin_userids: list[str]
+    enabled_modules: set[str]
+    data_mode: str
 
 
 _ctx: contextvars.ContextVar[Optional[TenantCtx]] = contextvars.ContextVar(
@@ -64,7 +69,16 @@ class BearerTokenMiddleware(BaseHTTPMiddleware):
         if not tctx:
             return JSONResponse({"errcode": 401, "errmsg": "Token 无效或未绑定租户"}, status_code=401)
 
-        ctx = TenantCtx(tenant_id=tctx.tenant_id, corpid=tctx.corpid, schema_name=tctx.schema_name)
+        ctx = TenantCtx(
+            tenant_id=tctx.tenant_id,
+            corpid=tctx.corpid,
+            secret=tctx.secret,
+            schema_name=tctx.schema_name,
+            contact_secret=tctx.contact_secret,
+            checkin_userids=tctx.checkin_userids,
+            enabled_modules=tctx.enabled_modules,
+            data_mode=tctx.data_mode,
+        )
         token_ctx = _ctx.set(ctx)
         try:
             return await call_next(request)

@@ -9,7 +9,7 @@ from __future__ import annotations
 import logging
 import time
 from dataclasses import dataclass
-from typing import Dict, Optional
+from typing import Dict, Literal, Optional
 
 from sqlalchemy import text
 
@@ -33,6 +33,7 @@ class _TenantCtx:
     enabled_modules: set
     checkin_userids: list       # 手动配的打卡userid
     contact_secret: str = ""    # 通讯录同步secret（解密后，可选，用于自动拉userid）
+    data_mode: Literal["stored", "direct"] = "stored"
 
 
 def _load_all() -> Dict[str, _TenantCtx]:
@@ -40,7 +41,8 @@ def _load_all() -> Dict[str, _TenantCtx]:
     sql = text("""SELECT tenant_id, corpid, secret_encrypted, mcp_token,
                          schema_name, sync_interval_min,
                          enabled_modules, checkin_userids,
-                         contact_secret_encrypted
+                         contact_secret_encrypted,
+                         IFNULL(data_mode, 'stored')
                   FROM tenant_config WHERE enabled=1""")
     out: Dict[str, _TenantCtx] = {}
     with get_engine().connect() as conn:
@@ -75,6 +77,7 @@ def _load_all() -> Dict[str, _TenantCtx]:
             )
         mods = {m.strip() for m in (r[6] or "").split(",") if m.strip()}
         uids = [u.strip() for u in (r[7] or "").split(",") if u.strip()] if r[7] else []
+        data_mode = r[9] if r[9] in {"stored", "direct"} else "stored"
         ctx = _TenantCtx(
             tenant_id=tenant_id, corpid=r[1], secret=secret,
             schema_name=r[4] or f"wbd_{_hash_corpid(r[1])}",
@@ -82,6 +85,7 @@ def _load_all() -> Dict[str, _TenantCtx]:
             enabled_modules=mods or {"report", "approval", "checkin"},
             checkin_userids=uids,
             contact_secret=contact_secret,
+            data_mode=data_mode,
         )
         out[r[3]] = ctx
     return out
