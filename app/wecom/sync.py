@@ -6,9 +6,12 @@
 """
 from __future__ import annotations
 
+import logging
 from typing import List
 
 from . import client as api   # 改为函数式调用，按租户传凭证
+
+logger = logging.getLogger("wecom-sync")
 
 MONTH = 30 * 86400   # 企微汇报时间跨度上限
 
@@ -22,6 +25,7 @@ def sync_reports_window(
     filters = [{"key": "template_id", "value": template_id}] if template_id else None
     seen: set[str] = set()
     result: list[str] = []
+    first_resp_logged = False
 
     seg_start = starttime
     while seg_start < endtime:
@@ -32,6 +36,17 @@ def sync_reports_window(
             if resp.get("errcode") not in (0, None):
                 raise RuntimeError(f"拉取汇报失败 [{resp.get('errcode')}] {resp.get('errmsg')}")
             uuids = resp.get("journaluuid_list", []) or []
+            if not first_resp_logged:
+                first_resp_logged = True
+                logger.info(
+                    "汇报列表首包 errcode=%s errmsg=%s list_len=%s endflag=%s window=[%s,%s]",
+                    resp.get("errcode", 0),
+                    resp.get("errmsg", "ok"),
+                    len(uuids),
+                    resp.get("endflag"),
+                    starttime,
+                    endtime,
+                )
             for u in uuids:
                 if u not in seen:
                     seen.add(u)
@@ -42,6 +57,12 @@ def sync_reports_window(
             if not cursor:
                 break
         seg_start = seg_end
+
+    if not result:
+        logger.warning(
+            "汇报列表为空 journaluuid_list_len=0 window=[%s,%s]（检查权限/可见范围/时间窗/游标）",
+            starttime, endtime,
+        )
     return result
 
 

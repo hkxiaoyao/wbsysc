@@ -298,33 +298,57 @@ def delete_tenant(tenant_id: str, request: Request):
 
 
 @router.post("/tenants/{tenant_id}/sync")
-def trigger_sync(tenant_id: str, request: Request):
-    """手动触发该租户同步（后台执行，立即返回）"""
+def trigger_sync(
+    tenant_id: str,
+    request: Request,
+    lookback_days: int = 30,
+    force: bool = False,
+    reset_cursor: bool = False,
+):
+    """手动触发该租户同步（后台执行，立即返回）
+
+    Query:
+      lookback_days: 回拨/强制窗口天数，默认 30，最大 180
+      force: true=忽略现有游标，按 lookback 窗口拉
+      reset_cursor: true=先把游标写回 now-lookback，再强制同步（全量回拨）
+    """
     _require_auth(request)
     import threading
 
-    # 单租户同步：在线程池跑 run_sync_one_tenant，不阻塞响应
-    from .tenant import get_all_tenants
-    from .wecom.dispatch import _sync_one_report, _sync_one_approval, _sync_one_checkin, BACKFILL_DAYS
+    from .tenant import get_all_tenants, reload_tenants
+    from .wecom.dispatch import FULL_WINDOW_DAYS, run_sync_tenant
 
+    # 刷新缓存，避免刚改 secret 仍用旧空值
+    reload_tenants()
     tenants = {t.tenant_id: t for t in get_all_tenants()}
     t = tenants.get(tenant_id)
     if not t:
         raise HTTPException(404, "租户不存在或已禁用")
 
+    days = max(1, min(int(lookback_days or 30), FULL_WINDOW_DAYS))
+    do_force = bool(force) or bool(reset_cursor)
+    do_reset = bool(reset_cursor)
+
     def _run():
         try:
-            if "report" in t.enabled_modules:
-                _sync_one_report(t, BACKFILL_DAYS)
-            if "approval" in t.enabled_modules:
-                _sync_one_approval(t, BACKFILL_DAYS)
-            if "checkin" in t.enabled_modules:
-                _sync_one_checkin(t, BACKFILL_DAYS)
+            run_sync_tenant(
+                t,
+                lookback_days=days,
+                force=do_force,
+                reset_cursor=do_reset,
+            )
         except Exception:
             pass  # 调度内已记日志
 
     threading.Thread(target=_run, daemon=True).start()
-    return {"ok": True, "msg": f"租户 {tenant_id} 同步已触发(后台执行)"}
+    mode = "全量回拨" if do_reset else ("强制窗口" if do_force else "增量")
+    return {
+        "ok": True,
+        "msg": f"租户 {tenant_id} {mode}同步已触发(后台执行) lookback_days={days}",
+        "lookback_days": days,
+        "force": do_force,
+        "reset_cursor": do_reset,
+    }
 
 
 @router.get("/tenants/{tenant_id}/domain-verify")

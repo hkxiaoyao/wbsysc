@@ -6,6 +6,7 @@
 """
 from __future__ import annotations
 
+import logging
 import time
 from dataclasses import dataclass
 from typing import Dict, Optional
@@ -14,6 +15,8 @@ from sqlalchemy import text
 
 from .crypto import decrypt_secret
 from .db import get_engine
+
+logger = logging.getLogger("wecom-tenant")
 
 _CACHE: Dict[str, "_TenantCtx"] = {}   # token -> ctx
 _CACHE_AT = 0.0
@@ -43,18 +46,37 @@ def _load_all() -> Dict[str, _TenantCtx]:
     with get_engine().connect() as conn:
         rows = conn.execute(sql).fetchall()
     for r in rows:
+        tenant_id = r[0]
         try:
-            secret = decrypt_secret(r[2]) if r[2] else ""
-        except Exception:
+            if r[2]:
+                secret = decrypt_secret(r[2])
+            else:
+                secret = ""
+                logger.warning(
+                    "租户 %s 应用 secret 密文为空（管理后台需重新填写自建应用 Secret）",
+                    tenant_id,
+                )
+        except Exception as e:
             secret = ""
+            logger.warning(
+                "租户 %s 应用 secret 解密失败（多为 CREDENTIAL_KEY 变更，需后台重填 Secret）: %s",
+                tenant_id, type(e).__name__,
+            )
         try:
-            contact_secret = decrypt_secret(r[8]) if r[8] else ""
-        except Exception:
+            if r[8]:
+                contact_secret = decrypt_secret(r[8])
+            else:
+                contact_secret = ""
+        except Exception as e:
             contact_secret = ""
+            logger.warning(
+                "租户 %s 通讯录 secret 解密失败（需后台重填通讯录 Secret）: %s",
+                tenant_id, type(e).__name__,
+            )
         mods = {m.strip() for m in (r[6] or "").split(",") if m.strip()}
         uids = [u.strip() for u in (r[7] or "").split(",") if u.strip()] if r[7] else []
         ctx = _TenantCtx(
-            tenant_id=r[0], corpid=r[1], secret=secret,
+            tenant_id=tenant_id, corpid=r[1], secret=secret,
             schema_name=r[4] or f"wbd_{_hash_corpid(r[1])}",
             sync_interval_min=r[5] or 30,
             enabled_modules=mods or {"report", "approval", "checkin"},

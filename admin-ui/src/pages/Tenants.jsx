@@ -104,13 +104,48 @@ export default function Tenants() {
     })
   }
 
-  const syncNow = async (row) => {
+  const syncNow = async (row, opts = {}) => {
+    const lookback = opts.lookback_days ?? 30
+    const reset = !!opts.reset_cursor
     try {
-      await api.post(`/admin/tenants/${row.tenant_id}/sync`)
-      message.success(`${row.tenant_id} 同步已触发(后台执行)`)
+      const qs = new URLSearchParams({
+        lookback_days: String(lookback),
+        force: reset ? 'true' : 'false',
+        reset_cursor: reset ? 'true' : 'false',
+      })
+      const r = await api.post(`/admin/tenants/${row.tenant_id}/sync?${qs.toString()}`)
+      message.success(r.data?.msg || `${row.tenant_id} 同步已触发(后台执行)`)
     } catch (e) {
       message.error('触发失败: ' + (e.response?.data?.detail || e.message))
     }
+  }
+
+  const openForceSync = (row) => {
+    let days = 30
+    Modal.confirm({
+      title: `强制全量回拨同步 · ${row.tenant_id}`,
+      content: (
+        <div>
+          <p style={{ marginBottom: 8 }}>
+            将游标回拨到「现在 − N 天」，并强制按该窗口重新拉取汇报/审批/打卡。
+            用于刚写了汇报但增量同步 pulled=0 的情况。
+          </p>
+          <div>
+            回拨天数 N：
+            <InputNumber
+              min={1}
+              max={180}
+              defaultValue={30}
+              style={{ marginLeft: 8, width: 100 }}
+              onChange={(v) => { days = Number(v) || 30 }}
+            />
+          </div>
+        </div>
+      ),
+      okText: '开始全量同步',
+      cancelText: '取消',
+      onOk: () => syncNow(row, { lookback_days: days, reset_cursor: true }),
+    })
   }
 
   const openMcpConfig = (row) => {
@@ -257,12 +292,13 @@ export default function Tenants() {
       render: (v) => <Tag color={v ? 'green' : 'default'}>{v ? '启用' : '禁用'}</Tag>
     },
     {
-      title: '操作', key: 'op', width: 360,
+      title: '操作', key: 'op', width: 420,
       render: (_, r) => (
         <Space size={4} wrap>
           <Button size="small" icon={<CopyOutlined />} onClick={() => openMcpConfig(r)}>MCP配置</Button>
           <Button size="small" icon={<GlobalOutlined />} onClick={() => openDomain(r)}>域名</Button>
           <Button size="small" icon={<ThunderboltOutlined />} onClick={() => syncNow(r)}>同步</Button>
+          <Button size="small" type="dashed" onClick={() => openForceSync(r)}>全量回拨</Button>
           <Button size="small" icon={<EditOutlined />} onClick={() => openEdit(r)}>编辑</Button>
           <Button size="small" danger icon={<DeleteOutlined />} onClick={() => remove(r)} />
         </Space>

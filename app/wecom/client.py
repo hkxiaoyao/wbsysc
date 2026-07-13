@@ -7,6 +7,7 @@
 from __future__ import annotations
 
 import hashlib
+import logging
 import threading
 import time
 from typing import Any, Dict, List, Optional
@@ -20,6 +21,8 @@ QYAPI = "https://qyapi.weixin.qq.com"
 # 否则通讯录token会覆盖自建应用token，导致调业务接口报48002
 _token_cache: Dict[str, tuple] = {}
 _token_lock = threading.Lock()
+# 关闭 httpx 默认把完整 URL（含 access_token）打到 INFO 的行为
+logging.getLogger("httpx").setLevel(logging.WARNING)
 _http = httpx.Client(timeout=30.0)
 
 

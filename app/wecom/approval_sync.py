@@ -5,9 +5,12 @@
 """
 from __future__ import annotations
 
+import logging
 from typing import List
 
 from . import client as api
+
+logger = logging.getLogger("wecom-sync")
 
 SPAN = 31 * 86400
 
@@ -26,6 +29,7 @@ def sync_approvals_window(
 
     seen: set[str] = set()
     result: list[str] = []
+    first_resp_logged = False
     seg_start = starttime
     while seg_start < endtime:
         seg_end = min(seg_start + SPAN, endtime)
@@ -35,6 +39,16 @@ def sync_approvals_window(
             if resp.get("errcode") not in (0, None):
                 raise RuntimeError(f"拉取审批失败 [{resp.get('errcode')}] {resp.get('errmsg')}")
             sp_list = resp.get("sp_no_list", []) or []
+            if not first_resp_logged:
+                first_resp_logged = True
+                logger.info(
+                    "审批列表首包 errcode=%s errmsg=%s list_len=%s window=[%s,%s]",
+                    resp.get("errcode", 0),
+                    resp.get("errmsg", "ok"),
+                    len(sp_list),
+                    starttime,
+                    endtime,
+                )
             for sp in sp_list:
                 if sp not in seen:
                     seen.add(sp)
@@ -44,6 +58,12 @@ def sync_approvals_window(
                 break
             cursor = next_cursor
         seg_start = seg_end
+
+    if not result:
+        logger.warning(
+            "审批列表为空 sp_no_list_len=0 window=[%s,%s]（检查权限/可见范围/时间窗/游标）",
+            starttime, endtime,
+        )
     return result
 
 
