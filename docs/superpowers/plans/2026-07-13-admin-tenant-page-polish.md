@@ -48,7 +48,7 @@
 - Consumes: Tenant rows returned by `GET /admin/tenants` with `tenant_id`, `display_name`, `corpid`, `data_mode`, `enabled`, and `has_secret`.
 - Produces: `EMPTY_FILTERS`, `getTenantStats(items)`, `filterTenants(items, filters)`, and `getDirectModeReason(row)` for `Tenants.jsx`.
 
-- [ ] **Step 1: Write the failing helper tests**
+- [x] **Step 1: Write the failing helper tests**
 
 Create `admin-ui/src/pages/tenantsView.test.js` with this exact test coverage:
 
@@ -123,7 +123,7 @@ test('getDirectModeReason explains unavailable synchronization actions', () => {
 })
 ```
 
-- [ ] **Step 2: Run the test and verify the missing module failure**
+- [x] **Step 2: Run the test and verify the missing module failure**
 
 Run:
 
@@ -134,7 +134,7 @@ node --test src/pages/tenantsView.test.js
 
 Expected: exit code `1` with `ERR_MODULE_NOT_FOUND` for `tenantsView.js`.
 
-- [ ] **Step 3: Implement the pure view helpers**
+- [x] **Step 3: Implement the pure view helpers**
 
 Create `admin-ui/src/pages/tenantsView.js`:
 
@@ -174,7 +174,7 @@ export function getDirectModeReason(row) {
 }
 ```
 
-- [ ] **Step 4: Run the helper tests**
+- [x] **Step 4: Run the helper tests**
 
 Run:
 
@@ -184,7 +184,7 @@ node --test src/pages/tenantsView.test.js
 
 Expected: `4` tests pass, `0` fail.
 
-- [ ] **Step 5: Commit the helper boundary**
+- [x] **Step 5: Commit the helper boundary**
 
 ```powershell
 git add admin-ui/src/pages/tenantsView.js admin-ui/src/pages/tenantsView.test.js
