@@ -7,6 +7,7 @@ import {
   Dropdown,
   Empty,
   Form,
+  Grid,
   Input,
   InputNumber,
   Modal,
@@ -18,6 +19,7 @@ import {
   Tooltip,
   Typography,
   Upload,
+  message,
 } from 'antd'
 import {
   CopyOutlined,
@@ -25,6 +27,7 @@ import {
   DownOutlined,
   EditOutlined,
   GlobalOutlined,
+  MoreOutlined,
   PlusOutlined,
   ReloadOutlined,
   SearchOutlined,
@@ -74,6 +77,9 @@ export default function Tenants() {
   })
   const [form] = Form.useForm()
   const [modal, modalContextHolder] = Modal.useModal()
+  const [messageApi, messageContextHolder] = message.useMessage()
+  const screens = Grid.useBreakpoint()
+  const compactTable = !screens.md
 
   const stats = useMemo(() => getTenantStats(data), [data])
   const visibleTenants = useMemo(() => filterTenants(data, filters), [data, filters])
@@ -156,16 +162,16 @@ export default function Tenants() {
       }
       if (editing) {
         await api.put(`/admin/tenants/${editing.tenant_id}`, payload)
-        message.success('已更新')
+        messageApi.success('已更新')
       } else {
         await api.post('/admin/tenants', payload)
-        message.success('已新增(已建schema)')
+        messageApi.success('已新增(已建schema)')
       }
       closeEditor()
       load()
     } catch (e) {
       if (!e.errorFields) {
-        message.error('保存失败: ' + (e.response?.data?.detail || e.message))
+        messageApi.error('保存失败: ' + (e.response?.data?.detail || e.message))
       }
     } finally {
       setSaving(false)
@@ -178,9 +184,14 @@ export default function Tenants() {
       content: '仅删除配置，历史数据schema保留(需另行手动删)。',
       okType: 'danger',
       onOk: async () => {
-        await api.delete(`/admin/tenants/${row.tenant_id}`)
-        message.success('已删除')
-        load()
+        try {
+          await api.delete(`/admin/tenants/${row.tenant_id}`)
+          messageApi.success('已删除')
+          load()
+        } catch (e) {
+          messageApi.error('删除失败: ' + (e.response?.data?.detail || e.message))
+          throw e
+        }
       },
     })
   }
@@ -210,9 +221,9 @@ export default function Tenants() {
         reset_cursor: reset ? 'true' : 'false',
       })
       const r = await api.post(`/admin/tenants/${row.tenant_id}/sync?${qs.toString()}`)
-      message.success(r.data?.msg || `${row.tenant_id} 同步已触发(后台执行)`)
+      messageApi.success(r.data?.msg || `${row.tenant_id} 同步已触发(后台执行)`)
     } catch (e) {
-      message.error('触发失败: ' + (e.response?.data?.detail || e.message))
+      messageApi.error('触发失败: ' + (e.response?.data?.detail || e.message))
     } finally {
       endRowAction(row, action)
     }
@@ -283,7 +294,7 @@ export default function Tenants() {
         ),
       })
     } catch (e) {
-      message.error('诊断失败: ' + (e.response?.data?.detail || e.message))
+      messageApi.error('诊断失败: ' + (e.response?.data?.detail || e.message))
     } finally {
       endRowAction(row, 'diagnose')
     }
@@ -292,7 +303,7 @@ export default function Tenants() {
   const openMcpConfig = async (row) => {
     if (mcpLoadingTenant) return
     if (!row.has_mcp_token) {
-      message.warning('该租户未配置 MCP Token')
+      messageApi.warning('该租户未配置 MCP Token')
       return
     }
     setMcpLoadingTenant(row.tenant_id)
@@ -305,7 +316,7 @@ export default function Tenants() {
         text,
       })
     } catch (e) {
-      message.error('读取 MCP 配置失败: ' + (e.response?.data?.detail || e.message))
+      messageApi.error('读取 MCP 配置失败: ' + (e.response?.data?.detail || e.message))
     } finally {
       setMcpLoadingTenant(null)
     }
@@ -322,11 +333,14 @@ export default function Tenants() {
     })
     try {
       const r = await api.get(`/admin/tenants/${row.tenant_id}/domain-verify`)
-      setDomainModal((s) => ({
-        ...s,
-        domain: r.data.trusted_domain || row.trusted_domain || '',
-        info: r.data,
-      }))
+      setDomainModal((s) => {
+        if (s.tenant?.tenant_id !== row.tenant_id) return s
+        return {
+          ...s,
+          domain: r.data.trusted_domain || row.trusted_domain || '',
+          info: r.data,
+        }
+      })
     } catch (e) {
       // 列表字段已有基础信息，查询失败不阻断
     }
@@ -336,7 +350,7 @@ export default function Tenants() {
     const { tenant, domain, fileList } = domainModal
     if (!tenant) return
     if (!fileList.length) {
-      message.warning('请选择企微下载的校验文件（.txt）')
+      messageApi.warning('请选择企微下载的校验文件（.txt）')
       return
     }
     const raw = fileList[0].originFileObj || fileList[0]
@@ -348,7 +362,7 @@ export default function Tenants() {
       const r = await api.post(`/admin/tenants/${tenant.tenant_id}/domain-verify`, fd, {
         headers: { 'Content-Type': 'multipart/form-data' },
       })
-      message.success(r.data.msg || '上传成功')
+      messageApi.success(r.data.msg || '上传成功')
       setDomainModal((s) => ({
         ...s,
         uploading: false,
@@ -364,7 +378,7 @@ export default function Tenants() {
       load()
     } catch (e) {
       setDomainModal((s) => ({ ...s, uploading: false }))
-      message.error('上传失败: ' + (e.response?.data?.detail || e.message))
+      messageApi.error('上传失败: ' + (e.response?.data?.detail || e.message))
     }
   }
 
@@ -376,14 +390,19 @@ export default function Tenants() {
       content: '删除后根路径将无法访问该文件；可信域名配置会保留。',
       okType: 'danger',
       onOk: async () => {
-        await api.delete(`/admin/tenants/${tenant.tenant_id}/domain-verify`)
-        message.success('已删除')
-        setDomainModal((s) => ({
-          ...s,
-          info: { ...(s.info || {}), has_file: false, verify_filename: '', verify_url: '' },
-          fileList: [],
-        }))
-        load()
+        try {
+          await api.delete(`/admin/tenants/${tenant.tenant_id}/domain-verify`)
+          messageApi.success('已删除')
+          setDomainModal((s) => ({
+            ...s,
+            info: { ...(s.info || {}), has_file: false, verify_filename: '', verify_url: '' },
+            fileList: [],
+          }))
+          load()
+        } catch (e) {
+          messageApi.error('删除校验文件失败: ' + (e.response?.data?.detail || e.message))
+          throw e
+        }
       },
     })
   }
@@ -402,18 +421,20 @@ export default function Tenants() {
         document.execCommand('copy')
         document.body.removeChild(ta)
       }
-      message.success('已复制到剪贴板')
+      messageApi.success('已复制到剪贴板')
     } catch (e) {
-      message.error('复制失败，请手动选择文本复制')
+      messageApi.error('复制失败，请手动选择文本复制')
     }
   }
 
   const actionMenu = (row) => {
     const directReason = getDirectModeReason(row)
-    const syncLabel = (label) => directReason ? (
+    const busyReason = isRowBusy(row) ? '当前租户操作正在执行，请稍候' : ''
+    const unavailableReason = directReason || busyReason
+    const syncLabel = (label) => unavailableReason ? (
       <span className="tenant-menu-label">
         <span>{label}</span>
-        <small>{directReason}</small>
+        <small>{unavailableReason}</small>
       </span>
     ) : label
 
@@ -422,9 +443,9 @@ export default function Tenants() {
         { key: 'mcp', icon: <CopyOutlined />, label: 'MCP 配置' },
         { key: 'domain', icon: <GlobalOutlined />, label: '可信域名' },
         { type: 'divider' },
-        { key: 'sync', icon: <ThunderboltOutlined />, label: syncLabel('立即同步'), disabled: Boolean(directReason) },
-        { key: 'force-sync', label: syncLabel('全量回拨'), disabled: Boolean(directReason) },
-        { key: 'diagnose', label: syncLabel('同步诊断'), disabled: Boolean(directReason) },
+        { key: 'sync', icon: <ThunderboltOutlined />, label: syncLabel('立即同步'), disabled: Boolean(unavailableReason) },
+        { key: 'force-sync', label: syncLabel('全量回拨'), disabled: Boolean(unavailableReason) },
+        { key: 'diagnose', label: syncLabel('同步诊断'), disabled: Boolean(unavailableReason) },
         { type: 'divider' },
         { key: 'delete', icon: <DeleteOutlined />, label: '删除租户', danger: true },
       ],
@@ -441,12 +462,14 @@ export default function Tenants() {
 
   const columns = [
     {
-      title: '租户', key: 'tenant', width: 220, rowScope: 'row',
+      title: '租户', key: 'tenant', width: compactTable ? 100 : 220, rowScope: 'row',
       render: (_, row) => (
         <div className="tenant-identity">
           <Text strong>{row.display_name || row.tenant_id}</Text>
           <Tooltip title={row.tenant_id}>
-            <Text className="tenant-code" copyable={{ text: row.tenant_id }}>{row.tenant_id}</Text>
+            <Text className="tenant-code" copyable={compactTable ? false : { text: row.tenant_id }}>
+              {row.tenant_id}
+            </Text>
           </Tooltip>
         </div>
       ),
@@ -465,10 +488,10 @@ export default function Tenants() {
       ),
     },
     {
-      title: '数据模式', dataIndex: 'data_mode', key: 'data_mode', width: 130,
+      title: '数据模式', dataIndex: 'data_mode', key: 'data_mode', width: compactTable ? 86 : 130,
       render: (mode) => (
         <Tag className={`mode-tag mode-tag--${mode}`}>
-          {mode === 'direct' ? '企微直连' : 'MySQL 存储'}
+          {mode === 'direct' ? (compactTable ? '直连' : '企微直连') : (compactTable ? '存储' : 'MySQL 存储')}
         </Tag>
       ),
     },
@@ -484,25 +507,44 @@ export default function Tenants() {
       ),
     },
     {
-      title: '状态', key: 'status', width: 140,
+      title: '状态', key: 'status', width: compactTable ? 72 : 140,
       render: (_, row) => (
         <div className="tenant-status">
-          <Badge status={row.enabled ? 'success' : 'default'} text={row.enabled ? '已启用' : '已禁用'} />
-          {!row.has_secret && <Text type="danger">缺少应用凭据</Text>}
+          {compactTable ? (
+            <Tooltip title={row.enabled ? '已启用' : '已禁用'}>
+              <span aria-label={`状态：${row.enabled ? '已启用' : '已禁用'}`}>
+                <Badge status={row.enabled ? 'success' : 'default'} />
+              </span>
+            </Tooltip>
+          ) : (
+            <Badge status={row.enabled ? 'success' : 'default'} text={row.enabled ? '已启用' : '已禁用'} />
+          )}
+          {!compactTable && !row.has_secret && <Text type="danger">缺少应用凭据</Text>}
         </div>
       ),
     },
     {
-      title: '操作', key: 'operation', width: 176, fixed: 'right',
+      title: '操作', key: 'operation', width: compactTable ? 74 : 176, fixed: 'right',
       render: (_, row) => (
-        <Space size={8}>
-          <Button type="primary" ghost icon={<EditOutlined />} onClick={() => openEdit(row)}>配置</Button>
+        <Space size={compactTable ? 4 : 8}>
+          <Button
+            type="primary"
+            ghost
+            size={compactTable ? 'small' : 'middle'}
+            icon={<EditOutlined />}
+            aria-label={`配置租户：${row.display_name || row.tenant_id}`}
+            onClick={() => openEdit(row)}
+          >
+            {compactTable ? null : '配置'}
+          </Button>
           <Dropdown menu={actionMenu(row)} trigger={['click']}>
             <Button
+              size={compactTable ? 'small' : 'middle'}
+              icon={compactTable ? <MoreOutlined /> : null}
               aria-label={`更多操作：${row.display_name || row.tenant_id}`}
               loading={isRowBusy(row) || mcpLoadingTenant === row.tenant_id}
             >
-              更多 <DownOutlined />
+              {compactTable ? null : <>更多 <DownOutlined /></>}
             </Button>
           </Dropdown>
         </Space>
@@ -513,6 +555,7 @@ export default function Tenants() {
   return (
     <>
       {modalContextHolder}
+      {messageContextHolder}
       <main className="tenant-workbench">
         <header className="tenant-heading">
           <div>
@@ -589,7 +632,7 @@ export default function Tenants() {
             rowClassName={(row) => (
               `tenant-table-row tenant-table-row--${row.data_mode === 'direct' ? 'direct' : 'stored'}`
             )}
-            scroll={{ x: 960 }}
+            scroll={{ x: compactTable ? 400 : 960 }}
             locale={{
               emptyText: loading || loadError ? null : !data.length ? (
                 <Empty description="还没有租户，先添加第一个企业接入">
@@ -667,7 +710,12 @@ export default function Tenants() {
             >
               <Input.Password placeholder={editing ? '留空表示不修改' : '输入长随机串'} />
             </Form.Item>
-            <Form.Item name="secret" label="自建应用 Secret" extra={editing ? '留空表示不修改' : '新租户需要配置应用 Secret'}>
+            <Form.Item
+              name="secret"
+              label="自建应用 Secret"
+              rules={[{ required: !editing, message: '请输入自建应用 Secret' }]}
+              extra={editing ? '留空表示不修改' : '新租户需要配置应用 Secret'}
+            >
               <Input.Password placeholder={editing ? '留空表示不修改' : '输入应用 Secret'} />
             </Form.Item>
             <Form.Item

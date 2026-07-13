@@ -123,12 +123,12 @@
   letter-spacing: 0.035em;
 }
 
-.tenant-panel .ant-table-tbody > tr > td:first-child {
+.tenant-panel .ant-table-tbody > tr > :first-child {
   position: relative;
   padding-left: 20px;
 }
 
-.tenant-panel .ant-table-tbody > .tenant-table-row > td:first-child::before {
+.tenant-panel .ant-table-tbody > .tenant-table-row > :first-child::before {
   position: absolute;
   inset: 8px auto 8px 0;
   width: 4px;
@@ -137,7 +137,7 @@
   content: '';
 }
 
-.tenant-panel .ant-table-tbody > .tenant-table-row--direct > td:first-child::before {
+.tenant-panel .ant-table-tbody > .tenant-table-row--direct > :first-child::before {
   background: var(--tenant-direct);
 }
 
