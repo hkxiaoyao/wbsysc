@@ -202,9 +202,9 @@ git commit -m "test: cover tenant workbench view model"
 - Consumes: All exports from `./tenantsView.js`; existing `api` client and unchanged tenant endpoints.
 - Produces: Full-list status statistics, filtered table rows, compact row actions, distinct initial/filter/error states, and per-tenant action loading feedback.
 
-- [ ] **Step 1: Add imports and workbench state**
+- [x] **Step 1: Add imports and workbench state**
 
-Update React and Ant Design imports to include `useMemo`, `Alert`, `Badge`, `Drawer`, `Dropdown`, `Empty`, and `Tooltip`. Add `DownOutlined`, `MoreOutlined`, and `SearchOutlined` to the icon import. Import the stylesheet and helper interface:
+Update React and Ant Design imports to include `useMemo`, `Alert`, `Badge`, `Dropdown`, `Empty`, and `Tooltip`. Add `DownOutlined` and `SearchOutlined` to the icon import. Import the helper interface; the page stylesheet is added with Task 4:
 
 ```js
 import { useEffect, useMemo, useState } from 'react'
@@ -219,7 +219,6 @@ import {
 } from '@ant-design/icons'
 import api from '../api.js'
 import { EMPTY_FILTERS, filterTenants, getDirectModeReason, getTenantStats } from './tenantsView.js'
-import './Tenants.css'
 ```
 
 Inside `Tenants`, add these state and derived values:
@@ -234,7 +233,7 @@ const visibleTenants = useMemo(() => filterTenants(data, filters), [data, filter
 const hasFilters = filters.query || filters.dataMode !== 'all' || filters.enabled !== 'all'
 ```
 
-- [ ] **Step 2: Make list loading recoverable without discarding safe data**
+- [x] **Step 2: Make list loading recoverable without discarding safe data**
 
 Replace `load` with:
 
@@ -256,7 +255,7 @@ const load = async () => {
 
 Do not clear `data` in the error path, so a failed refresh keeps the last safe list visible.
 
-- [ ] **Step 3: Isolate row-level operation state**
+- [x] **Step 3: Isolate row-level operation state**
 
 Wrap the existing sync and diagnosis request bodies with these helpers:
 
@@ -272,13 +271,12 @@ const endRowAction = (row, action) => setRowActions((current) => {
   next.delete(rowActionKey(row, action))
   return next
 })
-const isRowActionLoading = (row, action) => rowActions.has(rowActionKey(row, action))
 const isRowBusy = (row) => [...rowActions].some((key) => key.startsWith(`${row.tenant_id}:`))
 ```
 
 In `syncNow`, save `const action = opts.reset_cursor ? 'force-sync' : 'sync'`, call `beginRowAction(row, action)` before the request, and `endRowAction(row, action)` in `finally`. In `diagnoseSync`, use action key `diagnose` with the same row/action arguments. Keep the existing URLs, parameters, messages, and result content unchanged.
 
-- [ ] **Step 4: Replace the wide operation group with configuration plus a dropdown**
+- [x] **Step 4: Replace the wide operation group with configuration plus a dropdown**
 
 Add a menu factory next to the column definition:
 
@@ -381,7 +379,7 @@ const columns = [
 ]
 ```
 
-- [ ] **Step 5: Build the status rail, filters, and explicit table states**
+- [x] **Step 5: Build the status rail, filters, and explicit table states**
 
 Replace the current top `Space` and `Table` with this structure:
 
@@ -458,7 +456,7 @@ Replace the current top `Space` and `Table` with this structure:
 
 Keep the MCP, domain, force-sync, delete-confirmation, and diagnosis dialogs as siblings after `</main>` in the returned fragment.
 
-- [ ] **Step 6: Run deterministic tests and production build**
+- [x] **Step 6: Run deterministic tests and production build**
 
 ```powershell
 cd D:\app\wbsysc\admin-ui
@@ -468,7 +466,7 @@ pnpm run build
 
 Expected: all helper tests pass; Vite exits `0` and emits `dist/` assets without JSX or import errors.
 
-- [ ] **Step 7: Commit the workbench structure**
+- [x] **Step 7: Commit the workbench structure**
 
 ```powershell
 git add admin-ui/src/pages/Tenants.jsx

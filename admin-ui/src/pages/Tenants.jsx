@@ -1,7 +1,37 @@
-import { useEffect, useState } from 'react'
-import { Table, Button, Modal, Form, Input, InputNumber, Select, Switch, Space, Tag, message, Typography, Upload } from 'antd'
-import { PlusOutlined, ReloadOutlined, ThunderboltOutlined, EditOutlined, DeleteOutlined, CopyOutlined, GlobalOutlined, UploadOutlined } from '@ant-design/icons'
+import { useEffect, useMemo, useState } from 'react'
+import {
+  Alert,
+  Badge,
+  Button,
+  Dropdown,
+  Empty,
+  Form,
+  Input,
+  InputNumber,
+  Modal,
+  Select,
+  Space,
+  Switch,
+  Table,
+  Tag,
+  Tooltip,
+  Typography,
+  Upload,
+} from 'antd'
+import {
+  CopyOutlined,
+  DeleteOutlined,
+  DownOutlined,
+  EditOutlined,
+  GlobalOutlined,
+  PlusOutlined,
+  ReloadOutlined,
+  SearchOutlined,
+  ThunderboltOutlined,
+  UploadOutlined,
+} from '@ant-design/icons'
 import api from '../api.js'
+import { EMPTY_FILTERS, filterTenants, getDirectModeReason, getTenantStats } from './tenantsView.js'
 
 const { Text, Paragraph, Link } = Typography
 const MODULES = ['report', 'approval', 'checkin']
@@ -28,6 +58,9 @@ function buildMcpConfig(row) {
 export default function Tenants() {
   const [data, setData] = useState([])
   const [loading, setLoading] = useState(false)
+  const [loadError, setLoadError] = useState('')
+  const [filters, setFilters] = useState({ ...EMPTY_FILTERS })
+  const [rowActions, setRowActions] = useState(() => new Set())
   const [modalOpen, setModalOpen] = useState(false)
   const [editing, setEditing] = useState(null)
   const [saving, setSaving] = useState(false)
@@ -38,13 +71,18 @@ export default function Tenants() {
   })
   const [form] = Form.useForm()
 
+  const stats = useMemo(() => getTenantStats(data), [data])
+  const visibleTenants = useMemo(() => filterTenants(data, filters), [data, filters])
+  const hasFilters = Boolean(filters.query) || filters.dataMode !== 'all' || filters.enabled !== 'all'
+
   const load = async () => {
     setLoading(true)
+    setLoadError('')
     try {
       const r = await api.get('/admin/tenants')
-      setData(r.data.items)
+      setData(r.data.items || [])
     } catch (e) {
-      message.error('加载失败: ' + (e.response?.data?.detail || e.message))
+      setLoadError('租户列表加载失败：' + (e.response?.data?.detail || e.message))
     } finally { setLoading(false) }
   }
 
@@ -118,9 +156,24 @@ export default function Tenants() {
     })
   }
 
+  const rowActionKey = (row, action) => `${row.tenant_id}:${action}`
+  const beginRowAction = (row, action) => setRowActions((current) => {
+    const next = new Set(current)
+    next.add(rowActionKey(row, action))
+    return next
+  })
+  const endRowAction = (row, action) => setRowActions((current) => {
+    const next = new Set(current)
+    next.delete(rowActionKey(row, action))
+    return next
+  })
+  const isRowBusy = (row) => [...rowActions].some((key) => key.startsWith(`${row.tenant_id}:`))
+
   const syncNow = async (row, opts = {}) => {
     const lookback = opts.lookback_days ?? 30
     const reset = !!opts.reset_cursor
+    const action = reset ? 'force-sync' : 'sync'
+    beginRowAction(row, action)
     try {
       const qs = new URLSearchParams({
         lookback_days: String(lookback),
@@ -131,6 +184,8 @@ export default function Tenants() {
       message.success(r.data?.msg || `${row.tenant_id} 同步已触发(后台执行)`)
     } catch (e) {
       message.error('触发失败: ' + (e.response?.data?.detail || e.message))
+    } finally {
+      endRowAction(row, action)
     }
   }
 
@@ -163,6 +218,7 @@ export default function Tenants() {
   }
 
   const diagnoseSync = async (row) => {
+    beginRowAction(row, 'diagnose')
     try {
       const r = await api.get(`/admin/tenants/${row.tenant_id}/sync-diagnose`, {
         params: { lookback_days: 90 },
@@ -199,6 +255,8 @@ export default function Tenants() {
       })
     } catch (e) {
       message.error('诊断失败: ' + (e.response?.data?.detail || e.message))
+    } finally {
+      endRowAction(row, 'diagnose')
     }
   }
 
@@ -321,76 +379,203 @@ export default function Tenants() {
     }
   }
 
+  const actionMenu = (row) => {
+    const directReason = getDirectModeReason(row)
+    const syncLabel = (label) => directReason ? (
+      <span className="tenant-menu-label">
+        <span>{label}</span>
+        <small>{directReason}</small>
+      </span>
+    ) : label
+
+    return {
+      items: [
+        { key: 'mcp', icon: <CopyOutlined />, label: 'MCP 配置' },
+        { key: 'domain', icon: <GlobalOutlined />, label: '可信域名' },
+        { type: 'divider' },
+        { key: 'sync', icon: <ThunderboltOutlined />, label: syncLabel('立即同步'), disabled: Boolean(directReason) },
+        { key: 'force-sync', label: syncLabel('全量回拨'), disabled: Boolean(directReason) },
+        { key: 'diagnose', label: syncLabel('同步诊断'), disabled: Boolean(directReason) },
+        { type: 'divider' },
+        { key: 'delete', icon: <DeleteOutlined />, label: '删除租户', danger: true },
+      ],
+      onClick: ({ key }) => {
+        if (key === 'mcp') openMcpConfig(row)
+        if (key === 'domain') openDomain(row)
+        if (key === 'sync') syncNow(row)
+        if (key === 'force-sync') openForceSync(row)
+        if (key === 'diagnose') diagnoseSync(row)
+        if (key === 'delete') remove(row)
+      },
+    }
+  }
+
   const columns = [
-    { title: '租户ID', dataIndex: 'tenant_id', key: 'tenant_id' },
-    { title: '名称', dataIndex: 'display_name', key: 'display_name' },
-    { title: 'CorpID', dataIndex: 'corpid', key: 'corpid' },
     {
-      title: '模块', dataIndex: 'enabled_modules', key: 'modules',
-      render: (v) => (v || '').split(',').filter(Boolean).map(m => <Tag key={m} color="blue">{m}</Tag>)
-    },
-    { title: '间隔(分)', dataIndex: 'sync_interval_min', key: 'interval', width: 80 },
-    {
-      title: '数据模式', dataIndex: 'data_mode', key: 'data_mode', width: 110,
-      render: (v) => v === 'direct'
-        ? <Tag color="purple">企微直连</Tag>
-        : <Tag color="blue">缓存模式</Tag>,
+      title: '租户', key: 'tenant', width: 220, rowScope: 'row',
+      render: (_, row) => (
+        <div className="tenant-identity">
+          <Text strong>{row.display_name || row.tenant_id}</Text>
+          <Tooltip title={row.tenant_id}>
+            <Text className="tenant-code" copyable={{ text: row.tenant_id }}>{row.tenant_id}</Text>
+          </Tooltip>
+        </div>
+      ),
     },
     {
-      title: '凭证', key: 'cred',
-      render: (_, r) => (
-        <Space size={4}>
-          <Tag color={r.has_secret ? 'green' : 'red'}>应用{r.has_secret ? '✓' : '✗'}</Tag>
-          <Tag color={r.has_contact_secret ? 'green' : 'default'}>通讯录{r.has_contact_secret ? '✓' : '—'}</Tag>
+      title: '企业信息', key: 'company', width: 230, responsive: ['md'],
+      render: (_, row) => (
+        <div className="tenant-company">
+          <Tooltip title={row.corpid}><Text className="tenant-code">{row.corpid}</Text></Tooltip>
+          <Text type="secondary">{row.trusted_domain || '未配置可信域名'}</Text>
+          <Space size={4} wrap>
+            <Tag color={row.has_secret ? 'success' : 'error'}>应用{row.has_secret ? '已配置' : '缺失'}</Tag>
+            <Tag color={row.has_contact_secret ? 'success' : 'default'}>通讯录{row.has_contact_secret ? '已配置' : '可选'}</Tag>
+          </Space>
+        </div>
+      ),
+    },
+    {
+      title: '数据模式', dataIndex: 'data_mode', key: 'data_mode', width: 130,
+      render: (mode) => (
+        <Tag className={`mode-tag mode-tag--${mode}`}>
+          {mode === 'direct' ? '企微直连' : 'MySQL 存储'}
+        </Tag>
+      ),
+    },
+    {
+      title: '同步策略', key: 'policy', width: 250, responsive: ['lg'],
+      render: (_, row) => (
+        <div className="tenant-policy">
+          <Text>{row.data_mode === 'direct' ? '实时调用企微 API' : `每 ${row.sync_interval_min || 30} 分钟同步`}</Text>
+          <Text type="secondary">
+            {(row.enabled_modules || '').split(',').filter(Boolean).join(' · ') || '未启用模块'}
+          </Text>
+        </div>
+      ),
+    },
+    {
+      title: '状态', key: 'status', width: 140,
+      render: (_, row) => (
+        <div className="tenant-status">
+          <Badge status={row.enabled ? 'success' : 'default'} text={row.enabled ? '已启用' : '已禁用'} />
+          {!row.has_secret && <Text type="danger">缺少应用凭据</Text>}
+        </div>
+      ),
+    },
+    {
+      title: '操作', key: 'operation', width: 176, fixed: 'right',
+      render: (_, row) => (
+        <Space size={8}>
+          <Button type="primary" ghost icon={<EditOutlined />} onClick={() => openEdit(row)}>配置</Button>
+          <Dropdown menu={actionMenu(row)} trigger={['click']}>
+            <Button
+              aria-label={`更多操作：${row.display_name || row.tenant_id}`}
+              loading={isRowBusy(row) || mcpLoadingTenant === row.tenant_id}
+            >
+              更多 <DownOutlined />
+            </Button>
+          </Dropdown>
         </Space>
-      )
-    },
-    {
-      title: '可信域名', key: 'domain', width: 180,
-      render: (_, r) => (
-        <Space direction="vertical" size={0}>
-          <Text style={{ fontSize: 12 }}>{r.trusted_domain || '—'}</Text>
-          {r.verify_filename
-            ? <Tag color="green" style={{ margin: 0 }}>{r.verify_filename}</Tag>
-            : <Tag style={{ margin: 0 }}>无校验文件</Tag>}
-        </Space>
-      )
-    },
-    {
-      title: '状态', dataIndex: 'enabled', key: 'enabled', width: 80,
-      render: (v) => <Tag color={v ? 'green' : 'default'}>{v ? '启用' : '禁用'}</Tag>
-    },
-    {
-      title: '操作', key: 'op', width: 480,
-      render: (_, r) => (
-        <Space size={4} wrap>
-          <Button
-            size="small"
-            icon={<CopyOutlined />}
-            loading={mcpLoadingTenant === r.tenant_id}
-            disabled={!!mcpLoadingTenant && mcpLoadingTenant !== r.tenant_id}
-            onClick={() => openMcpConfig(r)}
-          >MCP配置</Button>
-          <Button size="small" icon={<GlobalOutlined />} onClick={() => openDomain(r)}>域名</Button>
-          <Button size="small" icon={<ThunderboltOutlined />} disabled={r.data_mode === 'direct'} onClick={() => syncNow(r)}>同步</Button>
-          <Button size="small" type="dashed" disabled={r.data_mode === 'direct'} onClick={() => openForceSync(r)}>全量回拨</Button>
-          <Button size="small" disabled={r.data_mode === 'direct'} onClick={() => diagnoseSync(r)}>诊断</Button>
-          <Button size="small" icon={<EditOutlined />} onClick={() => openEdit(r)}>编辑</Button>
-          <Button size="small" danger icon={<DeleteOutlined />} onClick={() => remove(r)} />
-        </Space>
-      )
+      ),
     },
   ]
 
   return (
-    <div>
-      <Space style={{ marginBottom: 16 }}>
-        <Button type="primary" icon={<PlusOutlined />} onClick={openCreate}>新增租户</Button>
-        <Button icon={<ReloadOutlined />} onClick={load} loading={loading}>刷新</Button>
-        <Text type="secondary">点「MCP配置」可一键复制 WorkBuddy 连接 JSON</Text>
-      </Space>
-      <Table rowKey="tenant_id" columns={columns} dataSource={data} loading={loading} size="middle"
-        pagination={false} scroll={{ x: 1200 }} />
+    <>
+      <main className="tenant-workbench">
+        <header className="tenant-heading">
+          <div>
+            <Text className="tenant-eyebrow">TENANT OPERATIONS</Text>
+            <h1>租户管理</h1>
+            <Paragraph>管理企业接入、数据模式与同步状态。</Paragraph>
+          </div>
+          <Button type="primary" size="large" icon={<PlusOutlined />} onClick={openCreate}>新增租户</Button>
+        </header>
+
+        <section className="tenant-status-rail" aria-label="租户状态概览">
+          {[
+            ['全部租户', stats.total, 'total'],
+            ['正常运行', stats.running, 'running'],
+            ['直连模式', stats.direct, 'direct'],
+            ['需要关注', stats.attention, 'attention'],
+          ].map(([label, value, tone]) => (
+            <div className={`status-rail-item status-rail-item--${tone}`} key={label}>
+              <span>{label}</span>
+              <strong>{value}</strong>
+            </div>
+          ))}
+        </section>
+
+        <section className="tenant-panel">
+          <div className="tenant-toolbar">
+            <Input
+              allowClear
+              aria-label="搜索租户"
+              prefix={<SearchOutlined />}
+              value={filters.query}
+              placeholder="搜索名称、租户 ID 或 CorpID"
+              onChange={(event) => setFilters((current) => ({ ...current, query: event.target.value }))}
+            />
+            <Select
+              value={filters.dataMode}
+              aria-label="按数据模式筛选"
+              onChange={(dataMode) => setFilters((current) => ({ ...current, dataMode }))}
+              options={[
+                { value: 'all', label: '全部模式' },
+                { value: 'stored', label: 'MySQL 存储' },
+                { value: 'direct', label: '企微直连' },
+              ]}
+            />
+            <Select
+              value={filters.enabled}
+              aria-label="按启用状态筛选"
+              onChange={(enabled) => setFilters((current) => ({ ...current, enabled }))}
+              options={[
+                { value: 'all', label: '全部状态' },
+                { value: 'enabled', label: '已启用' },
+                { value: 'disabled', label: '已禁用' },
+              ]}
+            />
+            <Button icon={<ReloadOutlined />} onClick={load} loading={loading}>刷新</Button>
+          </div>
+
+          {loadError && (
+            <Alert
+              type="error"
+              showIcon
+              message={loadError}
+              action={<Button size="small" onClick={load}>重试</Button>}
+            />
+          )}
+
+          <Table
+            rowKey="tenant_id"
+            columns={columns}
+            dataSource={visibleTenants}
+            loading={loading}
+            pagination={false}
+            size="middle"
+            rowClassName={(row) => (
+              `tenant-table-row tenant-table-row--${row.data_mode === 'direct' ? 'direct' : 'stored'}`
+            )}
+            scroll={{ x: 960 }}
+            locale={{
+              emptyText: loading || loadError ? null : !data.length ? (
+                <Empty description="还没有租户，先添加第一个企业接入">
+                  <Button type="primary" icon={<PlusOutlined />} onClick={openCreate}>新增租户</Button>
+                </Empty>
+              ) : (
+                <Empty description="没有匹配的租户">
+                  {hasFilters && (
+                    <Button onClick={() => setFilters({ ...EMPTY_FILTERS })}>清空筛选</Button>
+                  )}
+                </Empty>
+              ),
+            }}
+          />
+        </section>
+      </main>
 
       <Modal title={editing ? '编辑租户' : '新增租户'} open={modalOpen} onOk={submit}
         onCancel={() => setModalOpen(false)} width={620} okText="保存" cancelText="取消"
@@ -539,6 +724,6 @@ export default function Tenants() {
           </div>
         )}
       </Modal>
-    </div>
+    </>
   )
 }
