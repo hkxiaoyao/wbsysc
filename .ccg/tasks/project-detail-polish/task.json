@@ -1,0 +1,12 @@
+{
+  "id": "project-detail-polish",
+  "title": "检查项目并完善细节",
+  "status": "in_progress",
+  "complexity": "L+",
+  "risk": "medium",
+  "domain": "fullstack",
+  "currentPhase": "planning",
+  "nextAction": "等待用户审阅书面设计",
+  "createdAt": "2026-07-13T06:42:15Z",
+  "branch": "main"
+}

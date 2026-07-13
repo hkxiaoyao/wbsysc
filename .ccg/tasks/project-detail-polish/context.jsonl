@@ -1,0 +1,9 @@
+{"path":"app/wecom/dispatch.py","reason":"同步窗口、500 条上限、游标与部分记录"}
+{"path":"app/mcp_server.py","reason":"MCP 工具契约与数据源分流入口"}
+{"path":"app/config.py","reason":"生产配置验证与数据库 URL"}
+{"path":"app/crypto.py","reason":"凭证主密钥安全默认值"}
+{"path":"app/admin.py","reason":"租户模式、Token 与同步管理接口"}
+{"path":"app/tenant.py","reason":"租户配置缓存与运行时上下文"}
+{"path":"admin-ui/src/pages/Tenants.jsx","reason":"数据模式和敏感信息交互"}
+{"path":"tests/test_smoke_client.py","reason":"当前 pytest 收集失败来源"}
+{"path":"sql","reason":"MySQL 5.7 迁移与运行时结构对齐"}
