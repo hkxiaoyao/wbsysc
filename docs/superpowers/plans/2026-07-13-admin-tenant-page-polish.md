@@ -484,7 +484,7 @@ git commit -m "feat: reshape tenant management workbench"
 - Consumes: Existing Ant Design `Form` instance, existing tenant payload assembly, existing create and update endpoints.
 - Produces: Right-side create/edit drawer with dirty-close confirmation, fixed footer, grouped form sections, and unchanged submission semantics.
 
-- [ ] **Step 1: Rename editor state and track dirty input**
+- [x] **Step 1: Rename editor state and track dirty input**
 
 Replace `modalOpen` state with:
 
@@ -495,7 +495,7 @@ const [editorDirty, setEditorDirty] = useState(false)
 
 At the end of both `openCreate` and `openEdit`, call `setEditorDirty(false)` and `setEditorOpen(true)`. On successful save, call `setEditorDirty(false)` and `setEditorOpen(false)` before `load()`.
 
-- [ ] **Step 2: Add one guarded close path**
+- [x] **Step 2: Add one guarded close path**
 
 Add:
 
@@ -526,7 +526,7 @@ const requestCloseEditor = () => {
 
 Use `requestCloseEditor` for the drawer close button, mask click, Escape key, and footer cancellation through the Drawer `onClose` and cancel button.
 
-- [ ] **Step 3: Replace the editor Modal with a grouped Drawer**
+- [x] **Step 3: Replace the editor Modal with a grouped Drawer**
 
 Use the verified Ant Design 5.29.3 Drawer API:
 
@@ -606,7 +606,7 @@ Use the verified Ant Design 5.29.3 Drawer API:
 </Drawer>
 ```
 
-- [ ] **Step 4: Verify editor behavior and build**
+- [x] **Step 4: Verify editor behavior and build**
 
 Run:
 
@@ -618,7 +618,7 @@ pnpm run build
 
 Expected: tests and build pass. During smoke testing, an untouched drawer closes immediately; a changed field produces the discard confirmation; a failed save leaves the drawer and input open; a successful save closes and reloads the list.
 
-- [ ] **Step 5: Commit the editor interaction**
+- [x] **Step 5: Commit the editor interaction**
 
 ```powershell
 git add admin-ui/src/pages/Tenants.jsx

@@ -3,6 +3,7 @@ import {
   Alert,
   Badge,
   Button,
+  Drawer,
   Dropdown,
   Empty,
   Form,
@@ -61,7 +62,8 @@ export default function Tenants() {
   const [loadError, setLoadError] = useState('')
   const [filters, setFilters] = useState({ ...EMPTY_FILTERS })
   const [rowActions, setRowActions] = useState(() => new Set())
-  const [modalOpen, setModalOpen] = useState(false)
+  const [editorOpen, setEditorOpen] = useState(false)
+  const [editorDirty, setEditorDirty] = useState(false)
   const [editing, setEditing] = useState(null)
   const [saving, setSaving] = useState(false)
   const [mcpLoadingTenant, setMcpLoadingTenant] = useState(null)
@@ -97,7 +99,8 @@ export default function Tenants() {
       enabled: true,
       data_mode: 'stored',
     })
-    setModalOpen(true)
+    setEditorDirty(false)
+    setEditorOpen(true)
   }
 
   const openEdit = (row) => {
@@ -111,7 +114,31 @@ export default function Tenants() {
       mcp_token: '',
       trusted_domain: row.trusted_domain || '',
     })
-    setModalOpen(true)
+    setEditorDirty(false)
+    setEditorOpen(true)
+  }
+
+  const closeEditor = () => {
+    setEditorDirty(false)
+    setEditorOpen(false)
+    setEditing(null)
+    form.resetFields()
+  }
+
+  const requestCloseEditor = () => {
+    if (saving) return
+    if (!editorDirty) {
+      closeEditor()
+      return
+    }
+    Modal.confirm({
+      title: '放弃未保存的修改？',
+      content: '当前租户配置已发生变化，关闭后这些修改不会保留。',
+      okText: '放弃修改',
+      cancelText: '继续编辑',
+      okButtonProps: { danger: true },
+      onOk: closeEditor,
+    })
   }
 
   const submit = async () => {
@@ -132,7 +159,7 @@ export default function Tenants() {
         await api.post('/admin/tenants', payload)
         message.success('已新增(已建schema)')
       }
-      setModalOpen(false)
+      closeEditor()
       load()
     } catch (e) {
       if (!e.errorFields) {
@@ -577,55 +604,124 @@ export default function Tenants() {
         </section>
       </main>
 
-      <Modal title={editing ? '编辑租户' : '新增租户'} open={modalOpen} onOk={submit}
-        onCancel={() => setModalOpen(false)} width={620} okText="保存" cancelText="取消"
-        confirmLoading={saving}>
-        <Form form={form} layout="vertical">
-          <Form.Item name="tenant_id" label="租户ID" rules={[{ required: true }]}>
-            <Input disabled={!!editing} placeholder="如 customerA" />
-          </Form.Item>
-          <Form.Item name="display_name" label="显示名称"><Input /></Form.Item>
-          <Form.Item name="corpid" label="企业CorpID" rules={[{ required: true }]}>
-            <Input placeholder="wwXXXXXXXX" />
-          </Form.Item>
-          <Form.Item name="mcp_token" label="MCP连接Token(workbuddy用)" rules={[{ required: !editing }]}
-            extra={editing ? '留空=保留现有 Token' : '给客户配在 workbuddy 的 MCP Server headers；也可用列表「MCP配置」一键复制'}>
-            <Input.Password placeholder={editing ? '****（不改留空）' : '长随机串'} />
-          </Form.Item>
-          <Form.Item name="secret" label="自建应用Secret"
-            extra={editing ? '留空=不修改' : '必填'}>
-            <Input.Password placeholder={editing ? '****（不改留空）' : ''} />
-          </Form.Item>
-          <Form.Item name="contact_secret" label="通讯录同步Secret（可选）"
-            extra="配置后自动拉全企业userid喂打卡；留空=不改">
-            <Input.Password placeholder={editing ? '****（不改留空）' : ''} />
-          </Form.Item>
-          <Form.Item name="data_mode" label="数据模式" rules={[{ required: true }]}
-            extra="缓存模式定时写入 MySQL；企微直连每次实时请求且不保存业务数据">
-            <Select options={[
-              { value: 'stored', label: '缓存模式（MySQL）' },
-              { value: 'direct', label: '企微直连（不保存业务数据）' },
-            ]} />
-          </Form.Item>
-          <Form.Item name="enabled_modules" label="启用模块" rules={[{ required: true }]}>
-            <Select mode="multiple" options={MODULES.map(m => ({ value: m, label: m }))} />
-          </Form.Item>
-          <Form.Item name="sync_interval_min" label="同步间隔(分钟)">
-            <InputNumber min={1} max={1440} />
-          </Form.Item>
-          <Form.Item name="checkin_userids" label="打卡userid(逗号分隔,可选)"
-            extra="无通讯录secret时用；有则优先自动拉">
-            <Input.TextArea rows={2} placeholder="userA,userB" />
-          </Form.Item>
-          <Form.Item name="trusted_domain" label="可信域名（可选）"
-            extra="反代后的对外域名，如 mcp.example.com；也可在列表「域名」里上传校验文件">
-            <Input placeholder="mcp.example.com" />
-          </Form.Item>
-          <Form.Item name="enabled" label="启用" valuePropName="checked">
-            <Switch />
-          </Form.Item>
+      <Drawer
+        rootClassName="tenant-editor"
+        title={editing ? '配置租户' : '新增租户'}
+        open={editorOpen}
+        onClose={requestCloseEditor}
+        width={680}
+        destroyOnHidden={false}
+        maskClosable={!saving}
+        keyboard={!saving}
+        closable={!saving}
+        extra={editing && (
+          <Tag className={`mode-tag mode-tag--${editing.data_mode}`}>
+            {editing.data_mode === 'direct' ? '企微直连' : 'MySQL 存储'}
+          </Tag>
+        )}
+        footer={(
+          <div className="tenant-editor-footer">
+            <Button onClick={requestCloseEditor} disabled={saving}>取消</Button>
+            <Button type="primary" onClick={submit} loading={saving}>保存配置</Button>
+          </div>
+        )}
+      >
+        <Form
+          form={form}
+          layout="vertical"
+          requiredMark="optional"
+          onValuesChange={() => setEditorDirty(true)}
+        >
+          <section className="tenant-form-section">
+            <div className="tenant-form-section__heading">
+              <div><h2>基本信息</h2><p>用于识别租户和控制启用状态。</p></div>
+            </div>
+            <div className="tenant-form-grid">
+              <Form.Item name="tenant_id" label="租户 ID" rules={[{ required: true, message: '请输入租户 ID' }]}>
+                <Input disabled={Boolean(editing)} placeholder="如 customerA" />
+              </Form.Item>
+              <Form.Item name="display_name" label="显示名称">
+                <Input placeholder="企业或项目名称" />
+              </Form.Item>
+            </div>
+            <Form.Item name="enabled" label="启用租户" valuePropName="checked">
+              <Switch />
+            </Form.Item>
+          </section>
+
+          <section className="tenant-form-section">
+            <div className="tenant-form-section__heading">
+              <div><h2>连接凭据</h2><p>用于调用企微接口和连接 MCP 服务。</p></div>
+            </div>
+            <Form.Item name="corpid" label="企业 CorpID" rules={[{ required: true, message: '请输入企业 CorpID' }]}>
+              <Input placeholder="wwXXXXXXXX" />
+            </Form.Item>
+            <Form.Item
+              name="mcp_token"
+              label="MCP 连接 Token"
+              rules={[{ required: !editing, message: '请输入 MCP 连接 Token' }]}
+              extra={editing ? '留空将保留现有 Token' : '供 WorkBuddy / CodeBuddy 的 MCP Server headers 使用'}
+            >
+              <Input.Password placeholder={editing ? '留空表示不修改' : '输入长随机串'} />
+            </Form.Item>
+            <Form.Item name="secret" label="自建应用 Secret" extra={editing ? '留空表示不修改' : '新租户需要配置应用 Secret'}>
+              <Input.Password placeholder={editing ? '留空表示不修改' : '输入应用 Secret'} />
+            </Form.Item>
+            <Form.Item
+              name="contact_secret"
+              label="通讯录同步 Secret（可选）"
+              extra="配置后自动获取企业成员 userid；编辑时留空表示不修改"
+            >
+              <Input.Password placeholder="可选" />
+            </Form.Item>
+          </section>
+
+          <section className="tenant-form-section">
+            <div className="tenant-form-section__heading">
+              <div><h2>数据与同步策略</h2><p>选择 MySQL 存储或企微实时直连。</p></div>
+            </div>
+            <Form.Item
+              name="data_mode"
+              label="数据模式"
+              rules={[{ required: true, message: '请选择数据模式' }]}
+              extra="MySQL 存储会定时写入业务数据；企微直连每次实时请求且不保存业务数据"
+            >
+              <Select options={[
+                { value: 'stored', label: 'MySQL 存储' },
+                { value: 'direct', label: '企微直连（不缓存）' },
+              ]} />
+            </Form.Item>
+            <Form.Item
+              name="enabled_modules"
+              label="启用模块"
+              rules={[{ required: true, message: '请选择至少一个模块' }]}
+            >
+              <Select mode="multiple" options={MODULES.map((module) => ({ value: module, label: module }))} />
+            </Form.Item>
+            <div className="tenant-form-grid">
+              <Form.Item name="sync_interval_min" label="同步间隔（分钟）">
+                <InputNumber min={1} max={1440} />
+              </Form.Item>
+              <Form.Item name="checkin_userids" label="打卡 userid（可选）" extra="多个 userid 使用英文逗号分隔">
+                <Input.TextArea autoSize={{ minRows: 1, maxRows: 3 }} placeholder="userA,userB" />
+              </Form.Item>
+            </div>
+          </section>
+
+          <section className="tenant-form-section">
+            <div className="tenant-form-section__heading">
+              <div><h2>可信域名</h2><p>配置 MCP 服务对外访问的域名。</p></div>
+            </div>
+            <Form.Item
+              name="trusted_domain"
+              label="可信域名（可选）"
+              extra="不要包含 https://，校验文件仍可从租户列表的“更多”菜单上传"
+            >
+              <Input placeholder="mcp.example.com" />
+            </Form.Item>
+          </section>
         </Form>
-      </Modal>
+      </Drawer>
 
       <Modal
         title={mcpModal.title}
