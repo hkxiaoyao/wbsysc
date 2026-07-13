@@ -17,7 +17,7 @@ from .config import get_settings
 
 @lru_cache
 def _get_fernet() -> Fernet:
-    """从 .env 取主密钥。PoC：若未配 CREDENTIAL_KEY，用 corpid 派生（仅 PoC，生产必须配强随机密钥）"""
+    """从 .env 取主密钥；开发环境可用固定兜底，生产配置校验会阻止该路径。"""
     key = get_settings().credential_key  # 见 config.py 新增
     if not key:
         # PoC 兜底：用固定测试密钥（仅本地，绝不生产用）

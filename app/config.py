@@ -7,7 +7,12 @@ from __future__ import annotations
 from functools import lru_cache
 from typing import Dict
 
+from pydantic import model_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
+from sqlalchemy.engine import URL
+
+
+EXAMPLE_PASSWORDS = {"CHANGE_ME", "<强密码，与开发库不同>", "<强密码，登录管理后台用>"}
 
 
 class Settings(BaseSettings):
@@ -69,6 +74,23 @@ class Settings(BaseSettings):
     sync_interval_approval_min: int = 30
     sync_interval_smarttable_min: int = 60
 
+    @model_validator(mode="after")
+    def validate_production(self):
+        if self.app_env.lower() != "prod":
+            return self
+        errors = []
+        if not self.credential_key:
+            errors.append("CREDENTIAL_KEY must be set in production")
+        if not self.admin_password or self.admin_password in EXAMPLE_PASSWORDS:
+            errors.append("ADMIN_PASSWORD must be a non-example value in production")
+        if not self.db_password or self.db_password in EXAMPLE_PASSWORDS:
+            errors.append("DB_PASSWORD must be a non-example value in production")
+        if self.wecom_use_mock:
+            errors.append("WECOM_USE_MOCK must be false in production")
+        if errors:
+            raise ValueError("; ".join(errors))
+        return self
+
     @property
     def token_map(self) -> Dict[str, str]:
         """解析 token -> 租户标识 映射"""
@@ -85,10 +107,15 @@ class Settings(BaseSettings):
         return mapping
 
     @property
-    def db_url(self) -> str:
-        return (
-            f"mysql+pymysql://{self.db_user}:{self.db_password}"
-            f"@{self.db_host}:{self.db_port}/{self.db_name}?charset=utf8mb4"
+    def db_url(self) -> URL:
+        return URL.create(
+            "mysql+pymysql",
+            username=self.db_user,
+            password=self.db_password,
+            host=self.db_host,
+            port=self.db_port,
+            database=self.db_name,
+            query={"charset": "utf8mb4"},
         )
 
 

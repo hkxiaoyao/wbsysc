@@ -18,9 +18,9 @@ os.environ["NO_PROXY"] = "localhost,127.0.0.1"
 from mcp.client.session import ClientSession
 from mcp.client.streamable_http import streamablehttp_client
 
-SERVER = "http://localhost:8000/mcp"
-TOKEN = "test-token"
-BAD_TOKEN = "wrong-token"
+SERVER = os.getenv("MCP_SMOKE_SERVER", "http://localhost:8000/mcp")
+TOKEN = os.getenv("MCP_SMOKE_TOKEN", "test-token")
+BAD_TOKEN = os.getenv("MCP_SMOKE_BAD_TOKEN", "wrong-token")
 
 
 async def test_auth_rejected():
@@ -90,4 +90,5 @@ async def main():
     sys.exit(0 if (ok1 and ok2) else 1)
 
 
-asyncio.run(main())
+if __name__ == "__main__":
+    asyncio.run(main())
