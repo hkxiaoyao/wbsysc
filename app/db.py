@@ -62,6 +62,13 @@ def ensure_schema(schema_name: str) -> None:
 
 # ----- 汇报落库 -----
 def upsert_report(schema: str, journaluuid: str, info: Dict[str, Any]) -> None:
+    submitter = info.get("submitter") or {}
+    if isinstance(submitter, str):
+        submitter_uid = submitter
+    elif isinstance(submitter, dict):
+        submitter_uid = submitter.get("userid", "") or ""
+    else:
+        submitter_uid = ""
     sql = text(f"""
         INSERT INTO {_q(schema,'wecom_report')}
             (tenant_id, journaluuid, template_id, template_name,
@@ -74,10 +81,11 @@ def upsert_report(schema: str, journaluuid: str, info: Dict[str, Any]) -> None:
     """)
     with get_engine().begin() as conn:
         conn.execute(sql, {
-            "t": schema, "j": journaluuid, "tid": info.get("template_id", ""),
-            "tname": info.get("template_name", ""),
+            "t": schema, "j": journaluuid,
+            "tid": info.get("template_id", "") or "",
+            "tname": info.get("template_name", "") or "",
             "rt": int(info.get("report_time", 0) or 0),
-            "su": (info.get("submitter") or {}).get("userid", ""),
+            "su": submitter_uid,
             "dj": json.dumps(info, ensure_ascii=False, default=str),
         })
 

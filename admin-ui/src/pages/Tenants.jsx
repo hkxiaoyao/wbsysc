@@ -121,23 +121,23 @@ export default function Tenants() {
   }
 
   const openForceSync = (row) => {
-    let days = 30
+    let days = 90
     Modal.confirm({
       title: `强制全量回拨同步 · ${row.tenant_id}`,
       content: (
         <div>
           <p style={{ marginBottom: 8 }}>
             将游标回拨到「现在 − N 天」，并强制按该窗口重新拉取汇报/审批/打卡。
-            用于刚写了汇报但增量同步 pulled=0 的情况。
+            用于企微有数据但库条数偏少（如企微3条库只有2条）。
           </p>
           <div>
             回拨天数 N：
             <InputNumber
               min={1}
               max={180}
-              defaultValue={30}
+              defaultValue={90}
               style={{ marginLeft: 8, width: 100 }}
-              onChange={(v) => { days = Number(v) || 30 }}
+              onChange={(v) => { days = Number(v) || 90 }}
             />
           </div>
         </div>
@@ -146,6 +146,46 @@ export default function Tenants() {
       cancelText: '取消',
       onOk: () => syncNow(row, { lookback_days: days, reset_cursor: true }),
     })
+  }
+
+  const diagnoseSync = async (row) => {
+    try {
+      const r = await api.get(`/admin/tenants/${row.tenant_id}/sync-diagnose`, {
+        params: { lookback_days: 90 },
+      })
+      const d = r.data || {}
+      Modal.info({
+        title: `同步诊断 · ${row.tenant_id}`,
+        width: 560,
+        content: (
+          <div style={{ fontSize: 13, lineHeight: 1.7 }}>
+            <div>企微列表 errcode: <Text code>{String(d.errcode)}</Text> {d.errmsg}</div>
+            <div>企微 journaluuid 条数: <Text strong>{d.list_len}</Text></div>
+            <div>库内 wecom_report 条数: <Text strong>{d.db_report_count}</Text></div>
+            <div>游标 last_value: <Text code>{String(d.db_report_cursor ?? '—')}</Text></div>
+            <div>窗口: [{d.starttime}, {d.endtime}] lookback={d.lookback_days}天</div>
+            <div>样例单号: {(d.sample_uuids || []).join(', ') || '—'}</div>
+            {d.list_len > d.db_report_count && (
+              <Paragraph type="warning" style={{ marginTop: 8 }}>
+                企微条数 &gt; 库条数：请点「全量回拨」再同步。
+              </Paragraph>
+            )}
+            {d.list_len === 0 && (
+              <Paragraph type="danger" style={{ marginTop: 8 }}>
+                企微 API 返回 0 条。请核对汇报应用授权、可见范围、是否为「汇报」单据。
+              </Paragraph>
+            )}
+            {d.list_len > 0 && d.list_len === d.db_report_count && (
+              <Paragraph type="success" style={{ marginTop: 8 }}>
+                条数一致。若业务侧看到更多，可能不在该应用 API 可见范围或时间窗外。
+              </Paragraph>
+            )}
+          </div>
+        ),
+      })
+    } catch (e) {
+      message.error('诊断失败: ' + (e.response?.data?.detail || e.message))
+    }
   }
 
   const openMcpConfig = (row) => {
@@ -292,13 +332,14 @@ export default function Tenants() {
       render: (v) => <Tag color={v ? 'green' : 'default'}>{v ? '启用' : '禁用'}</Tag>
     },
     {
-      title: '操作', key: 'op', width: 420,
+      title: '操作', key: 'op', width: 480,
       render: (_, r) => (
         <Space size={4} wrap>
           <Button size="small" icon={<CopyOutlined />} onClick={() => openMcpConfig(r)}>MCP配置</Button>
           <Button size="small" icon={<GlobalOutlined />} onClick={() => openDomain(r)}>域名</Button>
           <Button size="small" icon={<ThunderboltOutlined />} onClick={() => syncNow(r)}>同步</Button>
           <Button size="small" type="dashed" onClick={() => openForceSync(r)}>全量回拨</Button>
+          <Button size="small" onClick={() => diagnoseSync(r)}>诊断</Button>
           <Button size="small" icon={<EditOutlined />} onClick={() => openEdit(r)}>编辑</Button>
           <Button size="small" danger icon={<DeleteOutlined />} onClick={() => remove(r)} />
         </Space>

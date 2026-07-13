@@ -351,6 +351,44 @@ def trigger_sync(
     }
 
 
+@router.get("/tenants/{tenant_id}/sync-diagnose")
+def sync_diagnose(tenant_id: str, request: Request, lookback_days: int = 90):
+    """诊断：直接调企微汇报列表，返回条数/errcode（不落库、不推游标）"""
+    _require_auth(request)
+    from .tenant import get_all_tenants, reload_tenants
+    from .wecom.dispatch import FULL_WINDOW_DAYS, diagnose_report_pull
+
+    reload_tenants()
+    tenants = {t.tenant_id: t for t in get_all_tenants()}
+    t = tenants.get(tenant_id)
+    if not t:
+        raise HTTPException(404, "租户不存在或已禁用")
+    days = max(1, min(int(lookback_days or 90), FULL_WINDOW_DAYS))
+    result = diagnose_report_pull(t, lookback_days=days)
+    # 附带库内条数，方便对比「企微N条 vs 库M条」
+    try:
+        from sqlalchemy import text as sqltext
+        with get_engine().connect() as conn:
+            row = conn.execute(sqltext(
+                f"SELECT COUNT(*) FROM `{t.schema_name}`.`wecom_report`"
+            )).fetchone()
+            db_count = int(row[0]) if row else 0
+            curs = conn.execute(sqltext(
+                f"SELECT last_value, last_sync_at FROM `{t.schema_name}`.`sync_cursor` "
+                f"WHERE data_source='report' AND filter_key='' LIMIT 1"
+            )).fetchone()
+    except Exception as e:
+        db_count = -1
+        curs = None
+        result["db_error"] = str(e)
+    result["tenant_id"] = tenant_id
+    result["schema_name"] = t.schema_name
+    result["db_report_count"] = db_count
+    result["db_report_cursor"] = (curs[0] if curs else None)
+    result["db_report_cursor_at"] = (str(curs[1]) if curs and curs[1] is not None else None)
+    return result
+
+
 @router.get("/tenants/{tenant_id}/domain-verify")
 def get_domain_verify(tenant_id: str, request: Request):
     """查询租户可信域名与校验文件"""

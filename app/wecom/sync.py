@@ -51,11 +51,16 @@ def sync_reports_window(
                 if u not in seen:
                     seen.add(u)
                     result.append(u)
-            if resp.get("endflag") == 1 or not uuids:
+            # 官方：endflag=1 表示已无数据；空列表且无 next_cursor 也结束
+            # 不要仅因 uuids 为空就 break（兼容异常分页）
+            next_cursor = resp.get("next_cursor", 0)
+            if resp.get("endflag") == 1:
                 break
-            cursor = resp.get("next_cursor", 0)
-            if not cursor:
+            if not uuids and not next_cursor:
                 break
+            if not next_cursor:
+                break
+            cursor = next_cursor
         seg_start = seg_end
 
     if not result:
@@ -63,6 +68,8 @@ def sync_reports_window(
             "汇报列表为空 journaluuid_list_len=0 window=[%s,%s]（检查权限/可见范围/时间窗/游标）",
             starttime, endtime,
         )
+    else:
+        logger.info("汇报列表合计 unique=%s window=[%s,%s]", len(result), starttime, endtime)
     return result
 
 

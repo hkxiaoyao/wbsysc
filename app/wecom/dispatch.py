@@ -51,17 +51,21 @@ def _resolve_checkin_userids(t: _TenantCtx) -> list:
 
 
 def _window(schema: str, data_source: str, lookback_days: int, force: bool = False) -> tuple[int, int]:
-    """计算同步时间窗。force=True 时忽略游标，强制从 now-lookback 拉起。"""
+    """计算同步时间窗。force=True 时忽略游标，强制从 now-lookback 拉起。
+
+    endtime 向后放宽 1 小时，避免服务器时钟偏慢漏掉刚提交的单据。
+    """
     now = int(time.time())
-    endtime = now
+    endtime = now + 3600
     if force:
         starttime = now - max(1, lookback_days) * 86400
         return starttime, endtime
     last = db.get_cursor(schema, data_source, "")
     starttime = int(last) if (last and last.isdigit()) else now - lookback_days * 86400
-    # 游标异常超前时兜底
+    # 增量时再向前回拨 1 天，降低「刚提交却落在游标缝」的漏数
+    starttime = min(starttime, now) - 86400
     if starttime > endtime:
-        starttime = endtime - lookback_days * 86400
+        starttime = now - lookback_days * 86400
     return starttime, endtime
 
 
@@ -81,6 +85,8 @@ def reset_cursors(schema: str, lookback_days: int, modules: set | None = None) -
 def _sync_one_checkin(t: _TenantCtx, lookback_days: int, force: bool = False) -> dict:
     """打卡同步：需租户配置了 checkin_userids / contact_secret"""
     starttime, endtime = _window(t.schema_name, "checkin", lookback_days, force=force)
+    # 打卡接口 endtime 不宜超过当前过多，收回 now
+    endtime = min(endtime, int(time.time()))
     stats = {"pulled": 0, "stored": 0, "err": 0, "starttime": starttime, "endtime": endtime}
 
     if not t.secret:
@@ -113,7 +119,7 @@ def _sync_one_checkin(t: _TenantCtx, lookback_days: int, force: bool = False) ->
         except Exception as e:
             logger.warning("打卡落库失败 %s: %s", rec.get("userid"), e)
             stats["err"] += 1
-    db.save_cursor(t.schema_name, "checkin", "", str(endtime))
+    db.save_cursor(t.schema_name, "checkin", "", str(int(time.time())))
     logger.info("打卡 tenant=%s pulled=%s stored=%s err=%s window=[%s,%s]",
                 t.tenant_id, stats["pulled"], stats["stored"], stats["err"],
                 starttime, endtime)
@@ -123,10 +129,10 @@ def _sync_one_checkin(t: _TenantCtx, lookback_days: int, force: bool = False) ->
 def _detail_ok_report(info: dict) -> bool:
     if not isinstance(info, dict):
         return False
-    if info.get("errcode") not in (None, 0) and "errmsg" in info and "journal" not in info:
+    # 明确业务错误
+    if info.get("errcode") not in (None, 0):
         return False
-    # 企微字段 journal_uuid / journaluuid 都兼容
-    return bool(info.get("journal_uuid") or info.get("journaluuid") or info.get("report_time") is not None)
+    return True
 
 
 def _sync_one_report(t: _TenantCtx, lookback_days: int, force: bool = False) -> dict:
@@ -147,25 +153,41 @@ def _sync_one_report(t: _TenantCtx, lookback_days: int, force: bool = False) -> 
     for ju in uuids[:MAX_DETAIL_PER_RUN]:
         try:
             info = fetch_report_detail(t.corpid, t.secret, ju)
-            if _detail_ok_report(info):
-                # 统一补 journaluuid 便于落库
-                if isinstance(info, dict) and not info.get("journaluuid"):
-                    info = {**info, "journaluuid": ju}
-                db.upsert_report(t.schema_name, ju, info)
-                stats["stored"] += 1
-            else:
+            if not _detail_ok_report(info if isinstance(info, dict) else {}):
+                # 详情失败也不丢单号：用列表 uuid 写最小记录，避免「企微3条库只有2条」
                 logger.warning(
-                    "汇报详情不可落库 ju=%s keys=%s errcode=%s errmsg=%s",
+                    "汇报详情异常仍落最小记录 ju=%s keys=%s errcode=%s errmsg=%s",
                     ju[:16],
                     list(info.keys())[:12] if isinstance(info, dict) else type(info).__name__,
                     (info or {}).get("errcode") if isinstance(info, dict) else None,
                     (info or {}).get("errmsg") if isinstance(info, dict) else None,
                 )
+                info = {
+                    "journaluuid": ju,
+                    "journal_uuid": ju,
+                    "template_id": "",
+                    "template_name": "",
+                    "report_time": 0,
+                    "submitter": {},
+                    "_partial": True,
+                }
                 stats["err"] += 1
+            if isinstance(info, dict):
+                if not info.get("journaluuid"):
+                    info = {**info, "journaluuid": ju}
+                if not info.get("journal_uuid"):
+                    info = {**info, "journal_uuid": ju}
+                # submitter 兼容字符串
+                sub = info.get("submitter")
+                if isinstance(sub, str):
+                    info = {**info, "submitter": {"userid": sub}}
+            db.upsert_report(t.schema_name, ju, info if isinstance(info, dict) else {"journaluuid": ju})
+            stats["stored"] += 1
         except Exception as e:
-            logger.warning("汇报详情失败 %s: %s", ju[:16], e)
+            logger.warning("汇报详情/落库失败 %s: %s", ju[:16], e)
             stats["err"] += 1
-    db.save_cursor(t.schema_name, "report", "", str(endtime))
+    # 游标存真实 now，不用放宽后的 endtime，避免下次窗异常
+    db.save_cursor(t.schema_name, "report", "", str(int(time.time())))
     logger.info("汇报 tenant=%s pulled=%s stored=%s err=%s window=[%s,%s]",
                 t.tenant_id, stats["pulled"], stats["stored"], stats["err"],
                 starttime, endtime)
@@ -190,28 +212,74 @@ def _sync_one_approval(t: _TenantCtx, lookback_days: int, force: bool = False) -
     for sp in sps[:MAX_DETAIL_PER_RUN]:
         try:
             info = fetch_approval_detail(t.corpid, t.secret, sp)
-            if isinstance(info, dict) and ("sp_no" in info or info.get("sp_status") is not None):
-                if "sp_no" not in info:
-                    info = {**info, "sp_no": sp}
-                db.upsert_approval(t.schema_name, sp, info)
-                stats["stored"] += 1
-            else:
+            if not isinstance(info, dict) or info.get("errcode") not in (None, 0):
                 logger.warning(
-                    "审批详情不可落库 sp=%s keys=%s errcode=%s errmsg=%s",
+                    "审批详情异常仍落最小记录 sp=%s errcode=%s errmsg=%s",
                     sp,
-                    list(info.keys())[:12] if isinstance(info, dict) else type(info).__name__,
                     (info or {}).get("errcode") if isinstance(info, dict) else None,
                     (info or {}).get("errmsg") if isinstance(info, dict) else None,
                 )
+                info = {"sp_no": sp, "sp_name": "", "sp_status": 0, "template_id": "",
+                        "apply_time": 0, "applyer": {}, "_partial": True}
                 stats["err"] += 1
+            if "sp_no" not in info:
+                info = {**info, "sp_no": sp}
+            applyer = info.get("applyer")
+            if isinstance(applyer, str):
+                info = {**info, "applyer": {"userid": applyer}}
+            db.upsert_approval(t.schema_name, sp, info)
+            stats["stored"] += 1
         except Exception as e:
-            logger.warning("审批详情失败 %s: %s", sp, e)
+            logger.warning("审批详情/落库失败 %s: %s", sp, e)
             stats["err"] += 1
-    db.save_cursor(t.schema_name, "approval", "", str(endtime))
+    db.save_cursor(t.schema_name, "approval", "", str(int(time.time())))
     logger.info("审批 tenant=%s pulled=%s stored=%s err=%s window=[%s,%s]",
                 t.tenant_id, stats["pulled"], stats["stored"], stats["err"],
                 starttime, endtime)
     return stats
+
+
+def diagnose_report_pull(t: _TenantCtx, lookback_days: int = 30) -> dict:
+    """只调企微列表接口做诊断，不落库、不推进游标。"""
+    from . import client as api
+    now = int(time.time())
+    starttime = now - max(1, min(int(lookback_days), FULL_WINDOW_DAYS)) * 86400
+    endtime = now + 3600
+    if not t.secret:
+        return {
+            "ok": False,
+            "error": "empty app secret",
+            "starttime": starttime,
+            "endtime": endtime,
+        }
+    try:
+        resp = api.list_report_records(t.corpid, t.secret, starttime, endtime, 0, 100)
+    except Exception as e:
+        return {
+            "ok": False,
+            "error": str(e),
+            "starttime": starttime,
+            "endtime": endtime,
+        }
+    uuids = resp.get("journaluuid_list") or []
+    # 单号只回前缀，避免日志/响应过长
+    sample = []
+    for u in uuids[:5]:
+        s = str(u)
+        sample.append(s if len(s) <= 12 else f"{s[:8]}...{s[-4:]}")
+    return {
+        "ok": resp.get("errcode", 0) in (0, None),
+        "errcode": resp.get("errcode", 0),
+        "errmsg": resp.get("errmsg", "ok"),
+        "list_len": len(uuids),
+        "endflag": resp.get("endflag"),
+        "next_cursor": resp.get("next_cursor"),
+        "sample_uuids": sample,
+        "starttime": starttime,
+        "endtime": endtime,
+        "lookback_days": lookback_days,
+        "resp_keys": sorted(list(resp.keys()))[:20],
+    }
 
 
 def run_sync_tenant(
