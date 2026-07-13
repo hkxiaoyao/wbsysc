@@ -7,6 +7,7 @@
 from __future__ import annotations
 
 import hashlib
+import logging
 import secrets
 import time
 from typing import Literal, Optional
@@ -29,6 +30,8 @@ from .tenant import _hash_corpid, reload_tenants
 from .wecom.dispatch import run_sync_all
 
 router = APIRouter(prefix="/admin", tags=["admin"])
+logger = logging.getLogger("wecom-gateway")
+MCP_TOKEN_MIN_LENGTH = 16
 
 # session 存储：token -> expire_at（内存，重启失效；PoC 够用）
 _sessions: dict[str, float] = {}
@@ -112,12 +115,37 @@ class TenantUpsert(BaseModel):
     enabled: bool = True
 
 
+def _mcp_token_hint(token: str) -> str:
+    if not token:
+        return ""
+    if len(token) <= 4:
+        return "****"
+    return token[-4:]
+
+
+def _validate_mcp_token(token: str) -> None:
+    if len(token) < MCP_TOKEN_MIN_LENGTH:
+        raise HTTPException(
+            400,
+            f"MCP Token 长度不能少于 {MCP_TOKEN_MIN_LENGTH} 个字符",
+        )
+
+
+def _is_missing_data_mode_column_error(exc: Exception) -> bool:
+    """仅识别 MySQL 1054 且明确指向 data_mode 的缺列错误。"""
+    db_error = getattr(exc, "orig", exc)
+    args = getattr(db_error, "args", ())
+    code = args[0] if args else getattr(db_error, "errno", None)
+    message = " ".join(str(arg) for arg in args).lower()
+    return code == 1054 and "unknown column" in message and "data_mode" in message
+
+
 def _tenant_item(r) -> dict:
     """list/create 共用的租户序列化 + 校验文件信息"""
     item = {
         "tenant_id": r[0], "display_name": r[1], "corpid": r[2],
         "has_mcp_token": bool(r[3]),
-        "mcp_token_hint": r[3][-4:] if r[3] else "",
+        "mcp_token_hint": _mcp_token_hint(r[3]),
         "schema_name": r[4],
         "sync_interval_min": r[5], "enabled_modules": r[6],
         "checkin_userids": r[7],
@@ -149,8 +177,7 @@ def list_tenants(request: Request):
         ensure_domain_tables()
     except Exception as e:
         # 补表/补列失败不阻断列表（旧库兼容）；域名相关字段降级为空
-        import logging
-        logging.getLogger("wecom-gateway").warning("ensure_domain_tables failed: %s", e)
+        logger.warning("ensure_domain_tables failed: %s", e)
 
     # 优先带 trusted_domain/data_mode；列尚未加上时回退旧 SQL，避免 500
     sql_full = text("""SELECT tenant_id, display_name, corpid, mcp_token, schema_name,
@@ -170,7 +197,13 @@ def list_tenants(request: Request):
     with get_engine().connect() as conn:
         try:
             rows = conn.execute(sql_full).fetchall()
-        except Exception:
+        except Exception as e:
+            if not _is_missing_data_mode_column_error(e):
+                raise
+            logger.warning(
+                "tenant list falling back to legacy query because data_mode column is missing: %s",
+                e,
+            )
             rows = conn.execute(sql_legacy).fetchall()
     items = []
     for r in rows:
@@ -181,7 +214,7 @@ def list_tenants(request: Request):
             items.append({
                 "tenant_id": r[0], "display_name": r[1], "corpid": r[2],
                 "has_mcp_token": bool(r[3]),
-                "mcp_token_hint": r[3][-4:] if r[3] else "",
+                "mcp_token_hint": _mcp_token_hint(r[3]),
                 "schema_name": r[4],
                 "sync_interval_min": r[5], "enabled_modules": r[6],
                 "checkin_userids": r[7],
@@ -198,9 +231,10 @@ def list_tenants(request: Request):
 
 
 @router.get("/tenants/{tenant_id}/mcp-config")
-def get_mcp_config(tenant_id: str, request: Request):
+def get_mcp_config(tenant_id: str, request: Request, response: Response):
     """鉴权后按需返回单个租户的 MCP 连接配置。"""
     _require_auth(request)
+    response.headers["Cache-Control"] = "no-store"
     with get_engine().connect() as conn:
         row = conn.execute(text(
             "SELECT tenant_id, mcp_token, IFNULL(trusted_domain, '') "
@@ -223,6 +257,7 @@ def create_tenant(body: TenantUpsert, request: Request):
         raise HTTPException(400, "新增租户必须填 secret")
     if not body.mcp_token:
         raise HTTPException(400, "新增租户必须填 MCP Token")
+    _validate_mcp_token(body.mcp_token)
     ensure_domain_tables()
     try:
         trusted_domain = normalize_domain(body.trusted_domain) if body.trusted_domain else ""
@@ -261,6 +296,8 @@ def create_tenant(body: TenantUpsert, request: Request):
 def update_tenant(tenant_id: str, body: TenantUpsert, request: Request):
     """编辑租户：留空的 secret/contact_secret 不修改（保持原值）"""
     _require_auth(request)
+    if body.mcp_token:
+        _validate_mcp_token(body.mcp_token)
     ensure_domain_tables()
     eng = get_engine()
     try:
