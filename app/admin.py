@@ -124,6 +124,8 @@ def _mcp_token_hint(token: str) -> str:
 
 
 def _validate_mcp_token(token: str) -> None:
+    if token != token.strip():
+        raise HTTPException(400, "MCP Token 不能包含首尾空格")
     if len(token) < MCP_TOKEN_MIN_LENGTH:
         raise HTTPException(
             400,

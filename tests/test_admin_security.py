@@ -186,6 +186,17 @@ def test_create_tenant_rejects_short_mcp_token(monkeypatch):
     assert exc.value.status_code == 400
 
 
+@pytest.mark.parametrize(
+    "token",
+    [" token-1234567890", "token-1234567890 "],
+)
+def test_mcp_token_validation_rejects_surrounding_whitespace(token):
+    with pytest.raises(HTTPException) as exc:
+        admin._validate_mcp_token(token)
+
+    assert exc.value.status_code == 400
+
+
 def test_create_tenant_writes_data_mode(monkeypatch):
     executed = {}
 
