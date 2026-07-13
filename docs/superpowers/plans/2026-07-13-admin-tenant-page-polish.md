@@ -6,7 +6,7 @@
 
 **Architecture:** Keep all existing API calls and auxiliary MCP/domain dialogs in `Tenants.jsx`, extract only deterministic list derivation into a small ESM helper module, and cover those helpers with Node's built-in test runner. Add one page-scoped stylesheet for the status rail, data-mode row signature, drawer sections, and responsive behavior.
 
-**Tech Stack:** React 18.3, Ant Design 5.21, Vite 5.4, native CSS, Node `node:test`.
+**Tech Stack:** React 18.3, Ant Design 5.29.3 (resolved lockfile version), Vite 5.4, native CSS, Node `node:test`.
 
 ## Global Constraints
 
@@ -32,9 +32,9 @@
 
 ## Pre-implementation Gate
 
-- [ ] Run the required Gemini and Claude analyses in parallel from `D:\app\wbsysc`, asking both reviewers to inspect the approved specification, this plan, and the current `Tenants.jsx` for correctness, accessibility, regression risks, and Ant Design 5.21 compatibility.
-- [ ] Merge non-conflicting findings into the implementation notes; reject suggestions that change backend contracts or the approved page scope.
-- [ ] Update `.ccg/tasks/admin-tenant-page-polish/task.json` to `currentPhase: "implementation"` and `nextAction: "实现租户管理工作台"`.
+- [x] Run the required Gemini and Claude analyses in parallel from the active worktree, asking both reviewers to inspect the approved specification, this plan, and the current `Tenants.jsx` for correctness, accessibility, regression risks, and Ant Design 5.29.3 compatibility. Gemini was attempted but unavailable because `GEMINI_API_KEY` is not configured; Claude completed the analysis.
+- [x] Merge non-conflicting findings into the implementation notes; reject suggestions that change backend contracts or the approved page scope.
+- [x] Update `.ccg/tasks/admin-tenant-page-polish/task.json` to `currentPhase: "implementation"` and `nextAction: "实现租户管理工作台"`.
 
 ---
 
@@ -227,7 +227,7 @@ Inside `Tenants`, add these state and derived values:
 ```js
 const [loadError, setLoadError] = useState('')
 const [filters, setFilters] = useState({ ...EMPTY_FILTERS })
-const [rowAction, setRowAction] = useState({ tenantId: '', action: '' })
+const [rowActions, setRowActions] = useState(() => new Set())
 
 const stats = useMemo(() => getTenantStats(data), [data])
 const visibleTenants = useMemo(() => filterTenants(data, filters), [data, filters])
@@ -261,14 +261,22 @@ Do not clear `data` in the error path, so a failed refresh keeps the last safe l
 Wrap the existing sync and diagnosis request bodies with these helpers:
 
 ```js
-const beginRowAction = (row, action) => setRowAction({ tenantId: row.tenant_id, action })
-const endRowAction = () => setRowAction({ tenantId: '', action: '' })
-const isRowActionLoading = (row, action) => (
-  rowAction.tenantId === row.tenant_id && rowAction.action === action
-)
+const rowActionKey = (row, action) => `${row.tenant_id}:${action}`
+const beginRowAction = (row, action) => setRowActions((current) => {
+  const next = new Set(current)
+  next.add(rowActionKey(row, action))
+  return next
+})
+const endRowAction = (row, action) => setRowActions((current) => {
+  const next = new Set(current)
+  next.delete(rowActionKey(row, action))
+  return next
+})
+const isRowActionLoading = (row, action) => rowActions.has(rowActionKey(row, action))
+const isRowBusy = (row) => [...rowActions].some((key) => key.startsWith(`${row.tenant_id}:`))
 ```
 
-In `syncNow`, call `beginRowAction(row, opts.reset_cursor ? 'force-sync' : 'sync')` before the request and `endRowAction()` in `finally`. In `diagnoseSync`, use action key `diagnose` with the same `try/finally` structure. Keep the existing URLs, parameters, messages, and result content unchanged.
+In `syncNow`, save `const action = opts.reset_cursor ? 'force-sync' : 'sync'`, call `beginRowAction(row, action)` before the request, and `endRowAction(row, action)` in `finally`. In `diagnoseSync`, use action key `diagnose` with the same row/action arguments. Keep the existing URLs, parameters, messages, and result content unchanged.
 
 - [ ] **Step 4: Replace the wide operation group with configuration plus a dropdown**
 
@@ -277,9 +285,12 @@ Add a menu factory next to the column definition:
 ```jsx
 const actionMenu = (row) => {
   const directReason = getDirectModeReason(row)
-  const syncLabel = (label) => directReason
-    ? <Tooltip title={directReason}><span>{label}</span></Tooltip>
-    : label
+  const syncLabel = (label) => directReason ? (
+    <span className="tenant-menu-label">
+      <span>{label}</span>
+      <small>{directReason}</small>
+    </span>
+  ) : label
 
   return {
     items: [
@@ -287,7 +298,7 @@ const actionMenu = (row) => {
       { key: 'domain', icon: <GlobalOutlined />, label: '可信域名' },
       { type: 'divider' },
       { key: 'sync', icon: <ThunderboltOutlined />, label: syncLabel('立即同步'), disabled: Boolean(directReason) },
-      { key: 'force-sync', label: syncLabel('全量回滚'), disabled: Boolean(directReason) },
+      { key: 'force-sync', label: syncLabel('全量回拨'), disabled: Boolean(directReason) },
       { key: 'diagnose', label: syncLabel('同步诊断'), disabled: Boolean(directReason) },
       { type: 'divider' },
       { key: 'delete', icon: <DeleteOutlined />, label: '删除租户', danger: true },
@@ -309,7 +320,7 @@ Replace `columns` with six purposeful columns:
 ```jsx
 const columns = [
   {
-    title: '租户', key: 'tenant', width: 230, fixed: 'left', rowScope: 'row',
+    title: '租户', key: 'tenant', width: 220, rowScope: 'row',
     render: (_, row) => (
       <div className="tenant-identity">
         <Text strong>{row.display_name || row.tenant_id}</Text>
@@ -322,6 +333,7 @@ const columns = [
     render: (_, row) => (
       <div className="tenant-company">
         <Tooltip title={row.corpid}><Text className="tenant-code">{row.corpid}</Text></Tooltip>
+        <Text type="secondary">{row.trusted_domain || '未配置可信域名'}</Text>
         <Space size={4} wrap>
           <Tag color={row.has_secret ? 'success' : 'error'}>应用{row.has_secret ? '已配置' : '缺失'}</Tag>
           <Tag color={row.has_contact_secret ? 'success' : 'default'}>通讯录{row.has_contact_secret ? '已配置' : '可选'}</Tag>
@@ -360,7 +372,7 @@ const columns = [
           <Button
             aria-label={`更多操作：${row.display_name || row.tenant_id}`}
             icon={<MoreOutlined />}
-            loading={rowAction.tenantId === row.tenant_id || mcpLoadingTenant === row.tenant_id}
+            loading={isRowBusy(row) || mcpLoadingTenant === row.tenant_id}
           >更多 <DownOutlined /></Button>
         </Dropdown>
       </Space>
@@ -400,7 +412,7 @@ Replace the current top `Space` and `Table` with this structure:
   <section className="tenant-panel">
     <div className="tenant-toolbar">
       <Input
-        allowClear prefix={<SearchOutlined />} value={filters.query}
+        allowClear aria-label="搜索租户" prefix={<SearchOutlined />} value={filters.query}
         placeholder="搜索名称、租户 ID 或 CorpID"
         onChange={(event) => setFilters((current) => ({ ...current, query: event.target.value }))}
       />
@@ -429,7 +441,7 @@ Replace the current top `Space` and `Table` with this structure:
       rowClassName={(row) => `tenant-table-row tenant-table-row--${row.data_mode === 'direct' ? 'direct' : 'stored'}`}
       scroll={{ x: 960 }}
       locale={{
-        emptyText: !data.length && !loading ? (
+        emptyText: loading || loadError ? null : !data.length ? (
           <Empty description="还没有租户，先添加第一个企业接入">
             <Button type="primary" icon={<PlusOutlined />} onClick={openCreate}>新增租户</Button>
           </Empty>
@@ -451,7 +463,7 @@ Keep the MCP, domain, force-sync, delete-confirmation, and diagnosis dialogs as 
 ```powershell
 cd D:\app\wbsysc\admin-ui
 node --test src/pages/tenantsView.test.js
-npm run build
+pnpm run build
 ```
 
 Expected: all helper tests pass; Vite exits `0` and emits `dist/` assets without JSX or import errors.
@@ -498,6 +510,7 @@ const closeEditor = () => {
 }
 
 const requestCloseEditor = () => {
+  if (saving) return
   if (!editorDirty) {
     closeEditor()
     return
@@ -517,7 +530,7 @@ Use `requestCloseEditor` for the drawer close button, mask click, Escape key, an
 
 - [ ] **Step 3: Replace the editor Modal with a grouped Drawer**
 
-Use the verified Ant Design 5.21 Drawer API:
+Use the verified Ant Design 5.29.3 Drawer API:
 
 ```jsx
 <Drawer
@@ -526,7 +539,7 @@ Use the verified Ant Design 5.21 Drawer API:
   open={editorOpen}
   onClose={requestCloseEditor}
   width={680}
-  destroyOnClose={false}
+  destroyOnHidden={false}
   maskClosable={!saving}
   extra={editing && <Tag className={`mode-tag mode-tag--${editing.data_mode}`}>{editing.data_mode === 'direct' ? '企微直连' : 'MySQL 存储'}</Tag>}
   footer={(
@@ -543,9 +556,7 @@ Use the verified Ant Design 5.21 Drawer API:
     onValuesChange={() => setEditorDirty(true)}
   >
     <section className="tenant-form-section">
-      <div className="tenant-form-section__heading">
-        <span>01</span><div><h2>基本信息</h2><p>用于识别租户和控制启用状态。</p></div>
-      </div>
+      <div className="tenant-form-section__heading"><div><h2>基本信息</h2><p>用于识别租户和控制启用状态。</p></div></div>
       <div className="tenant-form-grid">
         <Form.Item name="tenant_id" label="租户 ID" rules={[{ required: true, message: '请输入租户 ID' }]}>
           <Input disabled={Boolean(editing)} placeholder="如 customerA" />
@@ -556,9 +567,7 @@ Use the verified Ant Design 5.21 Drawer API:
     </section>
 
     <section className="tenant-form-section">
-      <div className="tenant-form-section__heading">
-        <span>02</span><div><h2>连接凭据</h2><p>用于调用企微接口和连接 MCP 服务。</p></div>
-      </div>
+      <div className="tenant-form-section__heading"><div><h2>连接凭据</h2><p>用于调用企微接口和连接 MCP 服务。</p></div></div>
       <Form.Item name="corpid" label="企业 CorpID" rules={[{ required: true, message: '请输入企业 CorpID' }]}>
         <Input placeholder="wwXXXXXXXX" />
       </Form.Item>
@@ -574,9 +583,7 @@ Use the verified Ant Design 5.21 Drawer API:
     </section>
 
     <section className="tenant-form-section">
-      <div className="tenant-form-section__heading">
-        <span>03</span><div><h2>数据与同步策略</h2><p>选择 MySQL 存储或企微实时直连。</p></div>
-      </div>
+      <div className="tenant-form-section__heading"><div><h2>数据与同步策略</h2><p>选择 MySQL 存储或企微实时直连。</p></div></div>
       <Form.Item name="data_mode" label="数据模式" rules={[{ required: true, message: '请选择数据模式' }]} extra="MySQL 存储会定时写入业务数据；企微直连每次实时请求且不保存业务数据">
         <Select options={[{ value: 'stored', label: 'MySQL 存储' }, { value: 'direct', label: '企微直连（不缓存）' }]} />
       </Form.Item>
@@ -592,9 +599,7 @@ Use the verified Ant Design 5.21 Drawer API:
     </section>
 
     <section className="tenant-form-section">
-      <div className="tenant-form-section__heading">
-        <span>04</span><div><h2>可信域名</h2><p>配置 MCP 服务对外访问的域名。</p></div>
-      </div>
+      <div className="tenant-form-section__heading"><div><h2>可信域名</h2><p>配置 MCP 服务对外访问的域名。</p></div></div>
       <Form.Item name="trusted_domain" label="可信域名（可选）" extra="不要包含 https://，校验文件仍可从租户列表的“更多”菜单上传">
         <Input placeholder="mcp.example.com" />
       </Form.Item>
@@ -610,7 +615,7 @@ Run:
 ```powershell
 cd D:\app\wbsysc\admin-ui
 node --test src/pages/tenantsView.test.js
-npm run build
+pnpm run build
 ```
 
 Expected: tests and build pass. During smoke testing, an untouched drawer closes immediately; a changed field produces the discard confirmation; a failed save leaves the drawer and input open; a successful save closes and reloads the list.
@@ -644,7 +649,11 @@ Create `admin-ui/src/pages/Tenants.css`:
   --tenant-direct: #7356a3;
   --tenant-canvas: #eef3f5;
   --tenant-running: #2c8c68;
+  min-height: 100%;
+  margin: -24px;
+  padding: 24px;
   color: var(--tenant-ink);
+  background: var(--tenant-canvas);
 }
 
 .tenant-heading {
@@ -736,6 +745,8 @@ Create `admin-ui/src/pages/Tenants.css`:
 .mode-tag { margin: 0; border-color: transparent; font-weight: 650; }
 .mode-tag--stored { color: #0e6679; background: #e4f3f6; }
 .mode-tag--direct { color: #62428d; background: #f0eafa; }
+.tenant-menu-label { display: flex; flex-direction: column; gap: 2px; }
+.tenant-menu-label small { max-width: 230px; color: #8a969b; font-size: 11px; white-space: normal; }
 
 .tenant-editor .ant-drawer-header { border-bottom-color: #dfe7ea; }
 .tenant-editor .ant-drawer-body { background: var(--tenant-canvas, #eef3f5); }
@@ -750,8 +761,7 @@ Create `admin-ui/src/pages/Tenants.css`:
   background: #fff;
 }
 
-.tenant-form-section__heading { display: flex; align-items: flex-start; gap: 12px; margin-bottom: 18px; }
-.tenant-form-section__heading > span { display: grid; width: 28px; height: 28px; place-items: center; border-radius: 7px; color: #fff; background: #17323d; font: 700 11px/1 ui-monospace, SFMono-Regular, Consolas, monospace; }
+.tenant-form-section__heading { margin-bottom: 18px; padding-left: 12px; border-left: 3px solid #167d95; }
 .tenant-form-section__heading h2 { margin: 0; color: #17323d; font-size: 16px; line-height: 1.3; }
 .tenant-form-section__heading p { margin: 3px 0 0; color: #70828a; font-size: 12px; }
 .tenant-form-grid { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 0 14px; }
@@ -791,11 +801,10 @@ Create `admin-ui/src/pages/Tenants.css`:
 
 ```powershell
 cd D:\app\wbsysc\admin-ui
-npm run build
-antd lint src/pages/Tenants.jsx --format json
+pnpm run build
 ```
 
-Expected: build exits `0`; Ant Design lint reports no deprecated API or accessibility error introduced by the change. If the linter reports an actionable warning, correct the component usage and rerun both commands before committing.
+Expected: build exits `0` without JSX, import, or deprecated-API warnings. Verify the component source against the queried Ant Design 5.29.3 APIs and complete the keyboard/accessibility checks in Task 5 before committing.
 
 - [ ] **Step 3: Commit the visual system**
 
@@ -823,14 +832,13 @@ git commit -m "style: polish tenant operations console"
 ```powershell
 cd D:\app\wbsysc\admin-ui
 node --test src/pages/tenantsView.test.js
-npm run build
-antd lint src/pages/Tenants.jsx --format json
+pnpm run build
 cd D:\app\wbsysc
 git diff --check
 git status --short
 ```
 
-Expected: tests pass, build exits `0`, lint has no new actionable issue, `git diff --check` is empty, and status lists only the intended task files plus the already-known visual-companion scratch directory until cleanup.
+Expected: tests pass, build exits `0`, `git diff --check` is empty, and status lists only the intended task files. The visual-companion scratch directory remains in the primary checkout until final cleanup.
 
 - [ ] **Step 2: Review the page at desktop width**
 
@@ -865,7 +873,7 @@ Use a non-destructive existing tenant and verify:
 
 - [ ] **Step 5: Run required Gemini and Claude reviews in parallel**
 
-Ask both models to review `git diff` plus the design specification for correctness, regressions, security, accessibility, responsive behavior, and Ant Design 5.21 use. Classify the merged findings as Critical, Warning, or Info in `.ccg/tasks/admin-tenant-page-polish/review.md`.
+Ask both models to review `git diff` plus the design specification for correctness, regressions, security, accessibility, responsive behavior, and Ant Design 5.29.3 use. Classify the merged findings as Critical, Warning, or Info in `.ccg/tasks/admin-tenant-page-polish/review.md`.
 
 Expected: no unresolved Critical finding. Fix valid Critical and Warning findings, then rerun Steps 1–4 and repeat the dual-model review if code changed.
 
