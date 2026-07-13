@@ -1,0 +1,12 @@
+{
+  "id": "run-cloud-mysql-migration",
+  "title": "在云 MySQL 执行网关加固迁移",
+  "status": "completed",
+  "complexity": "S",
+  "risk": "high",
+  "domain": "database",
+  "currentPhase": "completed",
+  "nextAction": "归档执行记录",
+  "createdAt": "2026-07-13T00:00:00Z",
+  "branch": "main"
+}
