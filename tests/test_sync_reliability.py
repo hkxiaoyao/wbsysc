@@ -1,4 +1,8 @@
 from contextlib import contextmanager
+from types import SimpleNamespace
+
+import pytest
+from sqlalchemy.pool import NullPool
 
 from app import db
 from app.tenant import _TenantCtx
@@ -241,21 +245,36 @@ def test_approval_detail_exception_is_stored_as_partial(monkeypatch):
 
 
 class RecordingConnection:
-    def __init__(self, lock_result=1):
+    def __init__(self, lock_result=1, acquire_error=None, release_error=None):
         self.lock_result = lock_result
+        self.acquire_error = acquire_error
+        self.release_error = release_error
         self.statements = []
         self.params = []
+        self.invalidated = False
+        self.closed = False
 
     def __enter__(self):
         return self
 
     def __exit__(self, *args):
+        self.close()
         return False
+
+    def invalidate(self):
+        self.invalidated = True
+
+    def close(self):
+        self.closed = True
 
     def execute(self, statement, params=None):
         sql = str(statement)
         self.statements.append(sql)
         self.params.append(params or {})
+        if "GET_LOCK" in sql and self.acquire_error:
+            raise self.acquire_error
+        if "RELEASE_LOCK" in sql and self.release_error:
+            raise self.release_error
         value = self.lock_result if "GET_LOCK" in sql else 1
 
         class Result:
@@ -353,15 +372,104 @@ def test_checkin_write_failure_blocks_cursor(monkeypatch):
     assert cursors == []
 
 
-def test_tenant_sync_lock_uses_one_connection_for_acquire_and_release(monkeypatch):
+def test_lock_engine_uses_configured_url_and_nullpool(monkeypatch):
+    sentinel = object()
+    captured = {}
+
+    def create(url, **kwargs):
+        captured.update(url=url, kwargs=kwargs)
+        return sentinel
+
+    monkeypatch.setattr(db, "_lock_engine", None, raising=False)
+    monkeypatch.setattr(
+        db, "get_settings", lambda: SimpleNamespace(db_url="mysql+pymysql://lock-db")
+    )
+    monkeypatch.setattr(db, "create_engine", create)
+
+    assert db.get_lock_engine() is sentinel
+    assert captured["url"] == "mysql+pymysql://lock-db"
+    assert captured["kwargs"]["poolclass"] is NullPool
+
+
+def test_tenant_sync_lock_does_not_borrow_main_pool_connection(monkeypatch):
     connection = RecordingConnection()
-    monkeypatch.setattr(db, "get_engine", lambda: RecordingEngine(connection))
+    monkeypatch.setattr(
+        db,
+        "get_engine",
+        lambda: (_ for _ in ()).throw(AssertionError("main pool must not be used")),
+    )
+    monkeypatch.setattr(
+        db, "get_lock_engine", lambda: RecordingEngine(connection), raising=False
+    )
 
     with db.tenant_sync_lock("wbd_x") as acquired:
         assert acquired is True
 
     assert "GET_LOCK" in connection.statements[0]
     assert "RELEASE_LOCK" in connection.statements[1]
+    assert connection.invalidated is False
+    assert connection.closed is True
+
+
+def test_tenant_sync_lock_busy_path_closes_without_release(monkeypatch):
+    connection = RecordingConnection(lock_result=0)
+    monkeypatch.setattr(
+        db,
+        "get_engine",
+        lambda: (_ for _ in ()).throw(AssertionError("main pool must not be used")),
+    )
+    monkeypatch.setattr(
+        db, "get_lock_engine", lambda: RecordingEngine(connection), raising=False
+    )
+
+    with db.tenant_sync_lock("wbd_x") as acquired:
+        assert acquired is False
+
+    assert len(connection.statements) == 1
+    assert "GET_LOCK" in connection.statements[0]
+    assert connection.invalidated is False
+    assert connection.closed is True
+
+
+def test_tenant_sync_lock_acquire_error_closes_independent_connection(monkeypatch):
+    connection = RecordingConnection(acquire_error=RuntimeError("get lock failed"))
+    monkeypatch.setattr(
+        db,
+        "get_engine",
+        lambda: (_ for _ in ()).throw(AssertionError("main pool must not be used")),
+    )
+    monkeypatch.setattr(
+        db, "get_lock_engine", lambda: RecordingEngine(connection), raising=False
+    )
+
+    with pytest.raises(RuntimeError, match="get lock failed"):
+        with db.tenant_sync_lock("wbd_x"):
+            pass
+
+    assert len(connection.statements) == 1
+    assert connection.invalidated is False
+    assert connection.closed is True
+
+
+def test_tenant_sync_lock_release_error_invalidates_and_closes(monkeypatch):
+    connection = RecordingConnection(
+        release_error=RuntimeError("release connection lost")
+    )
+    monkeypatch.setattr(
+        db,
+        "get_engine",
+        lambda: (_ for _ in ()).throw(AssertionError("main pool must not be used")),
+    )
+    monkeypatch.setattr(
+        db, "get_lock_engine", lambda: RecordingEngine(connection), raising=False
+    )
+
+    with pytest.raises(RuntimeError, match="release connection lost"):
+        with db.tenant_sync_lock("wbd_x") as acquired:
+            assert acquired is True
+
+    assert connection.invalidated is True
+    assert connection.closed is True
 
 
 def test_busy_tenant_does_not_reset_or_sync(monkeypatch):

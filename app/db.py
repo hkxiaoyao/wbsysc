@@ -10,17 +10,19 @@
 """
 from __future__ import annotations
 
-from contextlib import contextmanager
 import hashlib
 import json
+from contextlib import contextmanager
 from typing import Any, Dict, Iterator, List, Optional
 
 from sqlalchemy import create_engine, text
 from sqlalchemy.engine import Engine
+from sqlalchemy.pool import NullPool
 
 from .config import get_settings
 
 _engine: Optional[Engine] = None
+_lock_engine: Optional[Engine] = None
 
 # 各租户 schema 的业务表名（所有 schema 结构相同）
 BIZ_TABLES = ["wecom_report", "wecom_approval", "wecom_checkin", "sync_cursor", "audit_log"]
@@ -40,6 +42,19 @@ def get_engine() -> Engine:
     return _engine
 
 
+def get_lock_engine() -> Engine:
+    """返回不复用 DBAPI 连接的独立 advisory-lock 引擎。"""
+    global _lock_engine
+    if _lock_engine is None:
+        s = get_settings()
+        _lock_engine = create_engine(
+            s.db_url,
+            poolclass=NullPool,
+            pool_pre_ping=True,
+        )
+    return _lock_engine
+
+
 def _q(schema: str, table: str) -> str:
     """生成带 schema 前缀的限定表名（防 SQL 注入：白名单校验）"""
     assert table in BIZ_TABLES, f"非法表名: {table}"
@@ -50,11 +65,11 @@ def _q(schema: str, table: str) -> str:
 
 @contextmanager
 def tenant_sync_lock(schema: str, timeout: int = 0) -> Iterator[bool]:
-    """持有同一 MySQL 连接的租户级同步互斥锁。"""
+    """用独立物理连接持有租户级同步互斥锁，不占主 QueuePool。"""
     assert schema.replace("_", "").isalnum(), f"非法schema: {schema}"
     digest = hashlib.sha256(schema.encode("utf-8")).hexdigest()[:40]
     lock_name = f"wbsysc:tenant-sync:{digest}"
-    with get_engine().connect() as conn:
+    with get_lock_engine().connect() as conn:
         acquired = conn.execute(
             text("SELECT GET_LOCK(:name, :timeout)"),
             {"name": lock_name, "timeout": max(0, int(timeout))},
@@ -63,10 +78,21 @@ def tenant_sync_lock(schema: str, timeout: int = 0) -> Iterator[bool]:
             yield acquired
         finally:
             if acquired:
-                released = conn.execute(
-                    text("SELECT RELEASE_LOCK(:name)"), {"name": lock_name}
-                ).scalar()
+                try:
+                    released = conn.execute(
+                        text("SELECT RELEASE_LOCK(:name)"), {"name": lock_name}
+                    ).scalar()
+                except Exception:
+                    try:
+                        conn.invalidate()
+                    finally:
+                        conn.close()
+                    raise
                 if released != 1:
+                    try:
+                        conn.invalidate()
+                    finally:
+                        conn.close()
                     raise RuntimeError(f"failed to release tenant sync lock: {schema}")
 
 
