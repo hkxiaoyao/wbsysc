@@ -10,15 +10,23 @@ import asyncio
 import os
 import sys
 
+import pytest
+
 from mcp.client.session import ClientSession
 from mcp.client.streamable_http import streamablehttp_client
 
 SERVER = os.getenv("MCP_SMOKE_SERVER", "http://localhost:8000/mcp")
 TOKEN = os.getenv("MCP_SMOKE_TOKEN", "test-token")
 BAD_TOKEN = os.getenv("MCP_SMOKE_BAD_TOKEN", "wrong-token")
+RUN_SMOKE = os.getenv("MCP_SMOKE_RUN", "").strip().lower() in {"1", "true", "yes", "on"}
+
+pytestmark = pytest.mark.skipif(
+    not RUN_SMOKE,
+    reason="set MCP_SMOKE_RUN=1 to run tests against a live MCP server",
+)
 
 
-async def test_auth_rejected():
+async def _auth_rejected():
     """无 token / 错 token 应被拒"""
     try:
         async with streamablehttp_client(
@@ -34,7 +42,7 @@ async def test_auth_rejected():
         return True
 
 
-async def test_list_tools_and_call():
+async def _list_tools_and_call():
     """正确 token：列工具 + 调用 wecom_list_reports + get_detail"""
     async with streamablehttp_client(
         SERVER, headers={"Authorization": f"Bearer {TOKEN}"}
@@ -76,14 +84,22 @@ async def test_list_tools_and_call():
     return True
 
 
+def test_auth_rejected():
+    assert asyncio.run(_auth_rejected())
+
+
+def test_list_tools_and_call():
+    assert asyncio.run(_list_tools_and_call())
+
+
 async def main():
     # 手工执行时强制禁代理（否则 localhost 走系统代理会 502）。
     for key in ("HTTP_PROXY", "HTTPS_PROXY", "http_proxy", "https_proxy"):
         os.environ.pop(key, None)
     os.environ["NO_PROXY"] = "localhost,127.0.0.1"
 
-    ok1 = await test_auth_rejected()
-    ok2 = await test_list_tools_and_call()
+    ok1 = await _auth_rejected()
+    ok2 = await _list_tools_and_call()
     print("\n=== 结果 ===")
     print(f"鉴权拒绝: {'PASS' if ok1 else 'FAIL'}")
     print(f"工具调用: {'PASS' if ok2 else 'FAIL'}")
