@@ -20,6 +20,7 @@ def sync_reports_window(
     corpid: str, secret: str,
     starttime: int, endtime: int,
     limit: int = 100, template_id: str | None = None,
+    max_records: int | None = None,
 ) -> List[str]:
     """拉取 [starttime, endtime] 区间内所有汇报单号（自动分段+分页）"""
     filters = [{"key": "template_id", "value": template_id}] if template_id else None
@@ -51,6 +52,8 @@ def sync_reports_window(
                 if u not in seen:
                     seen.add(u)
                     result.append(u)
+                    if max_records is not None and len(result) >= max_records:
+                        return result
             # 官方：endflag=1 表示已无数据；空列表且无 next_cursor 也结束
             # 不要仅因 uuids 为空就 break（兼容异常分页）
             next_cursor = resp.get("next_cursor", 0)

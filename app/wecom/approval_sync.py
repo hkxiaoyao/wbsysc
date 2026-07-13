@@ -19,6 +19,7 @@ def sync_approvals_window(
     corpid: str, secret: str,
     starttime: int, endtime: int,
     size: int = 100, template_id: str | None = None, creator: str | None = None,
+    max_records: int | None = None,
 ) -> List[str]:
     filters = []
     if template_id:
@@ -53,6 +54,8 @@ def sync_approvals_window(
                 if sp not in seen:
                     seen.add(sp)
                     result.append(sp)
+                    if max_records is not None and len(result) >= max_records:
+                        return result
             next_cursor = resp.get("new_next_cursor", "")
             if not sp_list or not next_cursor:
                 break
