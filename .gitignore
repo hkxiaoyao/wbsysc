@@ -44,3 +44,6 @@ app/static/dist/
 build/
 dist/
 .ace-tool/
+
+# Isolated implementation worktrees
+.worktrees/
