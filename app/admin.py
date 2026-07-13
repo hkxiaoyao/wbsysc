@@ -140,17 +140,52 @@ def _tenant_item(r) -> dict:
 def list_tenants(request: Request):
     """列出所有租户（secret 字段不回传明文，仅返回是否已配置）"""
     _require_auth(request)
-    ensure_domain_tables()
-    sql = text("""SELECT tenant_id, display_name, corpid, mcp_token, schema_name,
+    try:
+        ensure_domain_tables()
+    except Exception as e:
+        # 补表/补列失败不阻断列表（旧库兼容）；域名相关字段降级为空
+        import logging
+        logging.getLogger("wecom-gateway").warning("ensure_domain_tables failed: %s", e)
+
+    # 优先带 trusted_domain；列尚未加上时回退旧 SQL，避免 500
+    sql_full = text("""SELECT tenant_id, display_name, corpid, mcp_token, schema_name,
                          sync_interval_min, enabled_modules, checkin_userids,
                          IFNULL(contact_secret_encrypted IS NOT NULL, 0) AS has_contact_secret,
                          IFNULL(secret_encrypted IS NOT NULL, 0) AS has_secret,
                          enabled, created_at, updated_at,
                          IFNULL(trusted_domain, '') AS trusted_domain
                   FROM tenant_config ORDER BY created_at""")
+    sql_legacy = text("""SELECT tenant_id, display_name, corpid, mcp_token, schema_name,
+                         sync_interval_min, enabled_modules, checkin_userids,
+                         IFNULL(contact_secret_encrypted IS NOT NULL, 0) AS has_contact_secret,
+                         IFNULL(secret_encrypted IS NOT NULL, 0) AS has_secret,
+                         enabled, created_at, updated_at
+                  FROM tenant_config ORDER BY created_at""")
     with get_engine().connect() as conn:
-        rows = conn.execute(sql).fetchall()
-    return {"items": [_tenant_item(r) for r in rows]}
+        try:
+            rows = conn.execute(sql_full).fetchall()
+        except Exception:
+            rows = conn.execute(sql_legacy).fetchall()
+    items = []
+    for r in rows:
+        try:
+            items.append(_tenant_item(r))
+        except Exception:
+            # 校验文件表异常时仍返回基础租户信息
+            items.append({
+                "tenant_id": r[0], "display_name": r[1], "corpid": r[2],
+                "mcp_token": r[3], "schema_name": r[4],
+                "sync_interval_min": r[5], "enabled_modules": r[6],
+                "checkin_userids": r[7],
+                "has_contact_secret": bool(r[8]),
+                "has_secret": bool(r[9]),
+                "enabled": bool(r[10]),
+                "created_at": str(r[11]), "updated_at": str(r[12]),
+                "trusted_domain": (r[13] if len(r) > 13 else "") or "",
+                "verify_filename": "",
+                "verify_url": "",
+            })
+    return {"items": items}
 
 
 @router.post("/tenants")

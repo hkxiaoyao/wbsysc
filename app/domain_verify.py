@@ -29,21 +29,38 @@ CREATE TABLE IF NOT EXISTS `domain_verify_file` (
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COMMENT='可信域名校验文件(中心库)'
 """
 
-_TENANT_DOMAIN_COL = (
-    "ADD COLUMN IF NOT EXISTS trusted_domain VARCHAR(255) NOT NULL DEFAULT '' "
-    "COMMENT '租户可信域名(反代后对外域名)'"
-)
+def _column_exists(conn, table: str, column: str) -> bool:
+    """兼容 MySQL 5.7/8.0：不用 ADD COLUMN IF NOT EXISTS（5.7 不支持会整句失败）"""
+    r = conn.execute(
+        text(
+            """
+            SELECT 1 FROM information_schema.COLUMNS
+            WHERE TABLE_SCHEMA = DATABASE()
+              AND TABLE_NAME = :t
+              AND COLUMN_NAME = :c
+            LIMIT 1
+            """
+        ),
+        {"t": table, "c": column},
+    ).fetchone()
+    return bool(r)
 
 
 def ensure_domain_tables() -> None:
-    """建表 + 兼容旧库补列（幂等）"""
+    """建表 + 兼容旧库补列（幂等，兼容 MySQL 5.7）"""
     eng = get_engine()
     with eng.begin() as conn:
         conn.execute(text(_DDL))
-        try:
-            conn.execute(text(f"ALTER TABLE tenant_config {_TENANT_DOMAIN_COL}"))
-        except Exception:
-            pass
+        if not _column_exists(conn, "tenant_config", "trusted_domain"):
+            try:
+                conn.execute(text(
+                    "ALTER TABLE tenant_config "
+                    "ADD COLUMN trusted_domain VARCHAR(255) NOT NULL DEFAULT '' "
+                    "COMMENT '租户可信域名(反代后对外域名)'"
+                ))
+            except Exception:
+                # 并发下可能已被其他进程加上；后续 SELECT 再兜底
+                pass
 
 
 def is_safe_verify_filename(name: str) -> bool:

@@ -58,14 +58,27 @@ def init_tenant(tenant_id: str, corpid: str, secret: str, mcp_token: str,
     eng = get_engine()
     with eng.begin() as conn:
         conn.execute(text(_TENANT_CONFIG_DDL))
-        for col_ddl in [
-            "ADD COLUMN IF NOT EXISTS enabled_modules VARCHAR(64) NOT NULL DEFAULT 'report,approval,checkin'",
-            "ADD COLUMN IF NOT EXISTS checkin_userids TEXT NULL",
-            "ADD COLUMN IF NOT EXISTS contact_secret_encrypted VARBINARY(512) NULL",
-            "ADD COLUMN IF NOT EXISTS trusted_domain VARCHAR(255) NOT NULL DEFAULT ''",
-        ]:
+        # MySQL 5.7 不支持 ADD COLUMN IF NOT EXISTS；先查 information_schema 再补列
+        wanted_cols = {
+            "enabled_modules":
+                "ADD COLUMN enabled_modules VARCHAR(64) NOT NULL DEFAULT 'report,approval,checkin'",
+            "checkin_userids":
+                "ADD COLUMN checkin_userids TEXT NULL",
+            "contact_secret_encrypted":
+                "ADD COLUMN contact_secret_encrypted VARBINARY(512) NULL",
+            "trusted_domain":
+                "ADD COLUMN trusted_domain VARCHAR(255) NOT NULL DEFAULT ''",
+        }
+        for col, ddl in wanted_cols.items():
+            exists = conn.execute(text(
+                """SELECT 1 FROM information_schema.COLUMNS
+                   WHERE TABLE_SCHEMA=DATABASE() AND TABLE_NAME='tenant_config'
+                     AND COLUMN_NAME=:c LIMIT 1"""
+            ), {"c": col}).fetchone()
+            if exists:
+                continue
             try:
-                conn.execute(text(f"ALTER TABLE tenant_config {col_ddl}"))
+                conn.execute(text(f"ALTER TABLE tenant_config {ddl}"))
             except Exception:
                 pass
 
