@@ -3,7 +3,8 @@
 + APScheduler 定时同步任务（游标驱动增量）
 
 关键点（经官方文档核实）：
-1. streamable_http_app() 自带一个 /mcp 路由 → 挂到顶层根路径
+1. FastMCP(streamable_http_path="/") + app.mount("/mcp") → 对外路径是 /mcp
+   （若内部仍用默认 /mcp 再 mount /mcp，会变成 /mcp/mcp，客户端 POST /mcp 会 405）
 2. 挂载子应用时其内置 lifespan 不执行 → 顶层必须显式 mcp.session_manager.run()
 3. session_manager 只在调用 streamable_http_app() 后才可访问（惰性创建）
 4. 同步任务用单独线程池执行，不阻塞 asyncio 事件循环
@@ -39,6 +40,14 @@ _scheduler: AsyncIOScheduler | None = None
 def create_app() -> FastAPI:
     settings = get_settings()
     app = FastAPI(title="企微数据中转 MCP Gateway", version="0.1.0")
+
+    # WorkBuddy 等客户端 POST /mcp（无尾斜杠）。Starlette Mount("/mcp") 时
+    # 子应用拿到 path=""，匹配不到 FastMCP 的 "/"，会 405。进入路由前补上斜杠。
+    @app.middleware("http")
+    async def _mcp_trailing_slash(request, call_next):
+        if request.scope.get("path") == "/mcp":
+            request.scope["path"] = "/mcp/"
+        return await call_next(request)
 
     # 管理后台 API（独立路由，不经 MCP 鉴权，自带 session 校验）
     app.include_router(admin_router)
@@ -88,14 +97,14 @@ def create_app() -> FastAPI:
     if os.path.isdir(dist_dir):
         app.mount("/admin/ui", StaticFiles(directory=dist_dir, html=True), name="admin-ui")
 
-    # MCP Streamable HTTP 子 app（内部自带 /mcp 路由；签名仅 (self) 不接 middleware）
+    # MCP Streamable HTTP 子 app（内部路径已设为 "/"，见 mcp_server.py）
     mcp_app = mcp.streamable_http_app()
 
     from starlette.applications import Starlette
     from starlette.routing import Mount
 
     mcp_glyph = Starlette(
-        routes=[Mount("/", app=mcp_app)],   # mcp_app 内部路由是 /mcp
+        routes=[Mount("/", app=mcp_app)],
         middleware=[
             Middleware(BearerTokenMiddleware),
             Middleware(
@@ -107,8 +116,8 @@ def create_app() -> FastAPI:
             ),
         ],
     )
-    # 关键：mcp_glyph 只挂到 /mcp，不挂根 /。
-    # 之前挂根 / 会捕获所有未匹配路径（含 /admin/ui 子资源），导致静态资源被 BearerTokenMiddleware 拦截报 401。
+    # 关键：只挂 /mcp，不挂根 /（避免吞掉 /admin/ui 导致 401）。
+    # 最终对外 endpoint = /mcp（兼容 WorkBuddy streamableHttp + 后台复制的配置）
     app.mount("/mcp", mcp_glyph)
 
     logger.info("MCP Gateway 挂载于 /mcp (Streamable HTTP)，含 Bearer Token 鉴权")

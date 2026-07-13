@@ -19,7 +19,9 @@ from .wecom.mock import (
     MOCK_SMARTTABLE_RECORDS,
 )
 
-mcp = FastMCP("wecom-mcp-gateway")
+# streamable_http_path="/"：外层 main.py 会 mount 到 /mcp，
+# 若这里仍用默认 "/mcp"，最终变成 /mcp/mcp，WorkBuddy POST /mcp 会 405。
+mcp = FastMCP("wecom-mcp-gateway", streamable_http_path="/")
 
 
 def _use_mock() -> bool:
