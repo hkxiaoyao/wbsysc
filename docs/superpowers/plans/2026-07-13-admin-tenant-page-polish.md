@@ -826,7 +826,7 @@ git commit -m "style: polish tenant operations console"
 - Consumes: The complete tenant workbench and approved design specification.
 - Produces: Evidence-backed final review, corrected implementation, archived CCG task, and a clean worktree except for user-owned changes.
 
-- [ ] **Step 1: Run all deterministic checks from a clean command sequence**
+- [x] **Step 1: Run all deterministic checks from a clean command sequence**
 
 ```powershell
 cd D:\app\wbsysc\.worktrees\admin-tenant-page-polish\admin-ui
@@ -840,7 +840,7 @@ git status --short
 
 Expected: tests pass, build exits `0`, `git diff --check` is empty, and status lists only the intended task files. The visual-companion scratch directory remains in the primary checkout until final cleanup.
 
-- [ ] **Step 2: Review the page at desktop width**
+- [x] **Step 2: Review the page at desktop width**
 
 Run the Vite development server, open the authenticated tenant page at `1440 × 900`, and save a screenshot. Verify:
 
@@ -850,7 +850,7 @@ Run the Vite development server, open the authenticated tenant page at `1440 × 
 - Search and both filters fit on one line.
 - IDs truncate safely and reveal/copy the complete value.
 
-- [ ] **Step 3: Review the page at narrow width**
+- [x] **Step 3: Review the page at narrow width**
 
 Resize the same page to `390 × 844` and save a screenshot. Verify:
 
@@ -859,7 +859,7 @@ Resize the same page to `390 × 844` and save a screenshot. Verify:
 - Secondary columns hide while the table retains horizontal scrolling.
 - The editor drawer is `calc(100vw - 12px)` wide and its fixed footer does not cover the final field.
 
-- [ ] **Step 4: Run the main interaction smoke test**
+- [x] **Step 4: Run the main interaction smoke test**
 
 Use a non-destructive existing tenant and verify:
 
@@ -871,13 +871,13 @@ Use a non-destructive existing tenant and verify:
 6. A direct tenant shows sync, full rollback, and diagnosis disabled with the explanatory Tooltip.
 7. Do not confirm delete, upload a domain file, save edited credentials, or trigger full synchronization during smoke testing.
 
-- [ ] **Step 5: Run required Gemini and Claude reviews in parallel**
+- [x] **Step 5: Run required Gemini and Claude reviews in parallel**
 
 Ask both models to review `git diff` plus the design specification for correctness, regressions, security, accessibility, responsive behavior, and Ant Design 5.29.3 use. Classify the merged findings as Critical, Warning, or Info in `.ccg/tasks/admin-tenant-page-polish/review.md`.
 
 Expected: no unresolved Critical finding. Fix valid Critical and Warning findings, then rerun Steps 1–4 and repeat the dual-model review if code changed.
 
-- [ ] **Step 6: Commit review fixes and task evidence**
+- [x] **Step 6: Commit review fixes and task evidence**
 
 ```powershell
 git add admin-ui/src/pages/Tenants.jsx admin-ui/src/pages/Tenants.css admin-ui/src/pages/tenantsView.js admin-ui/src/pages/tenantsView.test.js .ccg/tasks/admin-tenant-page-polish
@@ -886,7 +886,7 @@ git commit -m "fix: address tenant page review findings"
 
 Skip this commit only when there are no code fixes and the review evidence is already included in the final archive commit.
 
-- [ ] **Step 7: Archive the completed CCG task and clean temporary visual files**
+- [x] **Step 7: Archive the completed CCG task and clean temporary visual files**
 
 Set `task.json` to `status: "completed"`, `currentPhase: "completed"`, and `nextAction: "已完成并归档"`. Move the task directory to `.ccg/tasks/archive/2026-07/admin-tenant-page-polish`, stop the visual-companion server, and remove only `D:\app\wbsysc\.superpowers\brainstorm\1006-1783952989` after verifying that exact resolved path is inside the repository scratch directory.
 
