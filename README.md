@@ -45,13 +45,21 @@
 - **鉴权**：MCP 用 Bearer Token（每租户独立，token→租户强绑定，不信任客户端 tenant_id）；管理后台用单密码 session
 - **同步策略**：一期定时轮询（增量游标），预留 Webhook 位，不引 MQ
 
+### 数据读取模式
+
+每个租户可选择 `stored` 或 `direct`。`stored` 定时把业务数据同步到租户 MySQL schema，MCP 查询本地表。`direct` 在每次 MCP 调用时请求企微 API，不写入审批、汇报或打卡业务表，也不参加后台同步。
+
+两种模式都在 MySQL 保存租户配置、加密凭证、MCP Token 和审计日志。直连请求失败时会返回企微错误，不读取历史缓存。现有租户升级后保持 `stored`。
+
+直连模式查询大时间窗口时，会从最新时间分段开始遍历企微列表分页，并为返回的单号逐条请求详情，API 调用成本较高。生产调用建议缩小时间窗口并设置较小的 `limit`。
+
 ## 🚀 快速开始
 
 ### 方式一：Docker（生产推荐，用 CI 构建的镜像）
 
 ```bash
 git clone https://github.com/hkxiaoyao/wbsysc.git && cd wbsysc
-cp .env.prod.example .env && vim .env    # 填 DB_PASSWORD + ADMIN_PASSWORD
+cp .env.prod.example .env && vim .env    # 确认 WECOM_USE_MOCK=false，填写 DB_PASSWORD + ADMIN_PASSWORD + CREDENTIAL_KEY
 
 docker pull ghcr.io/hkxiaoyao/wbsysc:latest
 docker compose up -d
@@ -63,6 +71,32 @@ docker compose exec wbsysc python -m app.tenant_init \
   --token $(openssl rand -hex 24) --contact-secret XXXX \
   --modules report,approval,checkin --display "测试客户1"
 ```
+
+### 生产升级（先迁移再切换）
+
+推荐执行 `bash deploy/server_deploy.sh`：脚本会先校验生产配置，再用宿主 `mysql` CLI 执行 `sql/004_gateway_hardening.sql`；只有迁移成功后才拉取镜像并启动新应用。迁移默认连接 `127.0.0.1`，远程 MySQL 可用 `DB_MIGRATION_HOST` 环境变量或 `.env` 同名项覆盖。
+
+```bash
+git pull
+bash deploy/server_deploy.sh
+```
+
+需要手动升级时，顺序必须是“备份数据库 → 执行 `004` → 拉取新镜像 → 启动”。以下非敏感连接参数需与 `.env` 一致，密码通过 `MYSQL_PWD` 环境变量传递，不放在命令行参数中：
+
+```bash
+DB_MIGRATION_HOST=127.0.0.1
+DB_PORT=3306
+DB_USER=wbsysc_app
+DB_NAME=websysc
+read -rsp "DB_PASSWORD: " MYSQL_PWD && export MYSQL_PWD && echo
+mysql --protocol=TCP --host="$DB_MIGRATION_HOST" --port="$DB_PORT" \
+  --user="$DB_USER" "$DB_NAME" < sql/004_gateway_hardening.sql
+unset MYSQL_PWD
+docker pull ghcr.io/hkxiaoyao/wbsysc:latest
+docker compose up -d
+```
+
+> `004_gateway_hardening.sql` 包含 `DELIMITER` 和存储过程语句，必须使用 MySQL `mysql` CLI 执行。迁移失败时不要启动新版本。
 
 ### 方式二：本地开发
 
@@ -83,11 +117,13 @@ python tests/test_smoke_client.py
 | `DB_HOST` | 同台部署填 `host.docker.internal`；跨机填 MySQL IP | ✓ |
 | `DB_PASSWORD` | MySQL `websysc` 账户密码 | ✓ |
 | `ADMIN_PASSWORD` | 管理后台登录密码 | ✓ |
-| `CREDENTIAL_KEY` | 凭证加密主密钥（留空自动生成；生产必配强随机） | 推荐 |
-| `WECOM_USE_MOCK` | `true`=脱敏 mock；`false`=真实企微（需配租户凭证） | - |
+| `CREDENTIAL_KEY` | 凭证加密主密钥（开发可留空；生产必配强随机） | 生产必填 |
+| `WECOM_USE_MOCK` | `true`=脱敏 mock；生产必须为 `false` 并配置租户凭证 | 生产必填 |
 | `SYNC_INTERVAL_*_MIN` | 同步间隔（report/approval/smarttable） | - |
 
 > 租户企微凭证（corpid/secret）**不进 .env**，通过管理后台或 `tenant_init` 写入 `tenant_config`（AES 加密）。
+>
+> 生产启动必须同时设置 `WECOM_USE_MOCK=false`、`CREDENTIAL_KEY`、`ADMIN_PASSWORD` 和 `DB_PASSWORD`；缺失或使用示例值时应用会拒绝启动。
 
 ## 🔧 MCP 工具（6 个）
 
