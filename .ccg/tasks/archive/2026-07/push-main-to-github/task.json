@@ -1,0 +1,12 @@
+{
+  "id": "push-main-to-github",
+  "title": "推送本地 main 到 GitHub",
+  "status": "completed",
+  "complexity": "S",
+  "risk": "low",
+  "domain": "devops",
+  "currentPhase": "completed",
+  "nextAction": "已完成，待归档",
+  "createdAt": "2026-07-14T00:00:00+08:00",
+  "branch": "main"
+}
