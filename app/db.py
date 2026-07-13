@@ -61,7 +61,14 @@ def ensure_schema(schema_name: str) -> None:
 
 
 # ----- 汇报落库 -----
-def upsert_report(schema: str, journaluuid: str, info: Dict[str, Any]) -> None:
+def upsert_report(
+    schema: str,
+    journaluuid: str,
+    info: Dict[str, Any],
+    source_window: tuple[int, int] | None = None,
+) -> None:
+    window_start, window_end = source_window or (0, 0)
+    partial = 1 if info.get("_partial") else 0
     submitter = info.get("submitter") or {}
     if isinstance(submitter, str):
         submitter_uid = submitter
@@ -72,11 +79,14 @@ def upsert_report(schema: str, journaluuid: str, info: Dict[str, Any]) -> None:
     sql = text(f"""
         INSERT INTO {_q(schema,'wecom_report')}
             (tenant_id, journaluuid, template_id, template_name,
-             report_time, submitter_userid, detail_json)
-        VALUES (:t,:j,:tid,:tname,:rt,:su,:dj)
+             report_time, submitter_userid, detail_json,
+             source_window_start, source_window_end, is_partial)
+        VALUES (:t,:j,:tid,:tname,:rt,:su,:dj,:ws,:we,:partial)
         ON DUPLICATE KEY UPDATE
             template_name=VALUES(template_name), report_time=VALUES(report_time),
             submitter_userid=VALUES(submitter_userid), detail_json=VALUES(detail_json),
+            source_window_start=VALUES(source_window_start),
+            source_window_end=VALUES(source_window_end), is_partial=VALUES(is_partial),
             synced_at=NOW()
     """)
     with get_engine().begin() as conn:
@@ -87,14 +97,21 @@ def upsert_report(schema: str, journaluuid: str, info: Dict[str, Any]) -> None:
             "rt": int(info.get("report_time", 0) or 0),
             "su": submitter_uid,
             "dj": json.dumps(info, ensure_ascii=False, default=str),
+            "ws": window_start,
+            "we": window_end,
+            "partial": partial,
         })
 
 
 def query_reports_by_window(schema: str, starttime: int, endtime: int, limit: int = 100) -> List[Dict]:
     sql = text(f"""SELECT journaluuid, template_id, template_name, report_time,
-                          submitter_userid, detail_json
+                          submitter_userid, detail_json, is_partial
                    FROM {_q(schema,'wecom_report')}
-                   WHERE report_time>=:s AND report_time<:e
+                   WHERE (
+                     is_partial=0 AND report_time>=:s AND report_time<:e
+                   ) OR (
+                     is_partial=1 AND source_window_start<:e AND source_window_end>:s
+                   )
                    ORDER BY report_time DESC LIMIT :n""")
     with get_engine().connect() as conn:
         rows = conn.execute(sql, {"s": starttime, "e": endtime, "n": limit})
@@ -109,16 +126,27 @@ def get_report_detail(schema: str, journaluuid: str) -> Optional[Dict]:
 
 
 # ----- 审批落库 -----
-def upsert_approval(schema: str, sp_no: str, info: Dict[str, Any]) -> None:
+def upsert_approval(
+    schema: str,
+    sp_no: str,
+    info: Dict[str, Any],
+    source_window: tuple[int, int] | None = None,
+) -> None:
+    window_start, window_end = source_window or (0, 0)
+    partial = 1 if info.get("_partial") else 0
     sql = text(f"""
         INSERT INTO {_q(schema,'wecom_approval')}
             (tenant_id, sp_no, sp_name, sp_status, template_id,
-             apply_time, applyer_userid, detail_json)
-        VALUES (:t,:sp,:sn,:ss,:tid,:at,:au,:dj)
+             apply_time, applyer_userid, detail_json,
+             source_window_start, source_window_end, is_partial)
+        VALUES (:t,:sp,:sn,:ss,:tid,:at,:au,:dj,:ws,:we,:partial)
         ON DUPLICATE KEY UPDATE
             sp_name=VALUES(sp_name), sp_status=VALUES(sp_status),
             apply_time=VALUES(apply_time), applyer_userid=VALUES(applyer_userid),
-            detail_json=VALUES(detail_json), synced_at=NOW()
+            detail_json=VALUES(detail_json),
+            source_window_start=VALUES(source_window_start),
+            source_window_end=VALUES(source_window_end), is_partial=VALUES(is_partial),
+            synced_at=NOW()
     """)
     with get_engine().begin() as conn:
         conn.execute(sql, {
@@ -127,14 +155,21 @@ def upsert_approval(schema: str, sp_no: str, info: Dict[str, Any]) -> None:
             "at": int(info.get("apply_time", 0) or 0),
             "au": (info.get("applyer") or {}).get("userid", ""),
             "dj": json.dumps(info, ensure_ascii=False, default=str),
+            "ws": window_start,
+            "we": window_end,
+            "partial": partial,
         })
 
 
 def query_approvals_by_window(schema: str, starttime: int, endtime: int, limit: int = 100) -> List[Dict]:
     sql = text(f"""SELECT sp_no, sp_name, sp_status, template_id,
-                          apply_time, applyer_userid, detail_json
+                          apply_time, applyer_userid, detail_json, is_partial
                    FROM {_q(schema,'wecom_approval')}
-                   WHERE apply_time>=:s AND apply_time<:e
+                   WHERE (
+                     is_partial=0 AND apply_time>=:s AND apply_time<:e
+                   ) OR (
+                     is_partial=1 AND source_window_start<:e AND source_window_end>:s
+                   )
                    ORDER BY apply_time DESC LIMIT :n""")
     with get_engine().connect() as conn:
         rows = conn.execute(sql, {"s": starttime, "e": endtime, "n": limit})
@@ -221,6 +256,9 @@ _BIZ_DDLS = [
   journaluuid VARCHAR(128) NOT NULL, template_id VARCHAR(128) NOT NULL DEFAULT '',
   template_name VARCHAR(128) NOT NULL DEFAULT '', report_time BIGINT NOT NULL DEFAULT 0,
   submitter_userid VARCHAR(64) NOT NULL DEFAULT '', detail_json JSON DEFAULT NULL,
+  source_window_start BIGINT NOT NULL DEFAULT 0,
+  source_window_end BIGINT NOT NULL DEFAULT 0,
+  is_partial TINYINT NOT NULL DEFAULT 0,
   synced_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
   PRIMARY KEY(id), UNIQUE KEY uk_tj(tenant_id,journaluuid),
   KEY idx_tt(tenant_id,report_time), KEY idx_tpl(tenant_id,template_id)
@@ -230,7 +268,11 @@ _BIZ_DDLS = [
   sp_no VARCHAR(64) NOT NULL, sp_name VARCHAR(128) NOT NULL DEFAULT '',
   sp_status INT NOT NULL DEFAULT 0, template_id VARCHAR(128) NOT NULL DEFAULT '',
   apply_time BIGINT NOT NULL DEFAULT 0, applyer_userid VARCHAR(64) NOT NULL DEFAULT '',
-  detail_json JSON DEFAULT NULL, synced_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
+  detail_json JSON DEFAULT NULL,
+  source_window_start BIGINT NOT NULL DEFAULT 0,
+  source_window_end BIGINT NOT NULL DEFAULT 0,
+  is_partial TINYINT NOT NULL DEFAULT 0,
+  synced_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
   PRIMARY KEY(id), UNIQUE KEY uk_ts(tenant_id,sp_no),
   KEY idx_tt(tenant_id,apply_time), KEY idx_ts(tenant_id,sp_status)
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4""",
