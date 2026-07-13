@@ -1,16 +1,34 @@
 import { useEffect, useState } from 'react'
 import { Table, Button, Modal, Form, Input, InputNumber, Select, Switch, Space, Tag, message, Typography } from 'antd'
-import { PlusOutlined, ReloadOutlined, ThunderboltOutlined, EditOutlined, DeleteOutlined } from '@ant-design/icons'
+import { PlusOutlined, ReloadOutlined, ThunderboltOutlined, EditOutlined, DeleteOutlined, CopyOutlined } from '@ant-design/icons'
 import api from '../api.js'
 
-const { Text } = Typography
+const { Text, Paragraph } = Typography
 const MODULES = ['report', 'approval', 'checkin']
+
+function buildMcpConfig(row) {
+  // 用当前站点 origin 拼 MCP 地址，适配直连/反代
+  const origin = window.location.origin
+  const serverKey = row.tenant_id || 'wecom-gateway'
+  return {
+    mcpServers: {
+      [serverKey]: {
+        type: 'http',
+        url: `${origin}/mcp`,
+        headers: {
+          Authorization: `Bearer ${row.mcp_token}`,
+        },
+      },
+    },
+  }
+}
 
 export default function Tenants() {
   const [data, setData] = useState([])
   const [loading, setLoading] = useState(false)
   const [modalOpen, setModalOpen] = useState(false)
   const [editing, setEditing] = useState(null)
+  const [mcpModal, setMcpModal] = useState({ open: false, title: '', text: '' })
   const [form] = Form.useForm()
 
   const load = async () => {
@@ -88,6 +106,39 @@ export default function Tenants() {
     }
   }
 
+  const openMcpConfig = (row) => {
+    if (!row.mcp_token) {
+      message.warning('该租户未配置 MCP Token')
+      return
+    }
+    const text = JSON.stringify(buildMcpConfig(row), null, 2)
+    setMcpModal({
+      open: true,
+      title: `MCP 配置 · ${row.display_name || row.tenant_id}`,
+      text,
+    })
+  }
+
+  const copyText = async (text) => {
+    try {
+      if (navigator.clipboard?.writeText) {
+        await navigator.clipboard.writeText(text)
+      } else {
+        const ta = document.createElement('textarea')
+        ta.value = text
+        ta.style.position = 'fixed'
+        ta.style.left = '-9999px'
+        document.body.appendChild(ta)
+        ta.select()
+        document.execCommand('copy')
+        document.body.removeChild(ta)
+      }
+      message.success('已复制到剪贴板')
+    } catch (e) {
+      message.error('复制失败，请手动选择文本复制')
+    }
+  }
+
   const columns = [
     { title: '租户ID', dataIndex: 'tenant_id', key: 'tenant_id' },
     { title: '名称', dataIndex: 'display_name', key: 'display_name' },
@@ -111,9 +162,10 @@ export default function Tenants() {
       render: (v) => <Tag color={v ? 'green' : 'default'}>{v ? '启用' : '禁用'}</Tag>
     },
     {
-      title: '操作', key: 'op', width: 220,
+      title: '操作', key: 'op', width: 300,
       render: (_, r) => (
-        <Space size={4}>
+        <Space size={4} wrap>
+          <Button size="small" icon={<CopyOutlined />} onClick={() => openMcpConfig(r)}>MCP配置</Button>
           <Button size="small" icon={<ThunderboltOutlined />} onClick={() => syncNow(r)}>同步</Button>
           <Button size="small" icon={<EditOutlined />} onClick={() => openEdit(r)}>编辑</Button>
           <Button size="small" danger icon={<DeleteOutlined />} onClick={() => remove(r)} />
@@ -127,10 +179,10 @@ export default function Tenants() {
       <Space style={{ marginBottom: 16 }}>
         <Button type="primary" icon={<PlusOutlined />} onClick={openCreate}>新增租户</Button>
         <Button icon={<ReloadOutlined />} onClick={load} loading={loading}>刷新</Button>
-        <Text type="secondary">MCP连接Token在编辑里查看/修改</Text>
+        <Text type="secondary">点「MCP配置」可一键复制 WorkBuddy 连接 JSON</Text>
       </Space>
       <Table rowKey="tenant_id" columns={columns} dataSource={data} loading={loading} size="middle"
-        pagination={false} scroll={{ x: 1000 }} />
+        pagination={false} scroll={{ x: 1100 }} />
 
       <Modal title={editing ? '编辑租户' : '新增租户'} open={modalOpen} onOk={submit}
         onCancel={() => setModalOpen(false)} width={620} okText="保存" cancelText="取消">
@@ -143,7 +195,7 @@ export default function Tenants() {
             <Input placeholder="wwXXXXXXXX" />
           </Form.Item>
           <Form.Item name="mcp_token" label="MCP连接Token(workbuddy用)" rules={[{ required: true }]}
-            extra="给客户配在 workbuddy 的 MCP Server headers">
+            extra="给客户配在 workbuddy 的 MCP Server headers；也可用列表「MCP配置」一键复制">
             <Input placeholder="长随机串" />
           </Form.Item>
           <Form.Item name="secret" label="自建应用Secret"
@@ -168,6 +220,34 @@ export default function Tenants() {
             <Switch />
           </Form.Item>
         </Form>
+      </Modal>
+
+      <Modal
+        title={mcpModal.title}
+        open={mcpModal.open}
+        onCancel={() => setMcpModal({ open: false, title: '', text: '' })}
+        width={640}
+        footer={[
+          <Button key="close" onClick={() => setMcpModal({ open: false, title: '', text: '' })}>关闭</Button>,
+          <Button key="copy" type="primary" icon={<CopyOutlined />} onClick={() => copyText(mcpModal.text)}>
+            复制 JSON
+          </Button>,
+        ]}
+      >
+        <Paragraph type="secondary" style={{ marginBottom: 8 }}>
+          粘贴到 WorkBuddy / CodeBuddy 的 MCP 配置中。URL 基于当前访问域名自动生成。
+        </Paragraph>
+        <pre style={{
+          background: '#f5f5f5',
+          border: '1px solid #eee',
+          borderRadius: 6,
+          padding: 12,
+          maxHeight: 360,
+          overflow: 'auto',
+          fontSize: 12,
+          lineHeight: 1.5,
+          margin: 0,
+        }}>{mcpModal.text}</pre>
       </Modal>
     </div>
   )

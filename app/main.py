@@ -53,6 +53,15 @@ def create_app() -> FastAPI:
             "scheduler": _scheduler.running if _scheduler else False,
         }
 
+    # /admin 快捷入口 → 静态管理后台（避免访问 /admin 或 /admin/index.html 得到 404）
+    from fastapi.responses import RedirectResponse
+
+    @app.get("/admin", include_in_schema=False)
+    @app.get("/admin/", include_in_schema=False)
+    @app.get("/admin/index.html", include_in_schema=False)
+    async def admin_entry_redirect():
+        return RedirectResponse(url="/admin/ui/", status_code=307)
+
     # 管理后台前端静态文件（构建产物 app/static/dist）—— 必须在 mcp_glyph 之前注册
     import os
     from fastapi.staticfiles import StaticFiles
