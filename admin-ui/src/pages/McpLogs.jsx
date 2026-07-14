@@ -305,11 +305,11 @@ export default function McpLogs({ filters, onFiltersChange = () => {} }) {
 
   const rangePresets = useMemo(() => {
     return [
-      { label: '最近 1 小时', value: [() => dayjs().subtract(1, 'hour'), () => dayjs()] },
-      { label: '最近 24 小时', value: [() => dayjs().subtract(24, 'hour'), () => dayjs()] },
-      { label: '最近 7 天', value: [() => dayjs().subtract(7, 'day'), () => dayjs()] },
-      { label: '最近 30 天', value: [() => dayjs().subtract(30, 'day'), () => dayjs()] },
-      { label: '最近 90 天', value: [() => dayjs().subtract(90, 'day'), () => dayjs()] },
+      { label: '最近 1 小时', value: () => [dayjs().subtract(1, 'hour'), dayjs()] },
+      { label: '最近 24 小时', value: () => [dayjs().subtract(24, 'hour'), dayjs()] },
+      { label: '最近 7 天', value: () => [dayjs().subtract(7, 'day'), dayjs()] },
+      { label: '最近 30 天', value: () => [dayjs().subtract(30, 'day'), dayjs()] },
+      { label: '最近 90 天', value: () => [dayjs().subtract(90, 'day'), dayjs()] },
     ]
   }, [])
 
