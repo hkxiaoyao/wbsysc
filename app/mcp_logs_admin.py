@@ -6,6 +6,7 @@ import hashlib
 import hmac
 import json
 import logging
+import math
 import secrets
 import time
 from datetime import datetime, timedelta, timezone
@@ -59,6 +60,7 @@ Category = Literal["tool", "protocol", "auth"]
 Status = Literal["ok", "partial", "error", "denied"]
 DeleteMode = Literal["ids", "filter", "before_date", "all"]
 StrictPositiveInt = Annotated[int, Field(strict=True, gt=0)]
+StrictNonNegativeInt = Annotated[int, Field(strict=True, ge=0)]
 
 
 def _utcnow() -> datetime:
@@ -172,8 +174,8 @@ class DeleteFilterBody(BaseModel):
     q: str | None = Field(default=None, max_length=100)
     request_id: str | None = Field(default=None, max_length=64)
     client_ip: str | None = Field(default=None, max_length=64)
-    cost_min: int | None = Field(default=None, ge=0)
-    cost_max: int | None = Field(default=None, ge=0)
+    cost_min: StrictNonNegativeInt | None = None
+    cost_max: StrictNonNegativeInt | None = None
 
     @model_validator(mode="after")
     def validate_ranges(self):
@@ -407,14 +409,14 @@ def _validate_confirmation(
     payload = _decode_confirmation(token)
     try:
         valid = (
-            payload["v"] == _TOKEN_VERSION
+            type(payload["v"]) is int
+            and payload["v"] == _TOKEN_VERSION
             and payload["spec"] == _spec_payload(spec)
             and hmac.compare_digest(payload["session"], _session_digest(request))
-            and isinstance(payload["max_id"], int)
-            and payload["max_id"] >= 0
-            and isinstance(payload["count"], int)
-            and payload["count"] >= 0
-            and float(payload["exp"]) >= _now()
+            and _is_nonnegative_int(payload["max_id"])
+            and _is_nonnegative_int(payload["count"])
+            and _is_finite_number(payload["exp"])
+            and payload["exp"] >= _now()
         )
     except (KeyError, TypeError, ValueError):
         valid = False
@@ -423,9 +425,10 @@ def _validate_confirmation(
     return payload
 
 
-def _store_call(operation, *args):
+def _store_call(operation, *args, transform=None):
     try:
-        return operation(*args)
+        result = operation(*args)
+        return transform(result) if transform is not None else result
     except HTTPException:
         raise
     except Exception as exc:
@@ -438,30 +441,83 @@ def _safe_log_item(item: Any) -> dict[str, Any]:
     return {field: values.get(field) for field in SAFE_LOG_FIELDS}
 
 
+def _is_nonnegative_int(value: Any) -> bool:
+    return type(value) is int and value >= 0
+
+
+def _require_nonnegative_int(value: Any) -> int:
+    if not _is_nonnegative_int(value):
+        raise TypeError("expected a nonnegative integer")
+    return value
+
+
+def _is_finite_number(value: Any) -> bool:
+    return type(value) in (int, float) and math.isfinite(value)
+
+
+def _require_nonnegative_number(value: Any) -> int | float:
+    if not _is_finite_number(value) or value < 0:
+        raise TypeError("expected a finite nonnegative number")
+    return value
+
+
+def _safe_counted_rows(rows: Any, label: str) -> list[dict[str, Any]]:
+    if not isinstance(rows, (list, tuple)):
+        raise TypeError("expected a row collection")
+    safe_rows = []
+    for row in rows:
+        values = dict(row)
+        safe_rows.append(
+            {
+                label: values.get(label),
+                "count": _require_nonnegative_int(values.get("count", 0)),
+            }
+        )
+    return safe_rows
+
+
+def _safe_list_result(result: Any, page: int, page_size: int) -> dict[str, Any]:
+    values = dict(result)
+    items = values.get("items", [])
+    if not isinstance(items, (list, tuple)):
+        raise TypeError("expected a log item collection")
+    return {
+        "items": [_safe_log_item(item) for item in items],
+        "total": _require_nonnegative_int(values.get("total", 0)),
+        "page": page,
+        "page_size": page_size,
+    }
+
+
 def _safe_stats(stats: Any) -> dict[str, Any]:
     values = dict(stats)
     return {
-        "total": values.get("total", 0),
-        "success_rate": values.get("success_rate", 0.0),
-        "error_count": values.get("error_count", 0),
-        "avg_cost_ms": values.get("avg_cost_ms", 0.0),
-        "p95_cost_ms": values.get("p95_cost_ms", 0),
-        "trend": [
-            {"bucket": row.get("bucket"), "count": row.get("count", 0)}
-            for row in values.get("trend", [])
-        ],
-        "top_tools": [
-            {"event_name": row.get("event_name"), "count": row.get("count", 0)}
-            for row in values.get("top_tools", [])
-        ],
-        "status_distribution": [
-            {
-                "result_status": row.get("result_status"),
-                "count": row.get("count", 0),
-            }
-            for row in values.get("status_distribution", [])
-        ],
+        "total": _require_nonnegative_int(values.get("total", 0)),
+        "success_rate": _require_nonnegative_number(values.get("success_rate", 0.0)),
+        "error_count": _require_nonnegative_int(values.get("error_count", 0)),
+        "avg_cost_ms": _require_nonnegative_number(values.get("avg_cost_ms", 0.0)),
+        "p95_cost_ms": _require_nonnegative_int(values.get("p95_cost_ms", 0)),
+        "trend": _safe_counted_rows(values.get("trend", []), "bucket"),
+        "top_tools": _safe_counted_rows(values.get("top_tools", []), "event_name"),
+        "status_distribution": _safe_counted_rows(
+            values.get("status_distribution", []), "result_status"
+        ),
     }
+
+
+def _safe_preview_result(result: Any) -> dict[str, int]:
+    values = dict(result)
+    return {
+        "matched_count": _require_nonnegative_int(values.get("matched_count")),
+        "max_id": _require_nonnegative_int(values.get("max_id")),
+    }
+
+
+def _safe_retention_days(value: Any) -> int:
+    days = _require_nonnegative_int(value)
+    if days > 3650:
+        raise TypeError("retention days are out of range")
+    return days
 
 
 @router.get("/mcp-logs")
@@ -472,13 +528,13 @@ def get_mcp_logs(
     page_size: Annotated[int, Query(ge=1, le=100)] = 20,
 ):
     _require_auth(request)
-    result = _store_call(list_logs, filters, page, page_size)
-    return {
-        "items": [_safe_log_item(item) for item in result.get("items", [])],
-        "total": int(result.get("total", 0)),
-        "page": page,
-        "page_size": page_size,
-    }
+    return _store_call(
+        list_logs,
+        filters,
+        page,
+        page_size,
+        transform=lambda result: _safe_list_result(result, page, page_size),
+    )
 
 
 @router.get("/mcp-logs/stats")
@@ -487,21 +543,21 @@ def get_mcp_log_statistics(
     filters: Annotated[LogFilters, Depends(_query_filters)],
 ):
     _require_auth(request)
-    return _safe_stats(_store_call(get_log_stats, filters))
+    return _store_call(get_log_stats, filters, transform=_safe_stats)
 
 
 @router.post("/mcp-logs/delete-preview")
 def post_mcp_log_delete_preview(body: DeletePreviewRequest, request: Request):
     _require_auth(request)
     spec = body.to_spec()
-    preview = _store_call(preview_delete, spec)
+    preview = _store_call(preview_delete, spec, transform=_safe_preview_result)
     expires_at = int(_now() + _TOKEN_TTL_SECONDS)
     payload = {
         "v": _TOKEN_VERSION,
         "session": _session_digest(request),
         "spec": _spec_payload(spec),
-        "max_id": int(preview.get("max_id", 0)),
-        "count": int(preview.get("matched_count", 0)),
+        "max_id": preview["max_id"],
+        "count": preview["matched_count"],
         "exp": expires_at,
     }
     try:
@@ -522,18 +578,28 @@ def delete_mcp_logs(body: DeleteExecuteRequest, request: Request):
     _require_auth(request)
     spec = body.to_spec()
     payload = _validate_confirmation(body.confirm_token, spec, request)
-    deleted = _store_call(delete_matching, spec, payload["max_id"])
-    return {"deleted": int(deleted)}
+    deleted = _store_call(
+        delete_matching,
+        spec,
+        payload["max_id"],
+        transform=_require_nonnegative_int,
+    )
+    return {"deleted": deleted}
 
 
 @router.get("/mcp-log-settings")
 def get_mcp_log_settings(request: Request):
     _require_auth(request)
-    return {"retention_days": int(_store_call(get_retention_days))}
+    days = _store_call(get_retention_days, transform=_safe_retention_days)
+    return {"retention_days": days}
 
 
 @router.put("/mcp-log-settings")
 def put_mcp_log_settings(body: RetentionRequest, request: Request):
     _require_auth(request)
-    days = _store_call(set_retention_days, body.retention_days)
-    return {"retention_days": int(days)}
+    days = _store_call(
+        set_retention_days,
+        body.retention_days,
+        transform=_safe_retention_days,
+    )
+    return {"retention_days": days}

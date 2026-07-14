@@ -1,3 +1,4 @@
+import math
 from datetime import datetime, timedelta
 from types import SimpleNamespace
 
@@ -298,6 +299,124 @@ def test_delete_token_rejects_tampering_changed_spec_session_and_expiry(
 )
 def test_delete_preview_rejects_ambiguous_or_raw_specs(authed_client, body):
     assert authed_client.post("/admin/mcp-logs/delete-preview", json=body).status_code == 422
+
+
+@pytest.mark.parametrize("field", ["cost_min", "cost_max"])
+@pytest.mark.parametrize("value", ["10", 10.0, True, -1])
+def test_delete_filter_costs_require_strict_nonnegative_integers(
+    authed_client, field, value
+):
+    response = authed_client.post(
+        "/admin/mcp-logs/delete-preview",
+        json={
+            "mode": "filter",
+            "filter": {"tenant_id": "tenant-a", field: value},
+        },
+    )
+
+    assert response.status_code == 422
+
+
+@pytest.mark.parametrize(
+    ("operation", "method", "path", "body", "malformed"),
+    [
+        ("list_logs", "get", "/admin/mcp-logs", None, None),
+        (
+            "get_log_stats",
+            "get",
+            "/admin/mcp-logs/stats",
+            None,
+            {"trend": [None]},
+        ),
+        (
+            "preview_delete",
+            "post",
+            "/admin/mcp-logs/delete-preview",
+            {"mode": "all"},
+            {"matched_count": "not-an-integer", "max_id": 12},
+        ),
+        ("get_retention_days", "get", "/admin/mcp-log-settings", None, None),
+        (
+            "set_retention_days",
+            "put",
+            "/admin/mcp-log-settings",
+            {"retention_days": 90},
+            "not-an-integer",
+        ),
+    ],
+)
+def test_malformed_store_results_return_generic_service_error(
+    monkeypatch, authed_client, operation, method, path, body, malformed
+):
+    monkeypatch.setattr(api, operation, lambda *args: malformed)
+    client = TestClient(authed_client.app, raise_server_exceptions=False)
+    client.headers.update({"Authorization": "Bearer session-a"})
+
+    response = client.request(method, path, json=body)
+
+    assert response.status_code == 500
+    assert response.json() == {"detail": "日志服务暂不可用"}
+
+
+def test_malformed_delete_count_returns_generic_service_error(
+    monkeypatch, authed_client
+):
+    monkeypatch.setattr(
+        api,
+        "preview_delete",
+        lambda spec: {"matched_count": 1, "max_id": 7},
+    )
+    preview = authed_client.post(
+        "/admin/mcp-logs/delete-preview", json={"mode": "all"}
+    ).json()
+    monkeypatch.setattr(api, "delete_matching", lambda spec, max_id: "not-an-integer")
+    client = TestClient(authed_client.app, raise_server_exceptions=False)
+    client.headers.update({"Authorization": "Bearer session-a"})
+
+    response = client.request(
+        "delete",
+        "/admin/mcp-logs",
+        json={"mode": "all", "confirm_token": preview["confirm_token"]},
+    )
+
+    assert response.status_code == 500
+    assert response.json() == {"detail": "日志服务暂不可用"}
+
+
+@pytest.mark.parametrize(
+    ("field", "value"),
+    [
+        ("exp", True),
+        ("exp", "300"),
+        ("exp", math.inf),
+        ("max_id", True),
+        ("count", True),
+    ],
+)
+def test_confirmation_rejects_non_strict_or_non_finite_numeric_claims(
+    monkeypatch, authed_client, field, value
+):
+    monkeypatch.setattr(api, "_now", lambda: 0.0)
+    monkeypatch.setattr(
+        api,
+        "preview_delete",
+        lambda spec: {"matched_count": 1, "max_id": 7},
+    )
+    monkeypatch.setattr(api, "delete_matching", lambda spec, max_id: 1)
+    preview = authed_client.post(
+        "/admin/mcp-logs/delete-preview", json={"mode": "all"}
+    ).json()
+    payload = api._decode_confirmation(preview["confirm_token"])
+    payload[field] = value
+    malformed_token = api._confirmation_token(payload)
+
+    response = authed_client.request(
+        "DELETE",
+        "/admin/mcp-logs",
+        json={"mode": "all", "confirm_token": malformed_token},
+    )
+
+    assert response.status_code == 400
 
 
 def test_retention_get_and_strict_put(monkeypatch, authed_client):
