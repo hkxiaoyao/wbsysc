@@ -55,16 +55,21 @@ export default function App() {
     setAuthed(false)
   }
 
+  const applyLocation = useCallback((view, logFilters) => {
+    const nextUrl = adminUrl(view, logFilters)
+    const currentUrl = `${window.location.pathname}${window.location.search}${window.location.hash}`
+    if (nextUrl !== currentUrl) window.history.pushState({}, '', nextUrl)
+    setLocationState({ view, logFilters })
+  }, [])
+
   const navigate = useCallback((view, logFilters = locationState.logFilters) => {
     if (view === locationState.view && logFilters === locationState.logFilters) return
-    window.history.pushState({}, '', adminUrl(view, logFilters))
-    setLocationState({ view, logFilters })
-  }, [locationState])
+    applyLocation(view, logFilters)
+  }, [applyLocation, locationState])
 
   const onLogFiltersChange = useCallback((logFilters) => {
-    window.history.pushState({}, '', adminUrl('logs', logFilters))
-    setLocationState({ view: 'logs', logFilters })
-  }, [])
+    applyLocation('logs', logFilters)
+  }, [applyLocation])
 
   const onViewLogs = useCallback((tenantId) => {
     navigate('logs', { ...parseLogLocation(''), tenantId })
