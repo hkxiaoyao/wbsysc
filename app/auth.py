@@ -7,6 +7,7 @@ Bearer Token 鉴权 + 租户上下文（多租户版）
 from __future__ import annotations
 
 import contextvars
+import logging
 from dataclasses import dataclass
 from typing import Optional
 
@@ -15,7 +16,12 @@ from starlette.middleware.base import BaseHTTPMiddleware
 from starlette.requests import Request
 from starlette.responses import JSONResponse
 
+from .mcp_audit import AuthWriteLimiter, client_ip_from_scope, safe_summary, write_event
+from .mcp_log_models import McpLogEvent
 from .tenant import get_tenant_by_token, reload_tenants
+
+logger = logging.getLogger(__name__)
+_auth_write_limiter = AuthWriteLimiter()
 
 
 @dataclass
@@ -48,6 +54,32 @@ def require_tenant() -> str:
     return current_ctx().tenant_id
 
 
+def _record_auth(request: Request, event_name: str, tenant_id: str = "") -> None:
+    client_ip = client_ip_from_scope(request.scope)
+    if not _auth_write_limiter.allow(client_ip, event_name):
+        logger.warning("MCP auth audit rate limit reached event=%s", event_name)
+        return
+    request_id = safe_summary(
+        request.headers.get("x-request-id")
+        or request.headers.get("mcp-session-id")
+        or "",
+        64,
+    )
+    write_event(
+        McpLogEvent(
+            tenant_id=tenant_id,
+            category="auth",
+            event_name=event_name,
+            result_status="ok" if event_name == "auth_ok" else "denied",
+            error_code="" if event_name == "auth_ok" else "401",
+            request_id=request_id,
+            client_ip=client_ip,
+            http_method=safe_summary(request.method, 16),
+            http_status=0 if event_name == "auth_ok" else 401,
+        )
+    )
+
+
 class BearerTokenMiddleware(BaseHTTPMiddleware):
     WHITE_LIST = {"/health", "/healthz", "/"}
 
@@ -58,6 +90,7 @@ class BearerTokenMiddleware(BaseHTTPMiddleware):
 
         auth = request.headers.get("Authorization", "")
         if not auth.startswith("Bearer "):
+            _record_auth(request, "auth_missing")
             return JSONResponse({"errcode": 401, "errmsg": "缺少 Bearer Token"}, status_code=401)
 
         token = auth[len("Bearer "):].strip()
@@ -67,6 +100,7 @@ class BearerTokenMiddleware(BaseHTTPMiddleware):
             reload_tenants()
             tctx = get_tenant_by_token(token)
         if not tctx:
+            _record_auth(request, "auth_invalid")
             return JSONResponse({"errcode": 401, "errmsg": "Token 无效或未绑定租户"}, status_code=401)
 
         ctx = TenantCtx(
@@ -81,6 +115,7 @@ class BearerTokenMiddleware(BaseHTTPMiddleware):
         )
         token_ctx = _ctx.set(ctx)
         try:
+            _record_auth(request, "auth_ok", ctx.tenant_id)
             return await call_next(request)
         finally:
             _ctx.reset(token_ctx)

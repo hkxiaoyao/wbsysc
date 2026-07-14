@@ -2,7 +2,7 @@
 MCP Server - 暴露给 workbuddy 的 tools（多租户版）
 - mock 模式：返回脱敏 mock 数据
 - 真实模式：stored 读租户 schema，direct 实时请求企微
-- 调用写审计日志到对应租户 schema
+- 调用写入统一中心审计日志
 """
 from __future__ import annotations
 
@@ -18,6 +18,8 @@ from mcp.server.transport_security import TransportSecuritySettings
 from . import data_access
 from .auth import current_ctx, require_tenant
 from .config import get_settings
+from .mcp_audit import current_request_metadata, safe_summary, write_event
+from .mcp_log_models import McpLogEvent
 from .wecom.mock import (
     MOCK_APPROVAL_LIST,
     MOCK_REPORT_LIST,
@@ -119,12 +121,32 @@ def _ok(data) -> str:
 
 
 def _audit(tool, target, params, status, cost):
-    try:
-        from . import db
-        ctx = current_ctx()
-        db.log_audit(ctx.schema_name, tool, target, params[:500], status, cost)
-    except Exception as exc:
-        logger.warning("MCP audit write failed tool=%s: %s", tool, type(exc).__name__)
+    ctx = current_ctx()
+    metadata = current_request_metadata()
+    write_event(
+        McpLogEvent(
+            tenant_id=ctx.tenant_id,
+            category="tool",
+            event_name=safe_summary(tool, 96),
+            target=safe_summary(target, 256),
+            params_summary=safe_summary(params, 512),
+            result_status=status,
+            cost_ms=max(0, int(cost)),
+            request_id=metadata.get("request_id", ""),
+            client_ip=metadata.get("client_ip", ""),
+            http_method=metadata.get("http_method", ""),
+        )
+    )
+
+
+def _run_mock(tool, target, params, started_at, result):
+    status = (
+        "partial"
+        if result.get("partial_count")
+        else ("error" if result.get("errcode") else "ok")
+    )
+    _audit(tool, target, params, status, int((time.time() - started_at) * 1000))
+    return _ok(result)
 
 
 def _run_real(tool, target, params, started_at, call):
@@ -176,8 +198,11 @@ def wecom_list_reports(starttime: int, endtime: int, limit: int = 100) -> str:
     tenant = require_tenant()
 
     if _use_mock():
-        return _ok({"tenant": tenant, "source": "mock",
-                    "count": len(MOCK_REPORT_LIST), "records": MOCK_REPORT_LIST})
+        return _run_mock(
+            "wecom_list_reports", "", f"{starttime}-{endtime}#{limit}", t0,
+            {"tenant": tenant, "source": "mock", "count": len(MOCK_REPORT_LIST),
+             "records": MOCK_REPORT_LIST},
+        )
 
     return _run_real(
         "wecom_list_reports", "", f"{starttime}-{endtime}#{limit}", t0,
@@ -193,7 +218,10 @@ def wecom_get_report(journaluuid: str) -> str:
 
     if _use_mock():
         from .wecom.mock import MOCK_REPORT_DETAIL
-        return _ok(MOCK_REPORT_DETAIL.get(journaluuid, {"errcode": 404, "errmsg": "不存在"}))
+        return _run_mock(
+            "wecom_get_report", journaluuid, journaluuid, t0,
+            MOCK_REPORT_DETAIL.get(journaluuid, {"errcode": 404, "errmsg": "不存在"}),
+        )
 
     return _run_real(
         "wecom_get_report", journaluuid, journaluuid, t0,
@@ -209,8 +237,11 @@ def wecom_list_approvals(starttime: int, endtime: int, limit: int = 100) -> str:
     tenant = require_tenant()
 
     if _use_mock():
-        return _ok({"tenant": tenant, "source": "mock",
-                    "count": len(MOCK_APPROVAL_LIST), "records": MOCK_APPROVAL_LIST})
+        return _run_mock(
+            "wecom_list_approvals", "", f"{starttime}-{endtime}#{limit}", t0,
+            {"tenant": tenant, "source": "mock", "count": len(MOCK_APPROVAL_LIST),
+             "records": MOCK_APPROVAL_LIST},
+        )
 
     return _run_real(
         "wecom_list_approvals", "", f"{starttime}-{endtime}#{limit}", t0,
@@ -226,7 +257,10 @@ def wecom_get_approval_detail(sp_no: str) -> str:
 
     if _use_mock():
         from .wecom.mock import MOCK_APPROVAL_DETAIL
-        return _ok(MOCK_APPROVAL_DETAIL.get(sp_no, {"errcode": 404, "errmsg": "不存在"}))
+        return _run_mock(
+            "wecom_get_approval_detail", sp_no, sp_no, t0,
+            MOCK_APPROVAL_DETAIL.get(sp_no, {"errcode": 404, "errmsg": "不存在"}),
+        )
 
     return _run_real(
         "wecom_get_approval_detail", sp_no, sp_no, t0,
@@ -250,8 +284,10 @@ def wecom_list_checkins(starttime: int, endtime: int, limit: int = 100) -> str:
     tenant = require_tenant()
 
     if _use_mock():
-        return _ok({"tenant": tenant, "source": "mock",
-                    "count": 0, "records": []})
+        return _run_mock(
+            "wecom_list_checkins", "", f"{starttime}-{endtime}#{limit}", t0,
+            {"tenant": tenant, "source": "mock", "count": 0, "records": []},
+        )
 
     return _run_real(
         "wecom_list_checkins", "", f"{starttime}-{endtime}#{limit}", t0,
@@ -263,10 +299,14 @@ def wecom_list_checkins(starttime: int, endtime: int, limit: int = 100) -> str:
 @mcp.tool()
 def wecom_list_smart_table_records(docid: str, sheet_id: str, limit: int = 1000) -> str:
     """查询智能表格记录（一期暂搁置：企微docid限制）"""
+    t0 = time.time()
     tenant = require_tenant()
-    return _ok({"tenant": tenant, "source": "mock",
-                 "note": "智能表格读取一期暂搁置",
-                 "records": MOCK_SMARTTABLE_RECORDS[:limit]})
+    return _run_mock(
+        "wecom_list_smart_table_records", f"{docid}/{sheet_id}",
+        f"{docid}#{sheet_id}#{limit}", t0,
+        {"tenant": tenant, "source": "mock", "note": "智能表格读取一期暂搁置",
+         "records": MOCK_SMARTTABLE_RECORDS[:limit]},
+    )
 
 
 def list_tool_names():

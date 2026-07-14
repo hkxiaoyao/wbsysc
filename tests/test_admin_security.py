@@ -5,7 +5,73 @@ from fastapi import FastAPI, HTTPException, Response
 from fastapi.testclient import TestClient
 
 from app import admin
+from app import auth as auth_module
 from app import tenant as tenant_module
+
+
+def _auth_test_client():
+    app = FastAPI()
+    app.add_middleware(auth_module.BearerTokenMiddleware)
+
+    @app.get("/secure")
+    def secure():
+        return {"tenant": auth_module.current_ctx().tenant_id}
+
+    return TestClient(app)
+
+
+@pytest.mark.parametrize(
+    ("headers", "event_name"),
+    [({}, "auth_missing"), ({"Authorization": "Bearer invalid-token"}, "auth_invalid")],
+)
+def test_bearer_auth_failures_emit_safe_rate_limited_events(
+    monkeypatch, headers, event_name
+):
+    events = []
+    monkeypatch.setattr(auth_module, "write_event", events.append)
+    monkeypatch.setattr(auth_module, "_auth_write_limiter", auth_module.AuthWriteLimiter())
+    monkeypatch.setattr(auth_module, "get_tenant_by_token", lambda token: None)
+    monkeypatch.setattr(auth_module, "reload_tenants", lambda: None)
+
+    response = _auth_test_client().get("/secure", headers=headers)
+
+    assert response.status_code == 401
+    assert len(events) == 1
+    assert events[0].category == "auth"
+    assert events[0].event_name == event_name
+    assert events[0].result_status == "denied"
+    assert events[0].tenant_id == ""
+    assert "invalid-token" not in repr(events[0])
+
+
+def test_bearer_auth_success_emits_tenant_event_without_token(monkeypatch):
+    events = []
+    tenant = SimpleNamespace(
+        tenant_id="tenant-a",
+        corpid="ww123",
+        secret="corp-secret",
+        schema_name="wbd_123",
+        contact_secret="contact-secret",
+        checkin_userids=[],
+        enabled_modules=set(),
+        data_mode="stored",
+    )
+    monkeypatch.setattr(auth_module, "write_event", events.append)
+    monkeypatch.setattr(auth_module, "_auth_write_limiter", auth_module.AuthWriteLimiter())
+    monkeypatch.setattr(auth_module, "get_tenant_by_token", lambda token: tenant)
+
+    response = _auth_test_client().get(
+        "/secure", headers={"Authorization": "Bearer valid-token"}
+    )
+
+    assert response.status_code == 200
+    assert response.json() == {"tenant": "tenant-a"}
+    assert len(events) == 1
+    assert events[0].event_name == "auth_ok"
+    assert events[0].tenant_id == "tenant-a"
+    assert events[0].result_status == "ok"
+    for sensitive in ("valid-token", "corp-secret", "contact-secret"):
+        assert sensitive not in repr(events[0])
 
 
 def test_tenant_item_redacts_token(monkeypatch):

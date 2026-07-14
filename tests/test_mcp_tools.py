@@ -3,7 +3,7 @@ import inspect
 
 import pytest
 
-from app import mcp_server
+from app import mcp_audit, mcp_server
 from app.auth import TenantCtx, _ctx
 
 
@@ -116,7 +116,9 @@ def test_mock_tools_bypass_data_access(
     monkeypatch, use_tenant_ctx, tool_name, accessor_name, args
 ):
     use_tenant_ctx("stored")
+    events = []
     monkeypatch.setattr(mcp_server, "_use_mock", lambda: True)
+    monkeypatch.setattr(mcp_server, "write_event", events.append)
     monkeypatch.setattr(
         mcp_server.data_access,
         accessor_name,
@@ -129,6 +131,10 @@ def test_mock_tools_bypass_data_access(
 
     assert isinstance(result, str)
     assert isinstance(json.loads(result), dict)
+    assert len(events) == 1
+    assert events[0].category == "tool"
+    assert events[0].event_name == tool_name
+    assert events[0].tenant_id == "tenant-a"
 
 
 @pytest.mark.parametrize(
@@ -351,12 +357,14 @@ def test_real_result_selects_expected_audit_status(
     monkeypatch.setattr(
         mcp_server.data_access, "list_reports", lambda *values: accessor_result
     )
-    monkeypatch.setattr(mcp_server, "_audit", lambda *values: audits.append(values))
+    monkeypatch.setattr(mcp_server, "write_event", audits.append)
 
     mcp_server.wecom_list_reports(1, 2, 10)
 
     assert len(audits) == 1
-    assert audits[0][3] == expected_status
+    assert audits[0].category == "tool"
+    assert audits[0].event_name == "wecom_list_reports"
+    assert audits[0].result_status == expected_status
 
 
 def test_audit_failure_logs_warning_without_changing_tool_result(
@@ -375,13 +383,25 @@ def test_audit_failure_logs_warning_without_changing_tool_result(
         mcp_server.data_access, "list_reports", lambda *values: expected
     )
     monkeypatch.setattr(
-        mcp_server.data_access.db,
-        "log_audit",
+        mcp_audit,
+        "insert_event",
         lambda *values: (_ for _ in ()).throw(RuntimeError("database unavailable")),
     )
 
-    with caplog.at_level("WARNING", logger="app.mcp_server"):
+    with caplog.at_level("WARNING", logger="app.mcp_audit"):
         result = json.loads(mcp_server.wecom_list_reports(1, 2, 10))
 
     assert result == expected
-    assert "MCP audit write failed tool=wecom_list_reports: RuntimeError" in caplog.text
+    assert "MCP audit storage failed: RuntimeError" in caplog.text
+
+
+def test_mock_tool_audit_redacts_sensitive_target(monkeypatch, use_tenant_ctx):
+    use_tenant_ctx("stored")
+    events = []
+    monkeypatch.setattr(mcp_server, "_use_mock", lambda: True)
+    monkeypatch.setattr(mcp_server, "write_event", events.append)
+
+    mcp_server.wecom_get_report("secret=corp-secret")
+
+    assert len(events) == 1
+    assert "corp-secret" not in repr(events[0])
