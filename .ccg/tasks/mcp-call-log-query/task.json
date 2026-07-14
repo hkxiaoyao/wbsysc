@@ -5,8 +5,8 @@
   "complexity": "L+",
   "risk": "high",
   "domain": "fullstack",
-  "currentPhase": "analysis",
-  "nextAction": "提交设计文档并等待用户复核",
+  "currentPhase": "planning",
+  "nextAction": "自审实施计划并选择执行模式",
   "createdAt": "2026-07-14T00:00:00+08:00",
   "branch": "main"
 }
