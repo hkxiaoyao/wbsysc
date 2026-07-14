@@ -14,7 +14,12 @@ from app.mcp_audit import McpProtocolAuditMiddleware
 def test_runtime_registers_log_admin_before_static_and_mcp_mounts():
     runtime = main.create_app()
     paths = [getattr(route, "path", None) for route in runtime.routes]
-    log_router_index = paths.index("/admin/mcp-logs")
+    log_router_index = next(
+        index
+        for index, route in enumerate(runtime.routes)
+        if getattr(route, "path", None) == "/admin/mcp-logs"
+        or getattr(route, "original_router", None) is main.mcp_logs_admin_router
+    )
     log_paths = [route.path for route in main.mcp_logs_admin_router.routes]
 
     assert "/admin/mcp-logs" in log_paths
