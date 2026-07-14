@@ -1,2 +1,141 @@
 html, body, #root { height: 100%; margin: 0; }
 body { font-family: -apple-system, "Microsoft YaHei", sans-serif; background: #f0f2f5; }
+
+.admin-shell {
+  min-height: 100%;
+}
+
+.admin-header {
+  position: sticky;
+  z-index: 20;
+  top: 0;
+  display: grid;
+  grid-template-columns: minmax(190px, 1fr) auto minmax(96px, 1fr);
+  align-items: center;
+  gap: 20px;
+  height: 64px;
+  padding-inline: 24px;
+  color: #fff;
+  background: #102f3a;
+  box-shadow: 0 3px 16px rgba(8, 32, 40, 0.2);
+}
+
+.admin-brand {
+  overflow: hidden;
+  font-weight: 700;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.admin-nav {
+  display: flex;
+  align-items: center;
+  align-self: stretch;
+  gap: 4px;
+}
+
+.admin-nav__item.ant-btn {
+  position: relative;
+  align-self: stretch;
+  height: auto;
+  padding-inline: 18px;
+  border-radius: 0;
+  color: rgba(255, 255, 255, 0.72);
+  font-weight: 600;
+}
+
+.admin-nav__item.ant-btn::after {
+  position: absolute;
+  right: 18px;
+  bottom: 0;
+  left: 18px;
+  height: 3px;
+  border-radius: 3px 3px 0 0;
+  background: transparent;
+  content: '';
+}
+
+.admin-nav__item.ant-btn:hover,
+.admin-nav__item.ant-btn:focus-visible,
+.admin-nav__item--active.ant-btn {
+  color: #fff;
+  background: rgba(255, 255, 255, 0.09);
+}
+
+.admin-nav__item.ant-btn:focus-visible,
+.admin-logout.ant-btn:focus-visible {
+  outline: 2px solid #69d2dc;
+  outline-offset: -3px;
+}
+
+.admin-nav__item--active.ant-btn::after {
+  background: #69d2dc;
+}
+
+.admin-nav__short {
+  display: none;
+}
+
+.admin-logout.ant-btn {
+  justify-self: end;
+  color: rgba(255, 255, 255, 0.82);
+}
+
+.admin-logout.ant-btn:hover,
+.admin-logout.ant-btn:focus-visible {
+  color: #fff;
+  background: rgba(255, 255, 255, 0.09);
+}
+
+.admin-content {
+  padding: 24px;
+}
+
+@media (max-width: 680px) {
+  .admin-header {
+    grid-template-columns: minmax(44px, 1fr) auto auto;
+    gap: 6px;
+    padding-inline: 12px;
+  }
+
+  .admin-brand span {
+    display: none;
+  }
+
+  .admin-nav__item.ant-btn {
+    padding-inline: 12px;
+  }
+
+  .admin-nav__item.ant-btn::after {
+    right: 12px;
+    left: 12px;
+  }
+
+  .admin-nav__full {
+    display: none;
+  }
+
+  .admin-nav__short {
+    display: inline;
+  }
+
+  .admin-logout.ant-btn {
+    padding-inline: 8px;
+  }
+
+}
+
+@media (max-width: 430px) {
+  .admin-brand {
+    max-width: 40px;
+    font-size: 0;
+  }
+
+  .admin-brand::first-letter {
+    font-size: 16px;
+  }
+
+  .admin-header {
+    grid-template-columns: 40px minmax(132px, 1fr) auto;
+  }
+}

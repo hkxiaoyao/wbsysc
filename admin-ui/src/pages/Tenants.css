@@ -202,6 +202,11 @@
   white-space: normal;
 }
 
+.tenant-log-shortcut {
+  color: #126f82;
+  font-weight: 600;
+}
+
 .tenant-workbench .ant-btn:focus-visible,
 .tenant-workbench .ant-input-affix-wrapper:focus-visible,
 .tenant-workbench .ant-select-selector:focus-visible {

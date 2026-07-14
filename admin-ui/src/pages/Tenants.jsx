@@ -26,6 +26,7 @@ import {
   DeleteOutlined,
   DownOutlined,
   EditOutlined,
+  FileSearchOutlined,
   GlobalOutlined,
   MoreOutlined,
   PlusOutlined,
@@ -60,7 +61,7 @@ function buildMcpConfig(row) {
   }
 }
 
-export default function Tenants() {
+export default function Tenants({ onViewLogs = () => {} }) {
   const [data, setData] = useState([])
   const [loading, setLoading] = useState(false)
   const [loadError, setLoadError] = useState('')
@@ -443,6 +444,13 @@ export default function Tenants() {
         { key: 'mcp', icon: <CopyOutlined />, label: 'MCP 配置' },
         { key: 'domain', icon: <GlobalOutlined />, label: '可信域名' },
         { type: 'divider' },
+        {
+          key: 'logs',
+          className: 'tenant-log-shortcut',
+          icon: <FileSearchOutlined />,
+          label: '查看调用日志',
+        },
+        { type: 'divider' },
         { key: 'sync', icon: <ThunderboltOutlined />, label: syncLabel('立即同步'), disabled: Boolean(unavailableReason) },
         { key: 'force-sync', label: syncLabel('全量回拨'), disabled: Boolean(unavailableReason) },
         { key: 'diagnose', label: syncLabel('同步诊断'), disabled: Boolean(unavailableReason) },
@@ -452,6 +460,7 @@ export default function Tenants() {
       onClick: ({ key }) => {
         if (key === 'mcp') openMcpConfig(row)
         if (key === 'domain') openDomain(row)
+        if (key === 'logs') onViewLogs(row.tenant_id)
         if (key === 'sync') syncNow(row)
         if (key === 'force-sync') openForceSync(row)
         if (key === 'diagnose') diagnoseSync(row)

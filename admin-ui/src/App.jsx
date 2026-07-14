@@ -1,13 +1,35 @@
-import { useEffect, useState } from 'react'
-import { Layout, message } from 'antd'
+import { useCallback, useEffect, useState } from 'react'
+import { Button, Layout, message } from 'antd'
 import Login from './pages/Login.jsx'
+import McpLogs from './pages/McpLogs.jsx'
 import Tenants from './pages/Tenants.jsx'
+import { parseLogLocation, serializeLogFilters } from './pages/mcpLogsView.js'
 import api, { getToken, setToken, clearToken } from './api.js'
 
 const { Header, Content } = Layout
 
+function readAdminLocation() {
+  const params = new URLSearchParams(window.location.search)
+  return {
+    view: params.get('view') === 'logs' ? 'logs' : 'tenants',
+    logFilters: parseLogLocation(window.location.search),
+  }
+}
+
+function adminUrl(view, logFilters) {
+  const params = new URLSearchParams()
+  params.set('view', view)
+  if (view === 'logs') {
+    const filterParams = new URLSearchParams(serializeLogFilters(logFilters))
+    for (const [key, value] of filterParams) params.set(key, value)
+  }
+  return `${window.location.pathname}?${params.toString()}${window.location.hash}`
+}
+
 export default function App() {
   const [authed, setAuthed] = useState(!!getToken())
+  const [locationState, setLocationState] = useState(readAdminLocation)
+  const [messageApi, messageContextHolder] = message.useMessage()
 
   // 校验 session 是否仍有效
   useEffect(() => {
@@ -15,10 +37,16 @@ export default function App() {
     api.get('/admin/session').then(r => setAuthed(r.data.authed)).catch(() => setAuthed(false))
   }, [])
 
+  useEffect(() => {
+    const restoreLocation = () => setLocationState(readAdminLocation())
+    window.addEventListener('popstate', restoreLocation)
+    return () => window.removeEventListener('popstate', restoreLocation)
+  }, [])
+
   const onLogin = (token) => {
     setToken(token)
     setAuthed(true)
-    message.success('登录成功')
+    messageApi.success('登录成功')
   }
 
   const onLogout = async () => {
@@ -27,17 +55,71 @@ export default function App() {
     setAuthed(false)
   }
 
-  if (!authed) return <Login onLogin={onLogin} />
+  const navigate = useCallback((view, logFilters = locationState.logFilters) => {
+    if (view === locationState.view && logFilters === locationState.logFilters) return
+    window.history.pushState({}, '', adminUrl(view, logFilters))
+    setLocationState({ view, logFilters })
+  }, [locationState])
+
+  const onLogFiltersChange = useCallback((logFilters) => {
+    window.history.pushState({}, '', adminUrl('logs', logFilters))
+    setLocationState({ view: 'logs', logFilters })
+  }, [])
+
+  const onViewLogs = useCallback((tenantId) => {
+    navigate('logs', { ...parseLogLocation(''), tenantId })
+  }, [navigate])
+
+  if (!authed) {
+    return (
+      <>
+        {messageContextHolder}
+        <Login onLogin={onLogin} />
+      </>
+    )
+  }
 
   return (
-    <Layout style={{ height: '100%' }}>
-      <Header style={{ color: '#fff', display: 'flex', justifyContent: 'space-between', alignItems: 'center' }}>
-        <span>企微数据中转 · 管理后台</span>
-        <a onClick={onLogout} style={{ color: '#fff' }}>退出登录</a>
-      </Header>
-      <Content style={{ padding: 24 }}>
-        <Tenants />
-      </Content>
-    </Layout>
+    <>
+      {messageContextHolder}
+      <Layout className="admin-shell">
+        <Header className="admin-header">
+          <span className="admin-brand">企微数据中转 <span>· 管理后台</span></span>
+          <nav className="admin-nav" aria-label="管理后台主导航">
+            <Button
+              type="text"
+              className={locationState.view === 'tenants' ? 'admin-nav__item admin-nav__item--active' : 'admin-nav__item'}
+              aria-current={locationState.view === 'tenants' ? 'page' : undefined}
+              aria-label="租户管理"
+              onClick={() => navigate('tenants')}
+            >
+              <span className="admin-nav__full" aria-hidden="true">租户管理</span>
+              <span className="admin-nav__short" aria-hidden="true">租户</span>
+            </Button>
+            <Button
+              type="text"
+              className={locationState.view === 'logs' ? 'admin-nav__item admin-nav__item--active' : 'admin-nav__item'}
+              aria-current={locationState.view === 'logs' ? 'page' : undefined}
+              aria-label="调用日志"
+              onClick={() => navigate('logs')}
+            >
+              <span className="admin-nav__full" aria-hidden="true">调用日志</span>
+              <span className="admin-nav__short" aria-hidden="true">日志</span>
+            </Button>
+          </nav>
+          <Button type="text" className="admin-logout" onClick={onLogout}>退出登录</Button>
+        </Header>
+        <Content className="admin-content">
+          {locationState.view === 'logs' ? (
+            <McpLogs
+              filters={locationState.logFilters}
+              onFiltersChange={onLogFiltersChange}
+            />
+          ) : (
+            <Tenants onViewLogs={onViewLogs} />
+          )}
+        </Content>
+      </Layout>
+    </>
   )
 }
