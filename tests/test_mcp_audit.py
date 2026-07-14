@@ -12,12 +12,22 @@ from app.mcp_log_models import McpLogEvent
     ("value", "leaked"),
     [
         ("Authorization: Bearer abc", "abc"),
+        ("Authorization: Basic dXNlcjpwYXNz", "dXNlcjpwYXNz"),
+        (
+            "authorization = Digest username=admin response=digest-secret",
+            "digest-secret",
+        ),
         ("BEARER abc", "abc"),
         ("mcp_token = token-value", "token-value"),
         ("MCP TOKEN: token-value", "token-value"),
         ("secret=y", "y"),
         ("Cookie: sid=z", "sid=z"),
+        ("Cookie: sid=first-secret; session=second-secret", "second-secret"),
+        ("SET-COOKIE = session=case-secret; HttpOnly", "case-secret"),
         ("mysql+pymysql://root:db-password@db/gateway", "db-password"),
+        ("postgresql+psycopg://root:driver-secret@db/gateway", "driver-secret"),
+        ("db_password=db-secret", "db-secret"),
+        ({"Database-Password": "quoted-secret"}, "quoted-secret"),
         ({"Authorization": "Bearer abc", "mcp_token": "token-value"}, "token-value"),
     ],
 )
@@ -52,6 +62,31 @@ def test_auth_limiter_allows_sixty_per_minute_and_prunes_expired_buckets():
     assert limiter.allow("2001:db8::1", "auth_invalid", now=61)
     assert limiter.allow("2001:db8::1", "auth_ok", now=61)
     assert all("token" not in repr(key).lower() for key in limiter._buckets)
+
+
+def test_auth_limiter_enforces_bucket_cap_and_coalesces_rejection_notices():
+    limiter = mcp_audit.AuthWriteLimiter(
+        limit=1,
+        window_seconds=60,
+        max_buckets=3,
+    )
+
+    assert limiter.allow_with_notice("192.0.2.1", "auth_invalid", now=0) == (
+        True,
+        False,
+    )
+    assert limiter.allow_with_notice("192.0.2.1", "auth_invalid", now=1) == (
+        False,
+        True,
+    )
+    assert limiter.allow_with_notice("192.0.2.1", "auth_invalid", now=2) == (
+        False,
+        False,
+    )
+    for suffix in range(2, 10):
+        limiter.allow(f"192.0.2.{suffix}", "auth_invalid", now=2)
+
+    assert len(limiter._buckets) == 3
 
 
 def test_client_ip_from_scope_normalizes_and_rejects_non_ip_values():
@@ -142,6 +177,113 @@ def test_protocol_middleware_replays_oversized_post_without_parsing_body():
     assert received == [body]
     assert events[0].event_name == "mcp_http_request"
     assert "must-not-be-retained" not in repr(events[0])
+
+
+def test_protocol_middleware_streams_one_hundred_chunks_without_preconsuming():
+    original_messages = [
+        {
+            "type": "http.request",
+            "body": b"x" * 1024,
+            "more_body": index < 99,
+        }
+        for index in range(100)
+    ]
+    queue = list(original_messages)
+    received = []
+    receive_calls = 0
+    calls_at_app_start = None
+    events = []
+
+    async def receive():
+        nonlocal receive_calls
+        receive_calls += 1
+        return queue.pop(0)
+
+    async def app(scope, app_receive, send):
+        nonlocal calls_at_app_start
+        calls_at_app_start = receive_calls
+        while True:
+            message = await app_receive()
+            received.append(message)
+            if not message.get("more_body", False):
+                break
+        await send({"type": "http.response.start", "status": 200, "headers": []})
+
+    async def send(message):
+        return None
+
+    middleware = mcp_audit.McpProtocolAuditMiddleware(app, writer=events.append)
+    asyncio.run(
+        middleware(
+            {"type": "http", "method": "POST", "headers": [], "client": None},
+            receive,
+            send,
+        )
+    )
+
+    assert calls_at_app_start == 0
+    assert received == original_messages
+    assert receive_calls == 100
+    assert events[0].event_name == "mcp_http_request"
+
+
+def test_protocol_middleware_does_not_consume_an_unread_stream():
+    events = []
+
+    async def receive():
+        raise AssertionError("middleware must not pre-consume an unread request body")
+
+    async def app(scope, app_receive, send):
+        await send({"type": "http.response.start", "status": 204, "headers": []})
+
+    async def send(message):
+        return None
+
+    middleware = mcp_audit.McpProtocolAuditMiddleware(app, writer=events.append)
+    asyncio.run(
+        middleware(
+            {"type": "http", "method": "POST", "headers": [], "client": None},
+            receive,
+            send,
+        )
+    )
+
+    assert events[0].event_name == "mcp_http_request"
+    assert events[0].http_status == 204
+
+
+def test_protocol_writer_failure_isolated_and_request_metadata_reset(caplog):
+    async def app(scope, receive, send):
+        assert mcp_audit.current_request_metadata()["request_id"] == "request-1"
+        await send({"type": "http.response.start", "status": 200, "headers": []})
+
+    async def receive():
+        return {"type": "http.request", "body": b"", "more_body": False}
+
+    async def send(message):
+        return None
+
+    def failing_writer(event):
+        raise RuntimeError("secret=writer-secret")
+
+    middleware = mcp_audit.McpProtocolAuditMiddleware(app, writer=failing_writer)
+    with caplog.at_level(logging.WARNING, logger="app.mcp_audit"):
+        asyncio.run(
+            middleware(
+                {
+                    "type": "http",
+                    "method": "GET",
+                    "headers": [(b"x-request-id", b"request-1")],
+                    "client": None,
+                },
+                receive,
+                send,
+            )
+        )
+
+    assert mcp_audit.current_request_metadata() == {}
+    assert "RuntimeError" in caplog.text
+    assert "writer-secret" not in caplog.text
 
 
 @pytest.mark.parametrize(

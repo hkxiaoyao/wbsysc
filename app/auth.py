@@ -56,8 +56,13 @@ def require_tenant() -> str:
 
 def _record_auth(request: Request, event_name: str, tenant_id: str = "") -> None:
     client_ip = client_ip_from_scope(request.scope)
-    if not _auth_write_limiter.allow(client_ip, event_name):
-        logger.warning("MCP auth audit rate limit reached event=%s", event_name)
+    allowed, should_warn = _auth_write_limiter.allow_with_notice(
+        client_ip,
+        event_name,
+    )
+    if not allowed:
+        if should_warn:
+            logger.warning("MCP auth audit rate limit reached event=%s", event_name)
         return
     request_id = safe_summary(
         request.headers.get("x-request-id")

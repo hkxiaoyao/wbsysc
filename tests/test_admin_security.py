@@ -74,6 +74,30 @@ def test_bearer_auth_success_emits_tenant_event_without_token(monkeypatch):
         assert sensitive not in repr(events[0])
 
 
+def test_auth_rate_limit_warning_is_emitted_once_per_active_bucket(
+    monkeypatch, caplog
+):
+    events = []
+    request = SimpleNamespace(
+        scope={"client": ("192.0.2.1", 1234)},
+        headers={},
+        method="GET",
+    )
+    monkeypatch.setattr(auth_module, "write_event", events.append)
+    monkeypatch.setattr(
+        auth_module,
+        "_auth_write_limiter",
+        auth_module.AuthWriteLimiter(limit=1, window_seconds=60),
+    )
+
+    with caplog.at_level("WARNING", logger="app.auth"):
+        for _ in range(3):
+            auth_module._record_auth(request, "auth_invalid")
+
+    assert len(events) == 1
+    assert caplog.text.count("MCP auth audit rate limit reached") == 1
+
+
 def test_tenant_item_redacts_token(monkeypatch):
     monkeypatch.setattr(admin, "get_verify_by_tenant", lambda tenant_id: None)
     row = (

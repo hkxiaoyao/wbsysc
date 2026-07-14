@@ -8,7 +8,7 @@ import logging
 import re
 import threading
 import time
-from collections import deque
+from collections import OrderedDict, deque
 from collections.abc import Awaitable, Callable
 from typing import Any
 
@@ -17,12 +17,17 @@ from .mcp_log_store import insert_event
 
 logger = logging.getLogger(__name__)
 
-_DB_CREDENTIAL_RE = re.compile(
-    r"(?i)(\b(?:mysql(?:\+pymysql)?|postgres(?:ql)?|mariadb|mongodb|redis)://"
-    r"[^\s:/@]+:)([^\s/@]+)(@)"
+_CREDENTIAL_URL_RE = re.compile(
+    r"(?i)(\b[a-z][a-z0-9+.-]*://[^\s:/@]+:)([^\s/@]+)(@)"
 )
-_AUTHORIZATION_RE = re.compile(
-    r"(?i)(\bauthorization\s*[:=]\s*)(?:bearer\s+)?[^\s,;]+"
+_QUOTED_HEADER_VALUE_RE = re.compile(
+    r"(?ix)"
+    r"([\"']?\b(?:authorization|set[\s_-]*cookie|cookies?)\b[\"']?\s*[:=]\s*)"
+    r"(?:\"[^\"]*\"|'[^']*')"
+)
+_HEADER_VALUE_RE = re.compile(
+    r"(?im)(\b(?:authorization|set[\s_-]*cookie|cookies?)\b\s*[:=]\s*)"
+    r"[^\r\n]+"
 )
 _BEARER_RE = re.compile(r"(?i)\bbearer\s+[^\s,;]+")
 _SENSITIVE_KEY_RE = re.compile(
@@ -30,7 +35,8 @@ _SENSITIVE_KEY_RE = re.compile(
     r"([\"']?\b(?:"
     r"mcp[\s_-]*token|access[\s_-]*token|refresh[\s_-]*token|token|"
     r"client[\s_-]*secret|contact[\s_-]*secret|secret|"
-    r"set[\s_-]*cookie|cookies?|password|passwd|pwd|database[\s_-]*url"
+    r"db[\s_-]*password|database[\s_-]*password|password|passwd|pwd|"
+    r"database[\s_-]*url"
     r")\b[\"']?\s*[:=]\s*)(?:\"[^\"]*\"|'[^']*'|[^\s,;}\]]+)"
 )
 
@@ -54,10 +60,11 @@ def safe_summary(value: Any, limit: int) -> str:
         except Exception:
             text = type(value).__name__
 
-    text = _DB_CREDENTIAL_RE.sub(r"\1[REDACTED]\3", text)
-    text = _AUTHORIZATION_RE.sub(r"\1[REDACTED]", text)
+    text = _CREDENTIAL_URL_RE.sub(r"\1[REDACTED]\3", text)
+    text = _QUOTED_HEADER_VALUE_RE.sub(r'\1"[REDACTED]"', text)
+    text = _HEADER_VALUE_RE.sub(r"\1[REDACTED]", text)
     text = _BEARER_RE.sub("Bearer [REDACTED]", text)
-    text = _SENSITIVE_KEY_RE.sub(r"\1\"[REDACTED]\"", text)
+    text = _SENSITIVE_KEY_RE.sub(r'\1"[REDACTED]"', text)
     return text[:limit]
 
 
@@ -90,27 +97,71 @@ def client_ip_from_scope(scope: dict[str, Any]) -> str:
 class AuthWriteLimiter:
     """Rolling-window limiter keyed exclusively by normalized IP and event."""
 
-    def __init__(self, limit: int = 60, window_seconds: float = 60.0) -> None:
+    def __init__(
+        self,
+        limit: int = 60,
+        window_seconds: float = 60.0,
+        max_buckets: int = 4096,
+    ) -> None:
         self.limit = max(1, int(limit))
         self.window_seconds = max(0.001, float(window_seconds))
-        self._buckets: dict[tuple[str, str], deque[float]] = {}
+        self.max_buckets = max(1, int(max_buckets))
+        self._buckets: OrderedDict[tuple[str, str], deque[float]] = OrderedDict()
+        self._warned_buckets: set[tuple[str, str]] = set()
         self._lock = threading.Lock()
 
-    def allow(self, client_ip: str, event_name: str, *, now: float | None = None) -> bool:
+    @staticmethod
+    def _prune_timestamps(timestamps: deque[float], cutoff: float) -> None:
+        while timestamps and timestamps[0] <= cutoff:
+            timestamps.popleft()
+
+    def _prune_oldest_buckets(self, cutoff: float) -> None:
+        while self._buckets:
+            key = next(iter(self._buckets))
+            timestamps = self._buckets[key]
+            self._prune_timestamps(timestamps, cutoff)
+            if timestamps:
+                break
+            self._buckets.popitem(last=False)
+            self._warned_buckets.discard(key)
+
+    def allow_with_notice(
+        self,
+        client_ip: str,
+        event_name: str,
+        *,
+        now: float | None = None,
+    ) -> tuple[bool, bool]:
+        """Return whether to write and whether this rejection needs one warning."""
         timestamp = time.monotonic() if now is None else float(now)
         key = (_normalized_ip(client_ip), safe_summary(event_name, 96))
         cutoff = timestamp - self.window_seconds
         with self._lock:
-            for bucket_key, timestamps in tuple(self._buckets.items()):
-                while timestamps and timestamps[0] <= cutoff:
-                    timestamps.popleft()
+            self._prune_oldest_buckets(cutoff)
+            timestamps = self._buckets.pop(key, None)
+            if timestamps is None:
+                if len(self._buckets) >= self.max_buckets:
+                    evicted_key, _ = self._buckets.popitem(last=False)
+                    self._warned_buckets.discard(evicted_key)
+                timestamps = deque()
+            else:
+                self._prune_timestamps(timestamps, cutoff)
                 if not timestamps:
-                    del self._buckets[bucket_key]
-            timestamps = self._buckets.setdefault(key, deque())
+                    self._warned_buckets.discard(key)
+
             if len(timestamps) >= self.limit:
-                return False
+                should_warn = key not in self._warned_buckets
+                self._warned_buckets.add(key)
+                self._buckets[key] = timestamps
+                return False, should_warn
+
             timestamps.append(timestamp)
-            return True
+            self._buckets[key] = timestamps
+            return True, False
+
+    def allow(self, client_ip: str, event_name: str, *, now: float | None = None) -> bool:
+        allowed, _ = self.allow_with_notice(client_ip, event_name, now=now)
+        return allowed
 
 
 def current_request_metadata() -> dict[str, str]:
@@ -146,7 +197,7 @@ class McpProtocolAuditMiddleware:
         clock: Callable[[], float] = time.monotonic,
     ) -> None:
         self.app = app
-        self.writer = writer or write_event
+        self.writer = write_event if writer is None else writer
         self.max_body_bytes = max(0, int(max_body_bytes))
         self.clock = clock
 
@@ -157,55 +208,51 @@ class McpProtocolAuditMiddleware:
 
         method = str(scope.get("method", "")).upper()
         event_name = "mcp_http_request"
-        buffered_messages: list[dict[str, Any]] = []
         body_parts: list[bytes] = []
         body_size = 0
-        body_oversized = False
+        body_complete = False
+        body_capture_enabled = method == "POST"
 
-        if method == "POST":
-            while True:
-                message = await receive()
-                buffered_messages.append(message)
-                if message.get("type") != "http.request":
-                    break
-                chunk = message.get("body", b"")
-                body_size += len(chunk)
-                if body_size <= self.max_body_bytes:
-                    body_parts.append(chunk)
-                else:
-                    body_oversized = True
-                    body_parts.clear()
-                if not message.get("more_body", False):
-                    break
-            if not body_oversized:
-                try:
-                    payload = json.loads(b"".join(body_parts))
-                    rpc_method = payload.get("method") if isinstance(payload, dict) else None
-                    if isinstance(rpc_method, str) and rpc_method:
-                        event_name = safe_summary(rpc_method, 96)
-                except (UnicodeDecodeError, json.JSONDecodeError):
-                    pass
-        elif method == "GET":
+        if method == "GET":
             event_name = "mcp_http_get"
         elif method == "DELETE":
             event_name = "mcp_http_delete"
 
-        replay_index = 0
-
-        async def replay_receive():
-            nonlocal replay_index
-            if replay_index < len(buffered_messages):
-                message = buffered_messages[replay_index]
-                replay_index += 1
+        async def audit_receive():
+            nonlocal body_capture_enabled, body_complete, body_size
+            message = await receive()
+            if not body_capture_enabled or body_complete:
                 return message
-            return await receive()
+            try:
+                if message.get("type") != "http.request":
+                    body_capture_enabled = False
+                    body_parts.clear()
+                    return message
+                chunk = message.get("body", b"")
+                if not isinstance(chunk, bytes):
+                    raise TypeError("ASGI request body must be bytes")
+                body_size += len(chunk)
+                if body_size <= self.max_body_bytes:
+                    body_parts.append(chunk)
+                else:
+                    body_capture_enabled = False
+                    body_parts.clear()
+                if not message.get("more_body", False):
+                    body_complete = True
+            except Exception:
+                body_capture_enabled = False
+                body_parts.clear()
+            return message
 
         http_status = 500
 
         async def audit_send(message):
             nonlocal http_status
             if message.get("type") == "http.response.start":
-                http_status = int(message.get("status", 500))
+                try:
+                    http_status = int(message.get("status", 500))
+                except (TypeError, ValueError):
+                    http_status = 500
             await send(message)
 
         request_id = _header(scope, b"x-request-id") or _header(
@@ -219,26 +266,47 @@ class McpProtocolAuditMiddleware:
         started_at = self.clock()
         token = _request_metadata.set(metadata)
         try:
-            await self.app(scope, replay_receive, audit_send)
+            await self.app(scope, audit_receive, audit_send)
         finally:
-            cost_ms = max(0, int((self.clock() - started_at) * 1000))
-            status = "ok" if http_status < 400 else (
-                "denied" if http_status in (401, 403) else "error"
-            )
-            self.writer(
-                McpLogEvent(
-                    tenant_id=_tenant_id(),
-                    category="protocol",
-                    event_name=event_name,
-                    result_status=status,
-                    error_code=str(http_status) if http_status >= 400 else "",
-                    cost_ms=cost_ms,
-                    request_id=request_id,
-                    client_ip=metadata["client_ip"],
-                    http_method=metadata["http_method"],
-                    http_status=http_status,
+            try:
+                if body_capture_enabled and body_complete:
+                    try:
+                        payload = json.loads(b"".join(body_parts))
+                        rpc_method = (
+                            payload.get("method") if isinstance(payload, dict) else None
+                        )
+                        del payload
+                        if isinstance(rpc_method, str) and rpc_method:
+                            event_name = safe_summary(rpc_method, 96)
+                    except (UnicodeDecodeError, json.JSONDecodeError):
+                        pass
+                body_parts.clear()
+
+                cost_ms = max(0, int((self.clock() - started_at) * 1000))
+                status = "ok" if http_status < 400 else (
+                    "denied" if http_status in (401, 403) else "error"
                 )
-            )
-            _request_metadata.reset(token)
-            body_parts.clear()
-            buffered_messages.clear()
+                self.writer(
+                    McpLogEvent(
+                        tenant_id=_tenant_id(),
+                        category="protocol",
+                        event_name=event_name,
+                        result_status=status,
+                        error_code=str(http_status) if http_status >= 400 else "",
+                        cost_ms=cost_ms,
+                        request_id=request_id,
+                        client_ip=metadata["client_ip"],
+                        http_method=metadata["http_method"],
+                        http_status=http_status,
+                    )
+                )
+            except Exception as exc:
+                logger.warning(
+                    "MCP protocol audit failed: %s",
+                    type(exc).__name__,
+                )
+            finally:
+                try:
+                    _request_metadata.reset(token)
+                finally:
+                    body_parts.clear()
