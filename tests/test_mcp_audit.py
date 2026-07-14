@@ -28,6 +28,16 @@ from app.mcp_log_models import McpLogEvent
         ("postgresql+psycopg://root:driver-secret@db/gateway", "driver-secret"),
         ("db_password=db-secret", "db-secret"),
         ({"Database-Password": "quoted-secret"}, "quoted-secret"),
+        ("corp_secret=corp-value-1", "corp-value-1"),
+        ("CorpSecret : corp-value-2", "corp-value-2"),
+        ("corp secret = corp-value-3", "corp-value-3"),
+        ({"CORP-SECRET": "corp-value-4"}, "corp-value-4"),
+        ("api_key=api-value-1", "api-value-1"),
+        ("API KEY : api-value-2", "api-value-2"),
+        ("api-key = api-value-3", "api-value-3"),
+        ({"ApiKey": "api-value-4"}, "api-value-4"),
+        ("dsn=opaque-value-1", "opaque-value-1"),
+        ({"DSN": "opaque-value-2"}, "opaque-value-2"),
         ({"Authorization": "Bearer abc", "mcp_token": "token-value"}, "token-value"),
     ],
 )
@@ -36,6 +46,16 @@ def test_safe_summary_redacts_sensitive_values_before_truncation(value, leaked):
 
     assert leaked not in summary
     assert len(summary) <= 512
+
+
+def test_safe_summary_redacts_new_sensitive_keys_before_length_truncation():
+    summary = mcp_audit.safe_summary(
+        "x" * 32 + " api_key=api-value-before-truncation",
+        48,
+    )
+
+    assert "api-value" not in summary
+    assert len(summary) <= 48
 
 
 def test_write_event_swallows_storage_failure_and_logs_only_exception_type(

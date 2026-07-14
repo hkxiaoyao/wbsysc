@@ -34,6 +34,7 @@ _SENSITIVE_KEY_RE = re.compile(
     r"(?ix)"
     r"([\"']?\b(?:"
     r"mcp[\s_-]*token|access[\s_-]*token|refresh[\s_-]*token|token|"
+    r"corp[\s_-]*secret|api[\s_-]*key|dsn|"
     r"client[\s_-]*secret|contact[\s_-]*secret|secret|"
     r"db[\s_-]*password|database[\s_-]*password|password|passwd|pwd|"
     r"database[\s_-]*url"
