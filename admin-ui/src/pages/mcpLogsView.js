@@ -33,6 +33,10 @@ function normalizeText(value) {
   return String(value ?? '').trim()
 }
 
+export function normalizeLogKeyword(value) {
+  return [...normalizeText(value)].slice(0, 100).join('')
+}
+
 function normalizeEnum(value, allowedValues) {
   const normalized = normalizeText(value)
   return allowedValues.has(normalized) ? normalized : ''
@@ -81,7 +85,7 @@ function filterQuery(filters = DEFAULT_LOG_FILTERS) {
   const category = normalizeEnum(filters?.category, CATEGORY_VALUES)
   const eventName = normalizeText(filters?.eventName)
   const status = normalizeEnum(filters?.status, STATUS_VALUES)
-  const keyword = normalizeText(filters?.keyword)
+  const keyword = normalizeLogKeyword(filters?.keyword)
   const requestId = normalizeText(filters?.requestId)
   const clientIp = normalizeText(filters?.clientIp)
   const range = normalizeRange(filters?.from, filters?.to)
@@ -151,7 +155,7 @@ export function parseLogLocation(search = '') {
     status: normalizeEnum(params.get('status'), STATUS_VALUES),
     from: range.from,
     to: range.to,
-    keyword: normalizeText(params.get('q')),
+    keyword: normalizeLogKeyword(params.get('q')),
     requestId: normalizeText(params.get('request_id')),
     clientIp: normalizeText(params.get('client_ip')),
     costMin: costs.costMin,

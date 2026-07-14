@@ -227,9 +227,17 @@
   display: flex;
   align-items: flex-end;
   gap: clamp(4px, 1vw, 10px);
-  overflow: hidden;
+  overflow-x: auto;
+  overflow-y: hidden;
   height: 170px;
-  padding-top: 20px;
+  padding: 20px 0 6px;
+  scrollbar-gutter: stable;
+  scrollbar-width: thin;
+}
+
+.mcp-trend:focus-visible {
+  outline: 2px solid var(--mcp-signal);
+  outline-offset: 2px;
 }
 
 .mcp-trend__item {

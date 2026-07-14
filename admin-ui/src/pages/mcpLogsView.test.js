@@ -5,6 +5,7 @@ import {
   buildDeleteSpec,
   buildLogQuery,
   formatDuration,
+  normalizeLogKeyword,
   parseLogLocation,
   serializeLogFilters,
   statusMeta,
@@ -22,6 +23,12 @@ const EXPLICIT_FILTERS = Object.freeze({
   clientIp: '203.0.113.8',
   costMin: 25,
   costMax: 2500,
+})
+
+test('normalizeLogKeyword trims and caps API keywords at 100 Unicode characters', () => {
+  assert.equal(normalizeLogKeyword('  quarterly report  '), 'quarterly report')
+  assert.equal(normalizeLogKeyword('x'.repeat(101)), 'x'.repeat(100))
+  assert.equal([...normalizeLogKeyword('😀'.repeat(101))].length, 100)
 })
 
 test('parseLogLocation restores tenant and defaults to the last 24 hours', () => {

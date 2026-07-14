@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
+import { useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState } from 'react'
 import {
   Alert,
   Button,
@@ -36,6 +36,7 @@ import {
   buildDeleteSpec,
   buildLogQuery,
   formatDuration,
+  normalizeLogKeyword,
   parseLogLocation,
   serializeLogFilters,
   statusMeta,
@@ -169,7 +170,12 @@ function TrendPanel({ items }) {
   const maximum = Math.max(1, ...items.map((item) => Number(item.count) || 0))
   if (!items.length) return <Empty image={Empty.PRESENTED_IMAGE_SIMPLE} description="暂无趋势数据" />
   return (
-    <div className="mcp-trend" role="img" aria-label="调用量时间趋势">
+    <div
+      className="mcp-trend"
+      role="region"
+      tabIndex={0}
+      aria-label={`调用量时间趋势，共 ${items.length} 个时间点，可横向滚动`}
+    >
       {items.map((item, index) => {
         const count = Number(item.count) || 0
         return (
@@ -286,7 +292,7 @@ export default function McpLogs({ filters, onFiltersChange = () => {} }) {
   const [beforeDate, setBeforeDate] = useState(null)
   const [cleanupLoading, setCleanupLoading] = useState(false)
   const [tenantOptions, setTenantOptions] = useState([])
-  const [keywordDraft, setKeywordDraft] = useState(activeFilters.keyword || '')
+  const [keywordDraft, setKeywordDraft] = useState(normalizeLogKeyword(activeFilters.keyword))
   const [reloadNonce, setReloadNonce] = useState(0)
   const [moreForm] = Form.useForm()
   const [modal, modalContextHolder] = Modal.useModal()
@@ -298,13 +304,12 @@ export default function McpLogs({ filters, onFiltersChange = () => {} }) {
   const filterSignature = useMemo(() => serializeLogFilters(activeFilters), [activeFilters])
 
   const rangePresets = useMemo(() => {
-    const now = dayjs()
     return [
-      { label: '最近 1 小时', value: [now.subtract(1, 'hour'), now] },
-      { label: '最近 24 小时', value: [now.subtract(24, 'hour'), now] },
-      { label: '最近 7 天', value: [now.subtract(7, 'day'), now] },
-      { label: '最近 30 天', value: [now.subtract(30, 'day'), now] },
-      { label: '最近 90 天', value: [now.subtract(90, 'day'), now] },
+      { label: '最近 1 小时', value: [() => dayjs().subtract(1, 'hour'), () => dayjs()] },
+      { label: '最近 24 小时', value: [() => dayjs().subtract(24, 'hour'), () => dayjs()] },
+      { label: '最近 7 天', value: [() => dayjs().subtract(7, 'day'), () => dayjs()] },
+      { label: '最近 30 天', value: [() => dayjs().subtract(30, 'day'), () => dayjs()] },
+      { label: '最近 90 天', value: [() => dayjs().subtract(90, 'day'), () => dayjs()] },
     ]
   }, [])
 
@@ -317,8 +322,16 @@ export default function McpLogs({ filters, onFiltersChange = () => {} }) {
     onFiltersChange(next)
   }, [activeFilters, onFiltersChange])
 
-  useEffect(() => {
-    setKeywordDraft(activeFilters.keyword || '')
+  useLayoutEffect(() => {
+    listRequest.current += 1
+    statsRequest.current += 1
+    setItems([])
+    setTotal(0)
+    setStats(null)
+    setDetailRecord(null)
+    setLogsError('')
+    setStatsError('')
+    setKeywordDraft(normalizeLogKeyword(activeFilters.keyword))
     setPage(1)
     setSelectedRowKeys([])
   }, [filterSignature])
@@ -469,6 +482,7 @@ export default function McpLogs({ filters, onFiltersChange = () => {} }) {
         data: { ...spec, confirm_token: preview.confirm_token },
       })
       setSelectedRowKeys([])
+      setPage(1)
       messageApi.success(`已清理 ${Number(response.data?.deleted) || 0} 条日志`)
       reloadData()
     } catch (error) {
@@ -703,11 +717,12 @@ export default function McpLogs({ filters, onFiltersChange = () => {} }) {
           <Input.Search
             allowClear
             enterButton={<SearchOutlined />}
+            maxLength={100}
             aria-label="日志关键词"
             placeholder="搜索事件、目标或安全摘要"
             value={keywordDraft}
             onChange={(event) => setKeywordDraft(event.target.value)}
-            onSearch={(keyword) => updateFilters({ keyword: keyword.trim() })}
+            onSearch={(keyword) => updateFilters({ keyword: normalizeLogKeyword(keyword) })}
           />
           <Button icon={<FilterOutlined />} onClick={openMoreFilters}>
             更多筛选{moreFilterCount ? ` · ${moreFilterCount}` : ''}
@@ -776,6 +791,7 @@ export default function McpLogs({ filters, onFiltersChange = () => {} }) {
           scroll={{ x: compactTable ? 520 : 1120 }}
           onRow={(record) => ({
             tabIndex: 0,
+            'aria-label': `查看日志 #${record.id} ${record.event_name || ''}`,
             className: 'mcp-log-row',
             onClick: (event) => {
               if (event.target.closest('button, a, input, .ant-checkbox-wrapper')) return
