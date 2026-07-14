@@ -121,22 +121,25 @@ def _ok(data) -> str:
 
 
 def _audit(tool, target, params, status, cost):
-    ctx = current_ctx()
-    metadata = current_request_metadata()
-    write_event(
-        McpLogEvent(
-            tenant_id=ctx.tenant_id,
-            category="tool",
-            event_name=safe_summary(tool, 96),
-            target=safe_summary(target, 256),
-            params_summary=safe_summary(params, 512),
-            result_status=status,
-            cost_ms=max(0, int(cost)),
-            request_id=metadata.get("request_id", ""),
-            client_ip=metadata.get("client_ip", ""),
-            http_method=metadata.get("http_method", ""),
+    try:
+        ctx = current_ctx()
+        metadata = current_request_metadata()
+        write_event(
+            McpLogEvent(
+                tenant_id=ctx.tenant_id,
+                category="tool",
+                event_name=safe_summary(tool, 96),
+                target=safe_summary(target, 256),
+                params_summary=safe_summary(params, 512),
+                result_status=status,
+                cost_ms=max(0, int(cost)),
+                request_id=metadata.get("request_id", ""),
+                client_ip=metadata.get("client_ip", ""),
+                http_method=metadata.get("http_method", ""),
+            )
         )
-    )
+    except Exception as exc:
+        logger.warning("MCP tool audit failed type=%s", type(exc).__name__)
 
 
 def _run_mock(tool, target, params, started_at, result):

@@ -26,7 +26,7 @@ from starlette.middleware.cors import CORSMiddleware
 from . import db
 from .auth import BearerTokenMiddleware
 from .config import get_settings
-from .mcp_audit import McpProtocolAuditMiddleware
+from .mcp_audit import McpProtocolAuditMiddleware, shutdown_audit_writer
 from .mcp_server import mcp
 from .admin import router as admin_router
 from .mcp_logs_admin import router as mcp_logs_admin_router
@@ -201,6 +201,15 @@ async def lifespan(app):
         finally:
             _scheduler.shutdown(wait=False)
             logger.info("同步调度已停止")
+            try:
+                flushed = await asyncio.to_thread(shutdown_audit_writer, 2.0)
+                if not flushed:
+                    logger.warning("MCP audit shutdown incomplete type=TimeoutError")
+            except Exception as exc:
+                logger.warning(
+                    "MCP audit shutdown failed type=%s",
+                    type(exc).__name__,
+                )
 
 
 app = create_app()

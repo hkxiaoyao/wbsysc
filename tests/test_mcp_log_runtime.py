@@ -62,6 +62,8 @@ def test_lifespan_schedules_daily_cleanup_without_running_it_immediately(monkeyp
     events: list[str] = []
     scheduled_jobs: list[tuple[object, object, dict]] = []
     immediately_started: list[str] = []
+    shutdown_threads: list[int] = []
+    event_loop_thread = threading.get_ident()
 
     class FakeSessionManager:
         @contextlib.asynccontextmanager
@@ -112,6 +114,14 @@ def test_lifespan_schedules_daily_cleanup_without_running_it_immediately(monkeyp
     )
     monkeypatch.setattr(main, "AsyncIOScheduler", FakeScheduler)
     monkeypatch.setattr(main.asyncio, "create_task", fake_create_task)
+    monkeypatch.setattr(
+        main,
+        "shutdown_audit_writer",
+        lambda timeout: (
+            shutdown_threads.append(threading.get_ident()),
+            events.append("audit_shutdown"),
+        ),
+    )
 
     async def exercise_lifespan():
         async with main.lifespan(SimpleNamespace()):
@@ -123,7 +133,9 @@ def test_lifespan_schedules_daily_cleanup_without_running_it_immediately(monkeyp
     assert events.index("session_enter") < events.index("scheduler_init")
     assert events.index("scheduler_init") < events.index("scheduler_start")
     assert events.index("scheduler_start") < events.index("application_running")
-    assert events[-2:] == ["scheduler_shutdown", "session_exit"]
+    assert events[-3:] == ["scheduler_shutdown", "audit_shutdown", "session_exit"]
+    assert shutdown_threads
+    assert shutdown_threads[0] != event_loop_thread
 
     jobs_by_id = {kwargs["id"]: (job, trigger, kwargs) for job, trigger, kwargs in scheduled_jobs}
     sync_job, sync_trigger, sync_options = jobs_by_id["wecom_sync"]

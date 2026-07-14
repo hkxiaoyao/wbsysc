@@ -1,5 +1,6 @@
 import asyncio
 import logging
+import threading
 
 import pytest
 
@@ -38,6 +39,14 @@ from app.mcp_log_models import McpLogEvent
         ({"ApiKey": "api-value-4"}, "api-value-4"),
         ("dsn=opaque-value-1", "opaque-value-1"),
         ({"DSN": "opaque-value-2"}, "opaque-value-2"),
+        ("private_key=private-value-1", "private-value-1"),
+        ("PRIVATE KEY : private-value-2", "private-value-2"),
+        ({"Private-Key": "private-value-3"}, "private-value-3"),
+        ("jwt=jwt-value-1", "jwt-value-1"),
+        ({"JWT": "jwt-value-2"}, "jwt-value-2"),
+        ("session=session-value-1", "session-value-1"),
+        ("session_id=session-value-2", "session-value-2"),
+        ({"Session-Id": "session-value-3"}, "session-value-3"),
         ({"Authorization": "Bearer abc", "mcp_token": "token-value"}, "token-value"),
     ],
 )
@@ -58,20 +67,115 @@ def test_safe_summary_redacts_new_sensitive_keys_before_length_truncation():
     assert len(summary) <= 48
 
 
-def test_write_event_swallows_storage_failure_and_logs_only_exception_type(
-    monkeypatch, caplog
-):
-    monkeypatch.setattr(
-        mcp_audit,
-        "insert_event",
-        lambda event: (_ for _ in ()).throw(RuntimeError("secret=db-secret")),
-    )
+def test_write_event_persists_only_on_background_worker(monkeypatch):
+    caller_thread = threading.get_ident()
+    inserted_threads = []
+    inserted = threading.Event()
+
+    def fake_insert(event):
+        inserted_threads.append(threading.get_ident())
+        inserted.set()
+
+    writer = mcp_audit.AuditEventWriter(insert=fake_insert, max_queue_size=2)
+    monkeypatch.setattr(mcp_audit, "_audit_writer", writer)
+    try:
+        assert mcp_audit.write_event(McpLogEvent()) is True
+        assert inserted.wait(1)
+        assert writer.flush(1) is True
+    finally:
+        writer.shutdown(1)
+
+    assert inserted_threads == [inserted_threads[0]]
+    assert inserted_threads[0] != caller_thread
+
+
+def test_write_event_swallows_queue_infrastructure_failure(monkeypatch, caplog):
+    class BrokenWriter:
+        def submit(self, event):
+            raise RuntimeError("secret=queue-infrastructure")
+
+    monkeypatch.setattr(mcp_audit, "_audit_writer", BrokenWriter())
 
     with caplog.at_level(logging.WARNING, logger="app.mcp_audit"):
-        mcp_audit.write_event(McpLogEvent())
+        assert mcp_audit.write_event(McpLogEvent()) is False
+
+    assert "RuntimeError" in caplog.text
+    assert "queue-infrastructure" not in caplog.text
+
+
+def test_audit_writer_queue_is_bounded_and_drop_warning_is_coalesced(caplog):
+    started = threading.Event()
+    release = threading.Event()
+
+    def blocking_insert(event):
+        started.set()
+        release.wait(2)
+
+    writer = mcp_audit.AuditEventWriter(
+        insert=blocking_insert,
+        max_queue_size=2,
+        warning_interval=60,
+    )
+    try:
+        assert writer.submit(McpLogEvent(event_name="first")) is True
+        assert started.wait(1)
+        assert writer.submit(McpLogEvent(event_name="second")) is True
+        assert writer.submit(McpLogEvent(event_name="third")) is True
+        with caplog.at_level(logging.WARNING, logger="app.mcp_audit"):
+            assert writer.submit(McpLogEvent(event_name="secret=drop-one")) is False
+            assert writer.submit(McpLogEvent(event_name="secret=drop-two")) is False
+
+        assert writer._queue.qsize() == 2
+        assert writer.dropped_count == 2
+        assert caplog.text.count("audit queue full") == 1
+        assert "drop-one" not in caplog.text
+        assert "drop-two" not in caplog.text
+    finally:
+        release.set()
+        writer.shutdown(1)
+
+
+def test_audit_worker_isolates_storage_failure_and_flush_is_bounded(caplog):
+    started = threading.Event()
+    release = threading.Event()
+
+    def failing_insert(event):
+        started.set()
+        release.wait(1)
+        raise RuntimeError("secret=db-secret")
+
+    writer = mcp_audit.AuditEventWriter(insert=failing_insert, max_queue_size=1)
+    try:
+        with caplog.at_level(logging.WARNING, logger="app.mcp_audit"):
+            assert writer.submit(McpLogEvent()) is True
+            assert started.wait(1)
+            assert writer.flush(0.01) is False
+            release.set()
+            assert writer.flush(1) is True
+    finally:
+        release.set()
+        writer.shutdown(1)
 
     assert "RuntimeError" in caplog.text
     assert "db-secret" not in caplog.text
+
+
+def test_session_metadata_values_are_preserved_without_key_value_context():
+    scope = {
+        "headers": [(b"mcp-session-id", b"opaque-session-value")],
+    }
+    metadata_summary = mcp_audit.safe_summary(
+        {
+            "request_id": "request-value",
+            "mcp_session_id": "mcp-session-value",
+        },
+        512,
+    )
+
+    assert mcp_audit._header(scope, b"mcp-session-id") == "opaque-session-value"
+    assert mcp_audit.safe_summary("opaque-session-value", 64) == "opaque-session-value"
+    assert "request-value" in metadata_summary
+    assert "mcp-session-value" in metadata_summary
 
 
 def test_auth_limiter_allows_sixty_per_minute_and_prunes_expired_buckets():

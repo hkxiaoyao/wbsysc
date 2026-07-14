@@ -382,17 +382,46 @@ def test_audit_failure_logs_warning_without_changing_tool_result(
     monkeypatch.setattr(
         mcp_server.data_access, "list_reports", lambda *values: expected
     )
-    monkeypatch.setattr(
-        mcp_audit,
-        "insert_event",
-        lambda *values: (_ for _ in ()).throw(RuntimeError("database unavailable")),
+    writer = mcp_audit.AuditEventWriter(
+        insert=lambda event: (_ for _ in ()).throw(
+            RuntimeError("secret=database unavailable")
+        ),
     )
+    monkeypatch.setattr(mcp_audit, "_audit_writer", writer)
 
-    with caplog.at_level("WARNING", logger="app.mcp_audit"):
-        result = json.loads(mcp_server.wecom_list_reports(1, 2, 10))
+    try:
+        with caplog.at_level("WARNING", logger="app.mcp_audit"):
+            result = json.loads(mcp_server.wecom_list_reports(1, 2, 10))
+            assert writer.flush(1) is True
+    finally:
+        writer.shutdown(1)
 
     assert result == expected
-    assert "MCP audit storage failed: RuntimeError" in caplog.text
+    assert "RuntimeError" in caplog.text
+    assert "database unavailable" not in caplog.text
+
+
+@pytest.mark.parametrize(
+    "failure_point",
+    ["current_ctx", "current_request_metadata", "McpLogEvent", "write_event"],
+)
+def test_tool_audit_instrumentation_failure_never_changes_mock_result(
+    monkeypatch, use_tenant_ctx, caplog, failure_point
+):
+    use_tenant_ctx("stored")
+    monkeypatch.setattr(mcp_server, "_use_mock", lambda: True)
+
+    def fail(*args, **kwargs):
+        raise RuntimeError("secret=audit-instrumentation")
+
+    monkeypatch.setattr(mcp_server, failure_point, fail)
+
+    with caplog.at_level("WARNING", logger="app.mcp_server"):
+        result = json.loads(mcp_server.wecom_list_reports(1, 2, 10))
+
+    assert result["source"] == "mock"
+    assert "RuntimeError" in caplog.text
+    assert "audit-instrumentation" not in caplog.text
 
 
 def test_mock_tool_audit_redacts_sensitive_target(monkeypatch, use_tenant_ctx):

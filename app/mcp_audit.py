@@ -5,6 +5,7 @@ import contextvars
 import ipaddress
 import json
 import logging
+import queue
 import re
 import threading
 import time
@@ -35,6 +36,7 @@ _SENSITIVE_KEY_RE = re.compile(
     r"([\"']?\b(?:"
     r"mcp[\s_-]*token|access[\s_-]*token|refresh[\s_-]*token|token|"
     r"corp[\s_-]*secret|api[\s_-]*key|dsn|"
+    r"private[\s_-]*key|jwt|session(?:[\s_-]*id)?|"
     r"client[\s_-]*secret|contact[\s_-]*secret|secret|"
     r"db[\s_-]*password|database[\s_-]*password|password|passwd|pwd|"
     r"database[\s_-]*url"
@@ -69,12 +71,159 @@ def safe_summary(value: Any, limit: int) -> str:
     return text[:limit]
 
 
-def write_event(event: McpLogEvent) -> None:
-    """Persist an event without allowing audit storage to affect requests."""
+class AuditEventWriter:
+    """Bounded single-worker queue isolating audit persistence from requests."""
+
+    def __init__(
+        self,
+        *,
+        insert: Callable[[McpLogEvent], None] | None = None,
+        max_queue_size: int = 2048,
+        warning_interval: float = 60.0,
+        clock: Callable[[], float] = time.monotonic,
+    ) -> None:
+        self._insert = insert
+        self._queue: queue.Queue[McpLogEvent] = queue.Queue(
+            maxsize=max(1, int(max_queue_size))
+        )
+        self._warning_interval = max(0.0, float(warning_interval))
+        self._clock = clock
+        self._state_lock = threading.Lock()
+        self._pending_condition = threading.Condition()
+        self._pending = 0
+        self._thread: threading.Thread | None = None
+        self._stop_requested = threading.Event()
+        self._accepting = True
+        self._dropped_count = 0
+        self._unreported_drops = 0
+        self._last_drop_warning: float | None = None
+
+    @property
+    def dropped_count(self) -> int:
+        with self._state_lock:
+            return self._dropped_count
+
+    def _ensure_worker_locked(self) -> None:
+        if self._thread is not None and self._thread.is_alive():
+            return
+        self._thread = threading.Thread(
+            target=self._run,
+            name="mcp-audit-writer",
+            daemon=True,
+        )
+        self._thread.start()
+
+    def _record_drop_locked(self, reason_type: str) -> None:
+        self._dropped_count += 1
+        self._unreported_drops += 1
+        now = self._clock()
+        should_warn = (
+            self._last_drop_warning is None
+            or now - self._last_drop_warning >= self._warning_interval
+        )
+        if not should_warn:
+            return
+        count = self._unreported_drops
+        self._unreported_drops = 0
+        self._last_drop_warning = now
+        logger.warning(
+            "MCP audit queue full type=%s dropped_count=%s",
+            reason_type,
+            count,
+        )
+
+    def submit(self, event: McpLogEvent) -> bool:
+        """Queue one event without blocking the caller."""
+        with self._state_lock:
+            if not self._accepting:
+                self._record_drop_locked("WriterClosed")
+                return False
+            try:
+                self._ensure_worker_locked()
+            except Exception as exc:
+                self._record_drop_locked(type(exc).__name__)
+                return False
+
+            with self._pending_condition:
+                self._pending += 1
+            try:
+                self._queue.put_nowait(event)
+                return True
+            except queue.Full:
+                with self._pending_condition:
+                    self._pending -= 1
+                    self._pending_condition.notify_all()
+                self._record_drop_locked("Full")
+                return False
+
+    def _run(self) -> None:
+        while True:
+            try:
+                event = self._queue.get(timeout=0.1)
+            except queue.Empty:
+                if self._stop_requested.is_set():
+                    return
+                continue
+
+            try:
+                operation = insert_event if self._insert is None else self._insert
+                operation(event)
+            except Exception as exc:
+                logger.warning(
+                    "MCP audit storage failed type=%s",
+                    type(exc).__name__,
+                )
+            finally:
+                self._queue.task_done()
+                with self._pending_condition:
+                    self._pending -= 1
+                    self._pending_condition.notify_all()
+            if self._stop_requested.is_set() and self._queue.empty():
+                return
+
+    def flush(self, timeout: float = 2.0) -> bool:
+        """Wait up to timeout seconds for queued and active writes to finish."""
+        deadline = time.monotonic() + max(0.0, float(timeout))
+        with self._pending_condition:
+            while self._pending:
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    return False
+                self._pending_condition.wait(remaining)
+        return True
+
+    def shutdown(self, timeout: float = 2.0) -> bool:
+        """Stop accepting events and perform a bounded best-effort flush."""
+        deadline = time.monotonic() + max(0.0, float(timeout))
+        with self._state_lock:
+            self._accepting = False
+            self._stop_requested.set()
+            thread = self._thread
+
+        flushed = self.flush(max(0.0, deadline - time.monotonic()))
+        if thread is not None:
+            thread.join(max(0.0, deadline - time.monotonic()))
+        return flushed and (thread is None or not thread.is_alive())
+
+
+_audit_writer = AuditEventWriter()
+
+
+def write_event(event: McpLogEvent) -> bool:
+    """Queue an event without blocking or touching storage on the caller thread."""
     try:
-        insert_event(event)
+        return _audit_writer.submit(event)
     except Exception as exc:
-        logger.warning("MCP audit storage failed: %s", type(exc).__name__)
+        logger.warning(
+            "MCP audit queue submission failed type=%s",
+            type(exc).__name__,
+        )
+        return False
+
+
+def shutdown_audit_writer(timeout: float = 2.0) -> bool:
+    """Perform a bounded process-lifetime shutdown of the audit worker."""
+    return _audit_writer.shutdown(timeout)
 
 
 def _normalized_ip(value: Any) -> str:
