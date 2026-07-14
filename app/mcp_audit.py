@@ -216,13 +216,17 @@ class AuditEventWriter:
                 self._pending_condition.wait(remaining)
         return True
 
-    def shutdown(self, timeout: float = 2.0) -> bool:
-        """Stop accepting events and perform a bounded best-effort flush."""
-        deadline = time.monotonic() + max(0.0, float(timeout))
+    def _begin_shutdown(self) -> threading.Thread | None:
+        """Atomically stop accepting new events without waiting for storage."""
         with self._state_lock:
             self._accepting = False
             self._stop_requested.set()
-            thread = self._thread
+            return self._thread
+
+    def shutdown(self, timeout: float = 2.0) -> bool:
+        """Stop accepting events and perform a bounded best-effort flush."""
+        deadline = time.monotonic() + max(0.0, float(timeout))
+        thread = self._begin_shutdown()
 
         flushed = self.flush(max(0.0, deadline - time.monotonic()))
         if thread is not None:
@@ -257,7 +261,9 @@ def release_audit_writer(timeout: float = 2.0) -> bool:
         _audit_writer_refcount -= 1
         if _audit_writer_refcount:
             return True
-        return _audit_writer.shutdown(timeout)
+        writer = _audit_writer
+        writer._begin_shutdown()
+    return writer.shutdown(timeout)
 
 
 def write_event(event: McpLogEvent) -> bool:
@@ -269,11 +275,13 @@ def write_event(event: McpLogEvent) -> bool:
 
 
 def shutdown_audit_writer(timeout: float = 2.0) -> bool:
-    """Perform a bounded process-lifetime shutdown of the audit worker."""
+    """Force a bounded process-lifetime shutdown, regardless of active leases."""
     global _audit_writer_refcount
     with _audit_writer_lifecycle_lock:
         _audit_writer_refcount = 0
-        return _audit_writer.shutdown(timeout)
+        writer = _audit_writer
+        writer._begin_shutdown()
+    return writer.shutdown(timeout)
 
 
 def _normalized_ip(value: Any) -> str:
@@ -383,6 +391,8 @@ def request_id_from_scope(scope: dict[str, Any]) -> str:
         return request_id
     for key, value in scope.get("headers", ()):
         if key.lower() == b"mcp-session-id":
+            if not value:
+                return ""
             digest = hashlib.sha256(bytes(value)).hexdigest()[:32]
             return f"sha256:{digest}"
     return ""

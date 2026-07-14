@@ -1,6 +1,7 @@
 import asyncio
 import logging
 import threading
+import time
 
 import pytest
 
@@ -164,6 +165,43 @@ def test_audit_writer_lifecycle_refcounts_and_restarts_after_final_release(monke
         mcp_audit.release_audit_writer(1)
 
 
+def test_final_release_does_not_hold_lifecycle_lock_while_storage_drains(monkeypatch):
+    started = threading.Event()
+    release = threading.Event()
+
+    def blocking_insert(event):
+        started.set()
+        release.wait(2)
+
+    initial_writer = mcp_audit.AuditEventWriter(insert=blocking_insert)
+    monkeypatch.setattr(mcp_audit, "_audit_writer", initial_writer)
+    monkeypatch.setattr(mcp_audit, "_audit_writer_refcount", 0)
+    assert mcp_audit.acquire_audit_writer() is initial_writer
+    assert mcp_audit.write_event(McpLogEvent(event_name="blocking")) is True
+    assert started.wait(1)
+
+    release_result = []
+    release_thread = threading.Thread(
+        target=lambda: release_result.append(mcp_audit.release_audit_writer(1))
+    )
+    release_thread.start()
+    try:
+        deadline = time.monotonic() + 1
+        while initial_writer._accepting and time.monotonic() < deadline:
+            time.sleep(0.01)
+
+        started_at = time.monotonic()
+        replacement = mcp_audit.acquire_audit_writer()
+        assert time.monotonic() - started_at < 0.25
+        assert replacement is not initial_writer
+    finally:
+        release.set()
+        release_thread.join(2)
+        mcp_audit.release_audit_writer(1)
+
+    assert release_result == [True]
+
+
 def test_write_event_swallows_queue_infrastructure_failure(monkeypatch, caplog):
     class BrokenWriter:
         def submit(self, event):
@@ -264,6 +302,9 @@ def test_request_id_from_scope_preserves_request_id_and_hashes_session_fallback(
     assert session_request_id.startswith("sha256:")
     assert len(session_request_id) == 39
     assert "opaque-session-value" not in session_request_id
+    assert mcp_audit.request_id_from_scope(
+        {"headers": [(b"mcp-session-id", b"")]}
+    ) == ""
     assert "request-value" in metadata_summary
     assert "mcp-session-value" in metadata_summary
 

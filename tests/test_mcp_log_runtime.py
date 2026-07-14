@@ -3,6 +3,7 @@ import contextlib
 import threading
 from types import SimpleNamespace
 
+import pytest
 from apscheduler.triggers.cron import CronTrigger
 from apscheduler.triggers.interval import IntervalTrigger
 
@@ -137,7 +138,7 @@ def test_lifespan_schedules_daily_cleanup_without_running_it_immediately(monkeyp
     assert events.index("session_enter") < events.index("scheduler_init")
     assert events.index("scheduler_init") < events.index("scheduler_start")
     assert events.index("scheduler_start") < events.index("application_running")
-    assert events[-3:] == ["scheduler_shutdown", "audit_shutdown", "session_exit"]
+    assert events[-3:] == ["scheduler_shutdown", "session_exit", "audit_shutdown"]
     assert shutdown_threads
     assert shutdown_threads[0] != event_loop_thread
 
@@ -227,3 +228,43 @@ def test_real_lifespans_share_then_restart_the_audit_writer(monkeypatch):
         await third_lifespan.__aexit__(None, None, None)
 
     asyncio.run(exercise_lifespans())
+
+
+def test_lifespan_retries_audit_release_after_thread_dispatch_failure(monkeypatch):
+    events: list[str] = []
+
+    class FailingSessionManager:
+        @contextlib.asynccontextmanager
+        async def run(self):
+            events.append("session_enter_failed")
+            raise RuntimeError("session startup failed")
+            yield
+
+    attempts = 0
+
+    async def flaky_to_thread(operation, *args):
+        nonlocal attempts
+        attempts += 1
+        if attempts == 1:
+            raise RuntimeError("executor unavailable")
+        return operation(*args)
+
+    monkeypatch.setattr(main.db, "run_startup_migrations", lambda: None)
+    monkeypatch.setattr(main, "mcp", SimpleNamespace(session_manager=FailingSessionManager()))
+    monkeypatch.setattr(main, "acquire_audit_writer", lambda: events.append("audit_start"))
+    monkeypatch.setattr(
+        main,
+        "release_audit_writer",
+        lambda timeout: events.append("audit_release") or True,
+    )
+    monkeypatch.setattr(main.asyncio, "to_thread", flaky_to_thread)
+
+    async def exercise():
+        with pytest.raises(RuntimeError, match="session startup failed"):
+            async with main.lifespan(SimpleNamespace()):
+                pass
+
+    asyncio.run(exercise())
+
+    assert attempts == 2
+    assert events == ["audit_start", "session_enter_failed", "audit_release"]

@@ -175,16 +175,18 @@ async def lifespan(app):
         nonlocal audit_released
         if audit_released or not audit_acquired:
             return
-        audit_released = True
-        try:
-            flushed = await asyncio.to_thread(release_audit_writer, 2.0)
-            if not flushed:
-                logger.warning("MCP audit shutdown incomplete type=TimeoutError")
-        except Exception as exc:
-            logger.warning(
-                "MCP audit shutdown failed type=%s",
-                type(exc).__name__,
-            )
+        for _attempt in range(2):
+            try:
+                flushed = await asyncio.to_thread(release_audit_writer, 2.0)
+                audit_released = True
+                if not flushed:
+                    logger.warning("MCP audit shutdown incomplete type=TimeoutError")
+                return
+            except Exception as exc:
+                logger.warning(
+                    "MCP audit shutdown failed type=%s",
+                    type(exc).__name__,
+                )
 
     # 2. MCP 会话管理器
     try:
@@ -228,7 +230,6 @@ async def lifespan(app):
                     logger.info("同步调度已停止")
                     if _scheduler is scheduler:
                         _scheduler = None
-                await release_audit_once()
     finally:
         await release_audit_once()
 
