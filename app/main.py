@@ -17,6 +17,7 @@ import logging
 
 import uvicorn
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
+from apscheduler.triggers.cron import CronTrigger
 from apscheduler.triggers.interval import IntervalTrigger
 from fastapi import FastAPI
 from starlette.middleware import Middleware
@@ -25,8 +26,10 @@ from starlette.middleware.cors import CORSMiddleware
 from . import db
 from .auth import BearerTokenMiddleware
 from .config import get_settings
+from .mcp_audit import McpProtocolAuditMiddleware
 from .mcp_server import mcp
 from .admin import router as admin_router
+from .mcp_logs_admin import router as mcp_logs_admin_router
 
 logging.basicConfig(
     level=logging.INFO,
@@ -52,6 +55,7 @@ def create_app() -> FastAPI:
 
     # 管理后台 API（独立路由，不经 MCP 鉴权，自带 session 校验）
     app.include_router(admin_router)
+    app.include_router(mcp_logs_admin_router)
 
     # 健康检查（鉴权白名单）
     @app.get("/health")
@@ -108,6 +112,7 @@ def create_app() -> FastAPI:
         routes=[Mount("/", app=mcp_app)],
         middleware=[
             Middleware(BearerTokenMiddleware),
+            Middleware(McpProtocolAuditMiddleware),
             Middleware(
                 CORSMiddleware,
                 allow_origins=["*"],
@@ -140,6 +145,17 @@ async def _sync_job_async():
         logger.error("同步任务异常: %s", e)
 
 
+async def _cleanup_logs_job_async():
+    """在线程池执行 MCP 日志保留清理，避免阻塞事件循环。"""
+    from .mcp_log_store import cleanup_expired_logs
+
+    loop = asyncio.get_running_loop()
+    try:
+        await loop.run_in_executor(None, cleanup_expired_logs)
+    except Exception as exc:  # noqa: BLE001
+        logger.error("MCP 日志清理异常 type=%s", type(exc).__name__)
+
+
 @contextlib.asynccontextmanager
 async def lifespan(app):
     global _scheduler
@@ -163,6 +179,13 @@ async def lifespan(app):
             _sync_job_async,
             IntervalTrigger(minutes=min_interval),
             id="wecom_sync",
+            max_instances=1,
+            coalesce=True,
+        )
+        _scheduler.add_job(
+            _cleanup_logs_job_async,
+            CronTrigger(hour=3, minute=17, timezone="Asia/Shanghai"),
+            id="mcp_log_cleanup",
             max_instances=1,
             coalesce=True,
         )
