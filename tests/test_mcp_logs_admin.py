@@ -389,6 +389,7 @@ def test_malformed_delete_count_returns_generic_service_error(
         ("exp", True),
         ("exp", "300"),
         ("exp", math.inf),
+        ("exp", 10**400),
         ("max_id", True),
         ("count", True),
     ],
