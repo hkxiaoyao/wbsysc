@@ -352,6 +352,45 @@ def test_legacy_migration_existing_marker_skips_tenant_scan(monkeypatch):
     assert "tenant_config" not in marker_sql
 
 
+def test_legacy_migration_noncompleted_marker_is_retried_and_overwritten(monkeypatch):
+    tenant_created_at = datetime(2026, 6, 1, 0, 0)
+    connection = install_engine(
+        monkeypatch,
+        Result(scalar_value="started"),
+        Result(rows=[("tenant-real", "wbd_abc", tenant_created_at)]),
+        Result(),
+        Result(),
+    )
+
+    store.migrate_legacy_logs(days=90)
+
+    sql = "\n".join(statement for statement, _ in connection.statements)
+    assert "SELECT tenant_id, schema_name, created_at FROM tenant_config" in sql
+    assert "INSERT IGNORE INTO mcp_call_log" in sql
+    marker_params = next(
+        params
+        for statement, params in connection.statements
+        if "INSERT INTO gateway_setting" in statement
+    )
+    assert marker_params["setting_value"] == "completed"
+
+
+def test_legacy_migration_with_no_tenants_does_not_mark_completion(monkeypatch):
+    connection = install_engine(
+        monkeypatch,
+        Result(scalar_value=None),
+        Result(rows=[]),
+    )
+
+    store.migrate_legacy_logs(days=90)
+
+    assert len(connection.statements) == 2
+    assert all(
+        "INSERT INTO gateway_setting" not in statement
+        for statement, _ in connection.statements
+    )
+
+
 def test_legacy_migration_does_not_mark_completion_after_tenant_failure(monkeypatch):
     tenant_created_at = datetime(2026, 6, 1, 0, 0)
     connection = install_engine(
@@ -403,17 +442,42 @@ def test_legacy_migration_skips_rows_before_current_schema_owner(monkeypatch):
     assert params["tenant_created_at"] == tenant_created_at
 
 
-def test_legacy_migration_rejects_invalid_schema_before_interpolation(monkeypatch):
+def test_legacy_migration_invalid_schema_blocks_marker_until_config_is_fixed(
+    monkeypatch,
+):
+    tenant_created_at = datetime(2026, 1, 1)
     connection = install_engine(
         monkeypatch,
         Result(scalar_value=None),
-        Result(rows=[("tenant-real", "wbd_bad-name", datetime(2026, 1, 1))]),
+        Result(rows=[("tenant-real", "wbd_bad-name", tenant_created_at)]),
+        Result(scalar_value=None),
+        Result(rows=[("tenant-real", "wbd_fixed", tenant_created_at)]),
+        Result(),
         Result(),
     )
 
     store.migrate_legacy_logs()
+    store.migrate_legacy_logs()
 
-    assert any("INSERT INTO gateway_setting" in sql for sql, _ in connection.statements)
+    tenant_scans = [
+        statement
+        for statement, _ in connection.statements
+        if "FROM tenant_config" in statement
+    ]
+    migrations = [
+        statement
+        for statement, _ in connection.statements
+        if "INSERT IGNORE INTO mcp_call_log" in statement
+    ]
+    marker_writes = [
+        statement
+        for statement, _ in connection.statements
+        if "INSERT INTO gateway_setting" in statement
+    ]
+    assert len(tenant_scans) == 2
+    assert len(migrations) == 1
+    assert "`wbd_fixed`.`audit_log`" in migrations[0]
+    assert len(marker_writes) == 1
     assert all("wbd_bad-name" not in statement for statement, _ in connection.statements)
 
 

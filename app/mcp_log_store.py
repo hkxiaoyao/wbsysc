@@ -94,15 +94,18 @@ def migrate_legacy_logs(days: int = 90) -> None:
             ),
             {"setting_key": _LEGACY_MIGRATION_KEY},
         ).scalar()
-        if completed is not None:
+        if completed == _LEGACY_MIGRATION_VALUE:
             return
         tenants = conn.execute(
             text("SELECT tenant_id, schema_name, created_at FROM tenant_config")
         ).fetchall()
 
+    if not tenants:
+        return
     all_succeeded = True
     for tenant_id, schema_name, tenant_created_at in tenants:
         if not _valid_tenant_schema(schema_name):
+            all_succeeded = False
             logger.warning("Skipping invalid legacy audit schema for tenant_id=%s", tenant_id)
             continue
         statement = text(f"""
