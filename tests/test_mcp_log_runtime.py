@@ -6,7 +6,7 @@ from types import SimpleNamespace
 from apscheduler.triggers.cron import CronTrigger
 from apscheduler.triggers.interval import IntervalTrigger
 
-from app import main, mcp_log_store
+from app import main, mcp_audit, mcp_log_store
 from app.auth import BearerTokenMiddleware
 from app.mcp_audit import McpProtocolAuditMiddleware
 
@@ -114,13 +114,15 @@ def test_lifespan_schedules_daily_cleanup_without_running_it_immediately(monkeyp
     )
     monkeypatch.setattr(main, "AsyncIOScheduler", FakeScheduler)
     monkeypatch.setattr(main.asyncio, "create_task", fake_create_task)
+    monkeypatch.setattr(main, "acquire_audit_writer", lambda: events.append("audit_start"))
     monkeypatch.setattr(
         main,
-        "shutdown_audit_writer",
+        "release_audit_writer",
         lambda timeout: (
             shutdown_threads.append(threading.get_ident()),
             events.append("audit_shutdown"),
-        ),
+            True,
+        )[-1],
     )
 
     async def exercise_lifespan():
@@ -130,6 +132,8 @@ def test_lifespan_schedules_daily_cleanup_without_running_it_immediately(monkeyp
     asyncio.run(exercise_lifespan())
 
     assert events.index("migrations") < events.index("session_enter")
+    assert events.index("migrations") < events.index("audit_start")
+    assert events.index("audit_start") < events.index("session_enter")
     assert events.index("session_enter") < events.index("scheduler_init")
     assert events.index("scheduler_init") < events.index("scheduler_start")
     assert events.index("scheduler_start") < events.index("application_running")
@@ -155,3 +159,71 @@ def test_lifespan_schedules_daily_cleanup_without_running_it_immediately(monkeyp
     assert cleanup_options["coalesce"] is True
 
     assert immediately_started == ["_sync_job_async"]
+
+
+def test_real_lifespans_share_then_restart_the_audit_writer(monkeypatch):
+    class FakeSessionManager:
+        @contextlib.asynccontextmanager
+        async def run(self):
+            yield
+
+    class FakeScheduler:
+        def __init__(self, *, timezone):
+            self.running = False
+
+        def add_job(self, *args, **kwargs):
+            return None
+
+        def start(self):
+            self.running = True
+
+        def shutdown(self, *, wait):
+            self.running = False
+
+    def fake_create_task(coroutine):
+        coroutine.close()
+        return object()
+
+    initial_writer = mcp_audit.AuditEventWriter(insert=lambda event: None)
+    monkeypatch.setattr(mcp_audit, "_audit_writer", initial_writer)
+    monkeypatch.setattr(mcp_audit, "_audit_writer_refcount", 0)
+    monkeypatch.setattr(main, "acquire_audit_writer", mcp_audit.acquire_audit_writer)
+    monkeypatch.setattr(main, "release_audit_writer", mcp_audit.release_audit_writer)
+    monkeypatch.setattr(main.db, "run_startup_migrations", lambda: None)
+    monkeypatch.setattr(main, "mcp", SimpleNamespace(session_manager=FakeSessionManager()))
+    monkeypatch.setattr(main, "AsyncIOScheduler", FakeScheduler)
+    monkeypatch.setattr(main.asyncio, "create_task", fake_create_task)
+    monkeypatch.setattr(
+        main,
+        "get_settings",
+        lambda: SimpleNamespace(
+            sync_interval_report_min=15,
+            sync_interval_approval_min=30,
+        ),
+    )
+
+    async def exercise_lifespans():
+        first_lifespan = main.lifespan(SimpleNamespace())
+        second_lifespan = main.lifespan(SimpleNamespace())
+        await first_lifespan.__aenter__()
+        first_writer = mcp_audit._audit_writer
+        await second_lifespan.__aenter__()
+        assert mcp_audit._audit_writer is first_writer
+        assert mcp_audit._audit_writer_refcount == 2
+
+        await first_lifespan.__aexit__(None, None, None)
+        assert first_writer._thread is not None and first_writer._thread.is_alive()
+        assert mcp_audit._audit_writer_refcount == 1
+
+        await second_lifespan.__aexit__(None, None, None)
+        assert not first_writer._thread.is_alive()
+        assert mcp_audit._audit_writer_refcount == 0
+
+        third_lifespan = main.lifespan(SimpleNamespace())
+        await third_lifespan.__aenter__()
+        restarted_writer = mcp_audit._audit_writer
+        assert restarted_writer is not first_writer
+        assert restarted_writer._thread is not None and restarted_writer._thread.is_alive()
+        await third_lifespan.__aexit__(None, None, None)
+
+    asyncio.run(exercise_lifespans())

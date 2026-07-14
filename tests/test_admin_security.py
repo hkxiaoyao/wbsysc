@@ -74,6 +74,65 @@ def test_bearer_auth_success_emits_tenant_event_without_token(monkeypatch):
         assert sensitive not in repr(events[0])
 
 
+def test_auth_event_hashes_mcp_session_id_fallback(monkeypatch):
+    events = []
+    raw_session = "opaque-session-value"
+    request = SimpleNamespace(
+        scope={
+            "client": ("192.0.2.1", 1234),
+            "headers": [(b"mcp-session-id", raw_session.encode())],
+        },
+        headers={"mcp-session-id": raw_session},
+        method="POST",
+    )
+    monkeypatch.setattr(auth_module, "write_event", events.append)
+    monkeypatch.setattr(auth_module, "_auth_write_limiter", auth_module.AuthWriteLimiter())
+
+    auth_module._record_auth(request, "auth_invalid")
+
+    assert len(events) == 1
+    assert events[0].request_id.startswith("sha256:")
+    assert len(events[0].request_id) == 39
+    assert raw_session not in repr(events[0])
+
+
+@pytest.mark.parametrize(
+    "failure_point",
+    ["limiter", "request_id", "safe_summary", "event", "write_event"],
+)
+def test_auth_audit_failures_never_change_authentication_result(
+    monkeypatch, caplog, failure_point
+):
+    leaked = "secret=audit-failure"
+
+    def fail(*args, **kwargs):
+        raise RuntimeError(leaked)
+
+    if failure_point == "limiter":
+        monkeypatch.setattr(
+            auth_module,
+            "_auth_write_limiter",
+            SimpleNamespace(allow_with_notice=fail),
+        )
+    else:
+        monkeypatch.setattr(auth_module, "_auth_write_limiter", auth_module.AuthWriteLimiter())
+        target = {
+            "request_id": "request_id_from_scope",
+            "safe_summary": "safe_summary",
+            "event": "McpLogEvent",
+            "write_event": "write_event",
+        }[failure_point]
+        monkeypatch.setattr(auth_module, target, fail)
+
+    with caplog.at_level("WARNING", logger="app.auth"):
+        response = _auth_test_client().get("/secure")
+
+    assert response.status_code == 401
+    assert response.json() == {"errcode": 401, "errmsg": "缺少 Bearer Token"}
+    assert "RuntimeError" in caplog.text
+    assert leaked not in caplog.text
+
+
 def test_auth_rate_limit_warning_is_emitted_once_per_active_bucket(
     monkeypatch, caplog
 ):

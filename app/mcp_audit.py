@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import contextvars
+import hashlib
 import ipaddress
 import json
 import logging
@@ -96,12 +97,21 @@ class AuditEventWriter:
         self._accepting = True
         self._dropped_count = 0
         self._unreported_drops = 0
+        self._unreported_drop_type = "Full"
         self._last_drop_warning: float | None = None
 
     @property
     def dropped_count(self) -> int:
         with self._state_lock:
             return self._dropped_count
+
+    def start(self) -> bool:
+        """Start the worker eagerly when the application lifespan begins."""
+        with self._state_lock:
+            if not self._accepting:
+                return False
+            self._ensure_worker_locked()
+            return True
 
     def _ensure_worker_locked(self) -> None:
         if self._thread is not None and self._thread.is_alive():
@@ -116,21 +126,31 @@ class AuditEventWriter:
     def _record_drop_locked(self, reason_type: str) -> None:
         self._dropped_count += 1
         self._unreported_drops += 1
-        now = self._clock()
-        should_warn = (
-            self._last_drop_warning is None
-            or now - self._last_drop_warning >= self._warning_interval
-        )
-        if not should_warn:
+        self._unreported_drop_type = reason_type
+
+    def _emit_drop_warning(self, *, force: bool = False) -> None:
+        with self._state_lock:
+            if not self._unreported_drops:
+                return
+            now = self._clock()
+            if (
+                not force
+                and self._last_drop_warning is not None
+                and now - self._last_drop_warning < self._warning_interval
+            ):
+                return
+            count = self._unreported_drops
+            reason_type = self._unreported_drop_type
+            self._unreported_drops = 0
+            self._last_drop_warning = now
+        try:
+            logger.warning(
+                "MCP audit queue full type=%s dropped_count=%s",
+                reason_type,
+                count,
+            )
+        except Exception:
             return
-        count = self._unreported_drops
-        self._unreported_drops = 0
-        self._last_drop_warning = now
-        logger.warning(
-            "MCP audit queue full type=%s dropped_count=%s",
-            reason_type,
-            count,
-        )
 
     def submit(self, event: McpLogEvent) -> bool:
         """Queue one event without blocking the caller."""
@@ -157,29 +177,33 @@ class AuditEventWriter:
                 return False
 
     def _run(self) -> None:
-        while True:
-            try:
-                event = self._queue.get(timeout=0.1)
-            except queue.Empty:
-                if self._stop_requested.is_set():
-                    return
-                continue
+        try:
+            while True:
+                self._emit_drop_warning()
+                try:
+                    event = self._queue.get(timeout=0.1)
+                except queue.Empty:
+                    if self._stop_requested.is_set():
+                        return
+                    continue
 
-            try:
-                operation = insert_event if self._insert is None else self._insert
-                operation(event)
-            except Exception as exc:
-                logger.warning(
-                    "MCP audit storage failed type=%s",
-                    type(exc).__name__,
-                )
-            finally:
-                self._queue.task_done()
-                with self._pending_condition:
-                    self._pending -= 1
-                    self._pending_condition.notify_all()
-            if self._stop_requested.is_set() and self._queue.empty():
-                return
+                try:
+                    operation = insert_event if self._insert is None else self._insert
+                    operation(event)
+                except Exception as exc:
+                    logger.warning(
+                        "MCP audit storage failed type=%s",
+                        type(exc).__name__,
+                    )
+                finally:
+                    self._queue.task_done()
+                    with self._pending_condition:
+                        self._pending -= 1
+                        self._pending_condition.notify_all()
+                if self._stop_requested.is_set() and self._queue.empty():
+                    return
+        finally:
+            self._emit_drop_warning(force=True)
 
     def flush(self, timeout: float = 2.0) -> bool:
         """Wait up to timeout seconds for queued and active writes to finish."""
@@ -203,27 +227,53 @@ class AuditEventWriter:
         flushed = self.flush(max(0.0, deadline - time.monotonic()))
         if thread is not None:
             thread.join(max(0.0, deadline - time.monotonic()))
+        self._emit_drop_warning(force=True)
         return flushed and (thread is None or not thread.is_alive())
 
 
 _audit_writer = AuditEventWriter()
+_audit_writer_lifecycle_lock = threading.Lock()
+_audit_writer_refcount = 0
+
+
+def acquire_audit_writer() -> AuditEventWriter:
+    """Acquire one application-lifespan reference and eagerly start its worker."""
+    global _audit_writer, _audit_writer_refcount
+    with _audit_writer_lifecycle_lock:
+        if _audit_writer_refcount == 0:
+            if not _audit_writer.start():
+                _audit_writer = AuditEventWriter()
+                _audit_writer.start()
+        _audit_writer_refcount += 1
+        return _audit_writer
+
+
+def release_audit_writer(timeout: float = 2.0) -> bool:
+    """Release one lifespan reference, stopping only after the final release."""
+    global _audit_writer_refcount
+    with _audit_writer_lifecycle_lock:
+        if _audit_writer_refcount <= 0:
+            return True
+        _audit_writer_refcount -= 1
+        if _audit_writer_refcount:
+            return True
+        return _audit_writer.shutdown(timeout)
 
 
 def write_event(event: McpLogEvent) -> bool:
     """Queue an event without blocking or touching storage on the caller thread."""
     try:
         return _audit_writer.submit(event)
-    except Exception as exc:
-        logger.warning(
-            "MCP audit queue submission failed type=%s",
-            type(exc).__name__,
-        )
+    except Exception:
         return False
 
 
 def shutdown_audit_writer(timeout: float = 2.0) -> bool:
     """Perform a bounded process-lifetime shutdown of the audit worker."""
-    return _audit_writer.shutdown(timeout)
+    global _audit_writer_refcount
+    with _audit_writer_lifecycle_lock:
+        _audit_writer_refcount = 0
+        return _audit_writer.shutdown(timeout)
 
 
 def _normalized_ip(value: Any) -> str:
@@ -326,6 +376,18 @@ def _header(scope: dict[str, Any], name: bytes) -> str:
     return ""
 
 
+def request_id_from_scope(scope: dict[str, Any]) -> str:
+    """Prefer a request ID, hashing the MCP session fallback before storage."""
+    request_id = _header(scope, b"x-request-id")
+    if request_id:
+        return request_id
+    for key, value in scope.get("headers", ()):
+        if key.lower() == b"mcp-session-id":
+            digest = hashlib.sha256(bytes(value)).hexdigest()[:32]
+            return f"sha256:{digest}"
+    return ""
+
+
 def _tenant_id() -> str:
     try:
         from .auth import current_ctx
@@ -405,9 +467,7 @@ class McpProtocolAuditMiddleware:
                     http_status = 500
             await send(message)
 
-        request_id = _header(scope, b"x-request-id") or _header(
-            scope, b"mcp-session-id"
-        )
+        request_id = request_id_from_scope(scope)
         metadata = {
             "request_id": request_id,
             "client_ip": client_ip_from_scope(scope),

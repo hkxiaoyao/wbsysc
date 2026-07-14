@@ -16,7 +16,13 @@ from starlette.middleware.base import BaseHTTPMiddleware
 from starlette.requests import Request
 from starlette.responses import JSONResponse
 
-from .mcp_audit import AuthWriteLimiter, client_ip_from_scope, safe_summary, write_event
+from .mcp_audit import (
+    AuthWriteLimiter,
+    client_ip_from_scope,
+    request_id_from_scope,
+    safe_summary,
+    write_event,
+)
 from .mcp_log_models import McpLogEvent
 from .tenant import get_tenant_by_token, reload_tenants
 
@@ -55,34 +61,35 @@ def require_tenant() -> str:
 
 
 def _record_auth(request: Request, event_name: str, tenant_id: str = "") -> None:
-    client_ip = client_ip_from_scope(request.scope)
-    allowed, should_warn = _auth_write_limiter.allow_with_notice(
-        client_ip,
-        event_name,
-    )
-    if not allowed:
-        if should_warn:
-            logger.warning("MCP auth audit rate limit reached event=%s", event_name)
-        return
-    request_id = safe_summary(
-        request.headers.get("x-request-id")
-        or request.headers.get("mcp-session-id")
-        or "",
-        64,
-    )
-    write_event(
-        McpLogEvent(
-            tenant_id=tenant_id,
-            category="auth",
-            event_name=event_name,
-            result_status="ok" if event_name == "auth_ok" else "denied",
-            error_code="" if event_name == "auth_ok" else "401",
-            request_id=request_id,
-            client_ip=client_ip,
-            http_method=safe_summary(request.method, 16),
-            http_status=0 if event_name == "auth_ok" else 401,
+    try:
+        client_ip = client_ip_from_scope(request.scope)
+        allowed, should_warn = _auth_write_limiter.allow_with_notice(
+            client_ip,
+            event_name,
         )
-    )
+        if not allowed:
+            if should_warn:
+                logger.warning("MCP auth audit rate limit reached event=%s", event_name)
+            return
+        request_id = request_id_from_scope(request.scope)
+        write_event(
+            McpLogEvent(
+                tenant_id=tenant_id,
+                category="auth",
+                event_name=event_name,
+                result_status="ok" if event_name == "auth_ok" else "denied",
+                error_code="" if event_name == "auth_ok" else "401",
+                request_id=request_id,
+                client_ip=client_ip,
+                http_method=safe_summary(request.method, 16),
+                http_status=0 if event_name == "auth_ok" else 401,
+            )
+        )
+    except Exception as exc:
+        try:
+            logger.warning("MCP auth audit failed type=%s", type(exc).__name__)
+        except Exception:
+            pass
 
 
 class BearerTokenMiddleware(BaseHTTPMiddleware):

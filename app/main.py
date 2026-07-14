@@ -26,7 +26,11 @@ from starlette.middleware.cors import CORSMiddleware
 from . import db
 from .auth import BearerTokenMiddleware
 from .config import get_settings
-from .mcp_audit import McpProtocolAuditMiddleware, shutdown_audit_writer
+from .mcp_audit import (
+    McpProtocolAuditMiddleware,
+    acquire_audit_writer,
+    release_audit_writer,
+)
 from .mcp_server import mcp
 from .admin import router as admin_router
 from .mcp_logs_admin import router as mcp_logs_admin_router
@@ -163,53 +167,70 @@ async def lifespan(app):
 
     # 1. 启动迁移必须先于 MCP 会话、租户加载和调度器；失败直接阻止启动。
     db.run_startup_migrations()
+    acquire_audit_writer()
+    audit_acquired = True
+    audit_released = False
+
+    async def release_audit_once() -> None:
+        nonlocal audit_released
+        if audit_released or not audit_acquired:
+            return
+        audit_released = True
+        try:
+            flushed = await asyncio.to_thread(release_audit_writer, 2.0)
+            if not flushed:
+                logger.warning("MCP audit shutdown incomplete type=TimeoutError")
+        except Exception as exc:
+            logger.warning(
+                "MCP audit shutdown failed type=%s",
+                type(exc).__name__,
+            )
 
     # 2. MCP 会话管理器
-    async with mcp.session_manager.run():
-        # 3. APScheduler 定时同步
-        _scheduler = AsyncIOScheduler(timezone="Asia/Shanghai")
-        # 间隔（分钟）；汇报、审批分别用各自配置，这里合并为同步轮次
-        min_interval = max(1, min(
-            settings.sync_interval_report_min,
-            settings.sync_interval_approval_min,
-        ))
-        # 注意：不设 next_run_time=None（会让任务不自动调度），
-        # 让 APScheduler 按 trigger 自动计算 next_run_time（启动后 min_interval 分钟触发首次）
-        _scheduler.add_job(
-            _sync_job_async,
-            IntervalTrigger(minutes=min_interval),
-            id="wecom_sync",
-            max_instances=1,
-            coalesce=True,
-        )
-        _scheduler.add_job(
-            _cleanup_logs_job_async,
-            CronTrigger(hour=3, minute=17, timezone="Asia/Shanghai"),
-            id="mcp_log_cleanup",
-            max_instances=1,
-            coalesce=True,
-        )
-        _scheduler.start()
-        logger.info("同步调度已启动，间隔=%s 分钟（一期 tenant1）", min_interval)
-
-        # 额外：启动后立即跑一次首次同步（独立后台任务，不依赖调度器）
-        # 这样既快响应（立即拉一次），又不干扰调度器的周期触发
-        asyncio.create_task(_sync_job_async())
-
-        try:
-            yield
-        finally:
-            _scheduler.shutdown(wait=False)
-            logger.info("同步调度已停止")
+    try:
+        async with mcp.session_manager.run():
+            scheduler = None
             try:
-                flushed = await asyncio.to_thread(shutdown_audit_writer, 2.0)
-                if not flushed:
-                    logger.warning("MCP audit shutdown incomplete type=TimeoutError")
-            except Exception as exc:
-                logger.warning(
-                    "MCP audit shutdown failed type=%s",
-                    type(exc).__name__,
+                # 3. APScheduler 定时同步
+                scheduler = AsyncIOScheduler(timezone="Asia/Shanghai")
+                _scheduler = scheduler
+                # 间隔（分钟）；汇报、审批分别用各自配置，这里合并为同步轮次
+                min_interval = max(1, min(
+                    settings.sync_interval_report_min,
+                    settings.sync_interval_approval_min,
+                ))
+                # 注意：不设 next_run_time=None（会让任务不自动调度），
+                # 让 APScheduler 按 trigger 自动计算 next_run_time（启动后 min_interval 分钟触发首次）
+                scheduler.add_job(
+                    _sync_job_async,
+                    IntervalTrigger(minutes=min_interval),
+                    id="wecom_sync",
+                    max_instances=1,
+                    coalesce=True,
                 )
+                scheduler.add_job(
+                    _cleanup_logs_job_async,
+                    CronTrigger(hour=3, minute=17, timezone="Asia/Shanghai"),
+                    id="mcp_log_cleanup",
+                    max_instances=1,
+                    coalesce=True,
+                )
+                scheduler.start()
+                logger.info("同步调度已启动，间隔=%s 分钟（一期 tenant1）", min_interval)
+
+                # 额外：启动后立即跑一次首次同步（独立后台任务，不依赖调度器）
+                # 这样既快响应（立即拉一次），又不干扰调度器的周期触发
+                asyncio.create_task(_sync_job_async())
+                yield
+            finally:
+                if scheduler is not None:
+                    scheduler.shutdown(wait=False)
+                    logger.info("同步调度已停止")
+                    if _scheduler is scheduler:
+                        _scheduler = None
+                await release_audit_once()
+    finally:
+        await release_audit_once()
 
 
 app = create_app()

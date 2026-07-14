@@ -89,6 +89,81 @@ def test_write_event_persists_only_on_background_worker(monkeypatch):
     assert inserted_threads[0] != caller_thread
 
 
+def test_blocking_audit_storage_does_not_block_protocol_event_loop(monkeypatch):
+    started = threading.Event()
+    release = threading.Event()
+
+    def blocking_insert(event):
+        started.set()
+        release.wait(2)
+
+    writer = mcp_audit.AuditEventWriter(insert=blocking_insert, max_queue_size=2)
+    monkeypatch.setattr(mcp_audit, "_audit_writer", writer)
+
+    async def app(scope, receive, send):
+        await send({"type": "http.response.start", "status": 200, "headers": []})
+        await send({"type": "http.response.body", "body": b""})
+
+    async def receive():
+        return {"type": "http.request", "body": b"", "more_body": False}
+
+    async def send(message):
+        return None
+
+    heartbeat = []
+
+    async def exercise():
+        middleware = mcp_audit.McpProtocolAuditMiddleware(app)
+
+        async def tick():
+            await asyncio.sleep(0.01)
+            heartbeat.append("advanced")
+
+        await asyncio.wait_for(
+            asyncio.gather(
+                middleware(
+                    {"type": "http", "method": "GET", "headers": [], "client": None},
+                    receive,
+                    send,
+                ),
+                tick(),
+            ),
+            timeout=0.25,
+        )
+
+    try:
+        asyncio.run(exercise())
+        assert started.wait(1)
+        assert heartbeat == ["advanced"]
+    finally:
+        release.set()
+        writer.shutdown(1)
+
+
+def test_audit_writer_lifecycle_refcounts_and_restarts_after_final_release(monkeypatch):
+    initial_writer = mcp_audit.AuditEventWriter(insert=lambda event: None)
+    monkeypatch.setattr(mcp_audit, "_audit_writer", initial_writer)
+    monkeypatch.setattr(mcp_audit, "_audit_writer_refcount", 0, raising=False)
+
+    first = mcp_audit.acquire_audit_writer()
+    second = mcp_audit.acquire_audit_writer()
+
+    assert first is initial_writer
+    assert second is first
+    assert first._thread is not None and first._thread.is_alive()
+    assert mcp_audit.release_audit_writer(1) is True
+    assert first._thread.is_alive()
+    assert mcp_audit.release_audit_writer(1) is True
+    assert not first._thread.is_alive()
+
+    restarted = mcp_audit.acquire_audit_writer()
+    try:
+        assert restarted is not first
+        assert restarted._thread is not None and restarted._thread.is_alive()
+    finally:
+        mcp_audit.release_audit_writer(1)
+
+
 def test_write_event_swallows_queue_infrastructure_failure(monkeypatch, caplog):
     class BrokenWriter:
         def submit(self, event):
@@ -99,13 +174,17 @@ def test_write_event_swallows_queue_infrastructure_failure(monkeypatch, caplog):
     with caplog.at_level(logging.WARNING, logger="app.mcp_audit"):
         assert mcp_audit.write_event(McpLogEvent()) is False
 
-    assert "RuntimeError" in caplog.text
+    assert caplog.text == ""
     assert "queue-infrastructure" not in caplog.text
 
 
-def test_audit_writer_queue_is_bounded_and_drop_warning_is_coalesced(caplog):
+def test_audit_writer_queue_is_bounded_and_drop_warning_runs_off_submit_thread(
+    monkeypatch,
+):
     started = threading.Event()
     release = threading.Event()
+    caller_thread = threading.get_ident()
+    warnings = []
 
     def blocking_insert(event):
         started.set()
@@ -116,23 +195,32 @@ def test_audit_writer_queue_is_bounded_and_drop_warning_is_coalesced(caplog):
         max_queue_size=2,
         warning_interval=60,
     )
+    monkeypatch.setattr(
+        mcp_audit.logger,
+        "warning",
+        lambda message, *args: warnings.append((threading.get_ident(), message, args)),
+    )
     try:
         assert writer.submit(McpLogEvent(event_name="first")) is True
         assert started.wait(1)
         assert writer.submit(McpLogEvent(event_name="second")) is True
         assert writer.submit(McpLogEvent(event_name="third")) is True
-        with caplog.at_level(logging.WARNING, logger="app.mcp_audit"):
-            assert writer.submit(McpLogEvent(event_name="secret=drop-one")) is False
-            assert writer.submit(McpLogEvent(event_name="secret=drop-two")) is False
+        assert writer.submit(McpLogEvent(event_name="secret=drop-one")) is False
+        assert writer.submit(McpLogEvent(event_name="secret=drop-two")) is False
 
         assert writer._queue.qsize() == 2
         assert writer.dropped_count == 2
-        assert caplog.text.count("audit queue full") == 1
-        assert "drop-one" not in caplog.text
-        assert "drop-two" not in caplog.text
+        assert warnings == []
     finally:
         release.set()
         writer.shutdown(1)
+
+    queue_warnings = [entry for entry in warnings if "audit queue full" in entry[1]]
+    assert len(queue_warnings) == 1
+    assert queue_warnings[0][0] != caller_thread
+    assert queue_warnings[0][2] == ("Full", 2)
+    assert "drop-one" not in repr(warnings)
+    assert "drop-two" not in repr(warnings)
 
 
 def test_audit_worker_isolates_storage_failure_and_flush_is_bounded(caplog):
@@ -160,10 +248,9 @@ def test_audit_worker_isolates_storage_failure_and_flush_is_bounded(caplog):
     assert "db-secret" not in caplog.text
 
 
-def test_session_metadata_values_are_preserved_without_key_value_context():
-    scope = {
-        "headers": [(b"mcp-session-id", b"opaque-session-value")],
-    }
+def test_request_id_from_scope_preserves_request_id_and_hashes_session_fallback():
+    request_scope = {"headers": [(b"x-request-id", b"request-value")]}
+    session_scope = {"headers": [(b"mcp-session-id", b"opaque-session-value")]}
     metadata_summary = mcp_audit.safe_summary(
         {
             "request_id": "request-value",
@@ -172,8 +259,11 @@ def test_session_metadata_values_are_preserved_without_key_value_context():
         512,
     )
 
-    assert mcp_audit._header(scope, b"mcp-session-id") == "opaque-session-value"
-    assert mcp_audit.safe_summary("opaque-session-value", 64) == "opaque-session-value"
+    assert mcp_audit.request_id_from_scope(request_scope) == "request-value"
+    session_request_id = mcp_audit.request_id_from_scope(session_scope)
+    assert session_request_id.startswith("sha256:")
+    assert len(session_request_id) == 39
+    assert "opaque-session-value" not in session_request_id
     assert "request-value" in metadata_summary
     assert "mcp-session-value" in metadata_summary
 
