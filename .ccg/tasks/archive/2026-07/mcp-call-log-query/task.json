@@ -1,12 +1,12 @@
 {
   "id": "mcp-call-log-query",
   "title": "增加 MCP 调用日志查询、检索与清理功能",
-  "status": "in_progress",
+  "status": "completed",
   "complexity": "L+",
   "risk": "high",
   "domain": "fullstack",
-  "currentPhase": "planning",
-  "nextAction": "自审实施计划并选择执行模式",
+  "currentPhase": "completed",
+  "nextAction": "归档任务并交付功能分支",
   "createdAt": "2026-07-14T00:00:00+08:00",
-  "branch": "main"
+  "branch": "codex/mcp-call-log-management"
 }
