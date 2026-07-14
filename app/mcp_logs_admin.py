@@ -59,6 +59,8 @@ _dev_warning_emitted = False
 Category = Literal["tool", "protocol", "auth"]
 Status = Literal["ok", "partial", "error", "denied"]
 DeleteMode = Literal["ids", "filter", "before_date", "all"]
+MAX_DELETE_IDS = 200
+MAX_CONFIRM_TOKEN_LENGTH = 8192
 StrictPositiveInt = Annotated[int, Field(strict=True, gt=0)]
 StrictNonNegativeInt = Annotated[int, Field(strict=True, ge=0)]
 
@@ -235,7 +237,10 @@ class DeleteRequestBase(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
     mode: DeleteMode
-    ids: list[StrictPositiveInt] = Field(default_factory=list, max_length=5000)
+    ids: list[StrictPositiveInt] = Field(
+        default_factory=list,
+        max_length=MAX_DELETE_IDS,
+    )
     filter: DeleteFilterBody | None = None
     before_date: datetime | None = None
 
@@ -261,7 +266,7 @@ class DeleteRequestBase(BaseModel):
 
     def to_spec(self) -> DeleteSpec:
         if self.mode == "ids":
-            return DeleteSpec(mode="ids", ids=tuple(self.ids))
+            return DeleteSpec(mode="ids", ids=tuple(sorted(set(self.ids))))
         if self.mode == "filter":
             return DeleteSpec(mode="filter", filters=self.filter.to_filters())
         if self.mode == "before_date":
@@ -277,7 +282,7 @@ class DeletePreviewRequest(DeleteRequestBase):
 
 
 class DeleteExecuteRequest(DeleteRequestBase):
-    confirm_token: str = Field(min_length=1, max_length=8192)
+    confirm_token: str = Field(min_length=1, max_length=MAX_CONFIRM_TOKEN_LENGTH)
 
 
 class RetentionRequest(BaseModel):
@@ -578,6 +583,7 @@ def post_mcp_log_delete_preview(body: DeletePreviewRequest, request: Request):
     }
 
 
+@router.post("/mcp-logs/delete")
 @router.delete("/mcp-logs")
 def delete_mcp_logs(body: DeleteExecuteRequest, request: Request):
     _require_auth(request)

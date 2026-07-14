@@ -36,6 +36,7 @@ import {
   buildDeleteSpec,
   buildLogQuery,
   formatDuration,
+  MAX_DELETE_IDS,
   normalizeLogKeyword,
   parseLogLocation,
   serializeLogFilters,
@@ -478,8 +479,9 @@ export default function McpLogs({ filters, onFiltersChange = () => {} }) {
   const executeDelete = async (spec, preview) => {
     setCleanupLoading(true)
     try {
-      const response = await api.delete('/admin/mcp-logs', {
-        data: { ...spec, confirm_token: preview.confirm_token },
+      const response = await api.post('/admin/mcp-logs/delete', {
+        ...spec,
+        confirm_token: preview.confirm_token,
       })
       setSelectedRowKeys([])
       setPage(1)
@@ -739,7 +741,14 @@ export default function McpLogs({ filters, onFiltersChange = () => {} }) {
 
         {selectedRowKeys.length > 0 && (
           <div className="mcp-selection-bar">
-            <div><strong>已选择 {selectedRowKeys.length} 条</strong><span>仅会清理这些日志 ID</span></div>
+            <div>
+              <strong>已选择 {selectedRowKeys.length} 条</strong>
+              <span>
+                {selectedRowKeys.length > MAX_DELETE_IDS
+                  ? `单次最多清理 ${MAX_DELETE_IDS} 条，请减少选择后重试`
+                  : '仅会清理这些日志 ID'}
+              </span>
+            </div>
             <Space>
               <Button size="small" onClick={() => setSelectedRowKeys([])}>取消选择</Button>
               <Button

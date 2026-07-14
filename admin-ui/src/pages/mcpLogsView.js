@@ -1,6 +1,7 @@
 const DAY_MS = 24 * 60 * 60 * 1000
 const DEFAULT_PAGE = 1
 const DEFAULT_PAGE_SIZE = 20
+export const MAX_DELETE_IDS = 200
 
 const CATEGORY_VALUES = new Set(['tool', 'protocol', 'auth'])
 const STATUS_VALUES = new Set(['ok', 'partial', 'error', 'denied'])
@@ -185,6 +186,9 @@ export function buildDeleteSpec(mode, filters = DEFAULT_LOG_FILTERS, selectedIds
       .map((value) => Number(value))
       .filter((value) => Number.isSafeInteger(value) && value > 0))]
     if (ids.length === 0) throw new RangeError('At least one log ID is required')
+    if (ids.length > MAX_DELETE_IDS) {
+      throw new RangeError(`一次最多清理 ${MAX_DELETE_IDS} 条日志 ID`)
+    }
     return { mode, ids }
   }
 

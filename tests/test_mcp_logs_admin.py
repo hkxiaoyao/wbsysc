@@ -39,6 +39,7 @@ def authed_client(monkeypatch) -> TestClient:
         ("get", "/admin/mcp-logs", None),
         ("get", "/admin/mcp-logs/stats", None),
         ("post", "/admin/mcp-logs/delete-preview", {"mode": "all"}),
+        ("post", "/admin/mcp-logs/delete", {"mode": "all", "confirm_token": "x"}),
         ("delete", "/admin/mcp-logs", {"mode": "all", "confirm_token": "x"}),
         ("get", "/admin/mcp-log-settings", None),
         ("put", "/admin/mcp-log-settings", {"retention_days": 90}),
@@ -220,6 +221,89 @@ def test_delete_preview_builds_typed_specs(
     assert response.json()["max_id"] == 12
     assert response.json()["expires_at"] == 1_300
     assert response.json()["confirm_token"]
+
+
+def test_maximum_id_batch_fits_confirmation_token_and_execute_binds_canonical_spec(
+    monkeypatch, authed_client
+):
+    max_bigint = 2**63 - 1
+    ids = [max_bigint - index for index in range(200)]
+    captured = {}
+    monkeypatch.setattr(api, "_now", lambda: 1_000.0)
+    monkeypatch.setattr(
+        api,
+        "preview_delete",
+        lambda spec: {"matched_count": len(spec.ids), "max_id": max_bigint},
+    )
+    monkeypatch.setattr(
+        api,
+        "delete_matching",
+        lambda spec, max_id: captured.update(spec=spec, max_id=max_id) or len(spec.ids),
+    )
+
+    preview_response = authed_client.post(
+        "/admin/mcp-logs/delete-preview",
+        json={"mode": "ids", "ids": ids},
+    )
+
+    assert preview_response.status_code == 200
+    preview = preview_response.json()
+    assert len(preview["confirm_token"]) <= 8192
+
+    execute_response = authed_client.post(
+        "/admin/mcp-logs/delete",
+        json={
+            "mode": "ids",
+            "ids": list(reversed(ids)),
+            "confirm_token": preview["confirm_token"],
+        },
+    )
+
+    assert execute_response.status_code == 200
+    assert execute_response.json() == {"deleted": 200}
+    assert captured["max_id"] == max_bigint
+    assert captured["spec"] == DeleteSpec(mode="ids", ids=tuple(sorted(ids)))
+
+
+def test_delete_confirmation_binds_deduplicated_id_spec(monkeypatch, authed_client):
+    captured = {}
+    monkeypatch.setattr(api, "_now", lambda: 1_000.0)
+    monkeypatch.setattr(
+        api,
+        "preview_delete",
+        lambda spec: {"matched_count": len(spec.ids), "max_id": 9},
+    )
+    monkeypatch.setattr(
+        api,
+        "delete_matching",
+        lambda spec, max_id: captured.update(spec=spec, max_id=max_id) or len(spec.ids),
+    )
+    preview = authed_client.post(
+        "/admin/mcp-logs/delete-preview",
+        json={"mode": "ids", "ids": [9, 2, 9]},
+    ).json()
+
+    response = authed_client.post(
+        "/admin/mcp-logs/delete",
+        json={"mode": "ids", "ids": [2, 9], "confirm_token": preview["confirm_token"]},
+    )
+
+    assert response.status_code == 200
+    assert captured["spec"] == DeleteSpec(mode="ids", ids=(2, 9))
+
+
+@pytest.mark.parametrize(
+    ("path", "body"),
+    [
+        ("/admin/mcp-logs/delete-preview", {"mode": "ids", "ids": list(range(1, 202))}),
+        (
+            "/admin/mcp-logs/delete",
+            {"mode": "ids", "ids": list(range(1, 202)), "confirm_token": "x"},
+        ),
+    ],
+)
+def test_delete_models_reject_more_than_two_hundred_ids(authed_client, path, body):
+    assert authed_client.post(path, json=body).status_code == 422
 
 
 def test_delete_preview_and_execute_bind_same_snapshot(monkeypatch, authed_client):

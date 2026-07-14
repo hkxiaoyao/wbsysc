@@ -150,6 +150,19 @@ test('buildDeleteSpec produces every supported delete payload without UI paginat
   assert.throws(() => buildDeleteSpec('sql', pollutedFilters, [], null), /delete mode/i)
 })
 
+test('buildDeleteSpec accepts 200 IDs and rejects 201 before requesting a preview', () => {
+  const maximumBatch = Array.from({ length: 200 }, (_, index) => index + 1)
+
+  assert.deepEqual(buildDeleteSpec('ids', DEFAULT_LOG_FILTERS, maximumBatch), {
+    mode: 'ids',
+    ids: maximumBatch,
+  })
+  assert.throws(
+    () => buildDeleteSpec('ids', DEFAULT_LOG_FILTERS, [...maximumBatch, 201]),
+    /200.*日志 id/i,
+  )
+})
+
 test('buildDeleteSpec filter mode omits empty values and pagination fields', () => {
   const body = buildDeleteSpec(
     'filter',
