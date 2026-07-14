@@ -44,7 +44,10 @@ class RecordingConnection:
     def execute(self, statement, params=None):
         self.statements.append((str(statement), params or {}))
         if self.results:
-            return self.results.pop(0)
+            result = self.results.pop(0)
+            if isinstance(result, BaseException):
+                raise result
+            return result
         return Result()
 
 
@@ -188,6 +191,23 @@ def test_stats_calculates_p95_with_one_sorted_offset_query(monkeypatch):
     assert p95[0][1]["p95_offset"] == 18
 
 
+def test_stats_trend_groups_by_full_expression_for_mysql57(monkeypatch):
+    connection = install_engine(
+        monkeypatch,
+        Result(rows=[{"total": 0, "ok_count": 0, "error_count": 0, "avg_cost_ms": 0}]),
+        Result(rows=[]),
+        Result(rows=[]),
+        Result(rows=[]),
+    )
+
+    store.get_log_stats(LogFilters())
+
+    trend_sql = next(sql for sql, _ in connection.statements if "DATE_FORMAT" in sql)
+    bucket_expression = "DATE_FORMAT(created_at, '%Y-%m-%d %H:00:00')"
+    assert f"GROUP BY {bucket_expression}" in trend_sql
+    assert "GROUP BY bucket" not in trend_sql
+
+
 def test_stats_default_window_is_latest_24_hours_for_every_query(monkeypatch):
     now = datetime(2026, 7, 14, 12, 0)
     monkeypatch.setattr(store, "_utcnow", lambda: now, raising=False)
@@ -275,17 +295,16 @@ def test_stats_non_tool_category_returns_no_top_tools(monkeypatch, category):
     assert all("GROUP BY event_name" not in sql for sql, _ in connection.statements)
 
 
-def test_legacy_migration_is_bounded_mapped_and_idempotent(monkeypatch):
+def test_legacy_migration_is_bounded_mapped_and_marks_completion(monkeypatch):
     tenant_created_at = datetime(2026, 6, 1, 0, 0)
     connection = install_engine(
         monkeypatch,
+        Result(scalar_value=None),
         Result(rows=[("tenant-real", "wbd_abc", tenant_created_at)]),
         Result(),
-        Result(rows=[("tenant-real", "wbd_abc", tenant_created_at)]),
         Result(),
     )
 
-    store.migrate_legacy_logs(days=90)
     store.migrate_legacy_logs(days=90)
 
     sql = "\n".join(statement for statement, _ in connection.statements)
@@ -302,19 +321,75 @@ def test_legacy_migration_is_bounded_mapped_and_idempotent(monkeypatch):
             "legacy_schema": "wbd_abc",
             "tenant_created_at": tenant_created_at,
         },
-        {
-            "tenant_id": "tenant-real",
-            "legacy_schema": "wbd_abc",
-            "tenant_created_at": tenant_created_at,
-        },
     ]
+    marker_index, (marker_sql, marker_params) = next(
+        (index, entry)
+        for index, entry in enumerate(connection.statements)
+        if "INSERT INTO gateway_setting" in entry[0]
+    )
+    migration_index = next(
+        index
+        for index, (statement, _) in enumerate(connection.statements)
+        if "INSERT IGNORE" in statement
+    )
+    assert migration_index < marker_index
+    assert "ON DUPLICATE KEY UPDATE" in marker_sql
+    assert marker_params == {
+        "setting_key": "mcp_log_legacy_migration_v1",
+        "setting_value": "completed",
+    }
+
+
+def test_legacy_migration_existing_marker_skips_tenant_scan(monkeypatch):
+    connection = install_engine(monkeypatch, Result(scalar_value="completed"))
+
+    store.migrate_legacy_logs(days=90)
+
+    assert len(connection.statements) == 1
+    marker_sql, marker_params = connection.statements[0]
+    assert "SELECT setting_value FROM gateway_setting" in marker_sql
+    assert marker_params["setting_key"] == "mcp_log_legacy_migration_v1"
+    assert "tenant_config" not in marker_sql
+
+
+def test_legacy_migration_does_not_mark_completion_after_tenant_failure(monkeypatch):
+    tenant_created_at = datetime(2026, 6, 1, 0, 0)
+    connection = install_engine(
+        monkeypatch,
+        Result(scalar_value=None),
+        Result(
+            rows=[
+                ("tenant-a", "wbd_a", tenant_created_at),
+                ("tenant-b", "wbd_b", tenant_created_at),
+            ]
+        ),
+        Result(),
+        RuntimeError("legacy table unavailable"),
+    )
+
+    store.migrate_legacy_logs(days=90)
+
+    migrations = [
+        statement
+        for statement, _ in connection.statements
+        if "INSERT IGNORE INTO mcp_call_log" in statement
+    ]
+    marker_writes = [
+        statement
+        for statement, _ in connection.statements
+        if "INSERT INTO gateway_setting" in statement
+    ]
+    assert len(migrations) == 2
+    assert marker_writes == []
 
 
 def test_legacy_migration_skips_rows_before_current_schema_owner(monkeypatch):
     tenant_created_at = datetime(2026, 7, 10, 9, 30)
     connection = install_engine(
         monkeypatch,
+        Result(scalar_value=None),
         Result(rows=[("new-owner", "wbd_reused", tenant_created_at)]),
+        Result(),
         Result(),
     )
 
@@ -331,12 +406,14 @@ def test_legacy_migration_skips_rows_before_current_schema_owner(monkeypatch):
 def test_legacy_migration_rejects_invalid_schema_before_interpolation(monkeypatch):
     connection = install_engine(
         monkeypatch,
+        Result(scalar_value=None),
         Result(rows=[("tenant-real", "wbd_bad-name", datetime(2026, 1, 1))]),
+        Result(),
     )
 
     store.migrate_legacy_logs()
 
-    assert len(connection.statements) == 1
+    assert any("INSERT INTO gateway_setting" in sql for sql, _ in connection.statements)
     assert all("wbd_bad-name" not in statement for statement, _ in connection.statements)
 
 

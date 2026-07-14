@@ -15,6 +15,8 @@ from .mcp_log_models import DeleteSpec, LogFilters, McpLogEvent
 logger = logging.getLogger(__name__)
 
 _RETENTION_KEY = "mcp_log_retention_days"
+_LEGACY_MIGRATION_KEY = "mcp_log_legacy_migration_v1"
+_LEGACY_MIGRATION_VALUE = "completed"
 _DEFAULT_RETENTION_DAYS = 90
 _MAX_DELETE_BATCH = 5000
 
@@ -62,6 +64,7 @@ CREATE TABLE IF NOT EXISTS `gateway_setting` (
 _SAFE_COLUMNS = """id, tenant_id, category, event_name, target, params_summary,
 result_status, error_code, error_summary, cost_ms, request_id, client_ip,
 http_method, http_status, created_at"""
+_TREND_BUCKET_EXPRESSION = "DATE_FORMAT(created_at, '%Y-%m-%d %H:00:00')"
 
 
 def _engine():
@@ -84,10 +87,20 @@ def migrate_legacy_logs(days: int = 90) -> None:
     from .db import _valid_tenant_schema
 
     with _engine().connect() as conn:
+        completed = conn.execute(
+            text(
+                "SELECT setting_value FROM gateway_setting "
+                "WHERE setting_key=:setting_key"
+            ),
+            {"setting_key": _LEGACY_MIGRATION_KEY},
+        ).scalar()
+        if completed is not None:
+            return
         tenants = conn.execute(
             text("SELECT tenant_id, schema_name, created_at FROM tenant_config")
         ).fetchall()
 
+    all_succeeded = True
     for tenant_id, schema_name, tenant_created_at in tenants:
         if not _valid_tenant_schema(schema_name):
             logger.warning("Skipping invalid legacy audit schema for tenant_id=%s", tenant_id)
@@ -121,11 +134,27 @@ def migrate_legacy_logs(days: int = 90) -> None:
                     },
                 )
         except Exception:
+            all_succeeded = False
             logger.exception(
                 "Legacy MCP audit migration failed tenant_id=%s schema=%s",
                 tenant_id,
                 schema_name,
             )
+
+    if not all_succeeded:
+        return
+    with _engine().begin() as conn:
+        conn.execute(
+            text("""
+                INSERT INTO gateway_setting (setting_key, setting_value)
+                VALUES (:setting_key, :setting_value)
+                ON DUPLICATE KEY UPDATE setting_value=VALUES(setting_value)
+            """),
+            {
+                "setting_key": _LEGACY_MIGRATION_KEY,
+                "setting_value": _LEGACY_MIGRATION_VALUE,
+            },
+        )
 
 
 def insert_event(event: McpLogEvent) -> None:
@@ -301,9 +330,9 @@ def get_log_stats(filters: LogFilters) -> dict[str, Any]:
             )
         trend = conn.execute(
             text(
-                "SELECT DATE_FORMAT(created_at, '%Y-%m-%d %H:00:00') AS bucket, "
+                f"SELECT {_TREND_BUCKET_EXPRESSION} AS bucket, "
                 f"COUNT(*) AS count FROM mcp_call_log{where} "
-                "GROUP BY bucket ORDER BY bucket"
+                f"GROUP BY {_TREND_BUCKET_EXPRESSION} ORDER BY bucket"
             ),
             params,
         ).mappings().all()
