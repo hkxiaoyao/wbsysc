@@ -185,8 +185,12 @@ def ensure_schema(schema_name: str) -> None:
 def run_startup_migrations() -> None:
     """启动时先升级中心表，再逐租户创建或修复业务 schema。"""
     ensure_central_columns()
+    from .mcp_log_store import ensure_central_log_tables, migrate_legacy_logs
+
+    ensure_central_log_tables()
     for schema_name in get_tenant_schema_names():
         ensure_schema(schema_name)
+    migrate_legacy_logs(days=90)
 
 
 # ----- 汇报落库 -----

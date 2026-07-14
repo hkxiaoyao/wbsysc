@@ -82,8 +82,20 @@ def test_runtime_migration_repairs_all_required_tenant_columns(monkeypatch):
 
 def test_startup_migrations_upgrade_center_before_tenant_schemas(monkeypatch):
     events = []
+    from app import mcp_log_store
+
     monkeypatch.setattr(
         db, "ensure_central_columns", lambda: events.append("center"), raising=False
+    )
+    monkeypatch.setattr(
+        mcp_log_store,
+        "ensure_central_log_tables",
+        lambda: events.append("log_tables"),
+    )
+    monkeypatch.setattr(
+        mcp_log_store,
+        "migrate_legacy_logs",
+        lambda days=90: events.append(f"legacy:{days}"),
     )
     monkeypatch.setattr(
         db,
@@ -97,11 +109,22 @@ def test_startup_migrations_upgrade_center_before_tenant_schemas(monkeypatch):
 
     db.run_startup_migrations()
 
-    assert events == ["center", "enumerate", "wbd_a", "wbd_b"]
+    assert events == [
+        "center",
+        "log_tables",
+        "enumerate",
+        "wbd_a",
+        "wbd_b",
+        "legacy:90",
+    ]
 
 
 def test_startup_migration_failure_propagates(monkeypatch):
+    from app import mcp_log_store
+
     monkeypatch.setattr(db, "ensure_central_columns", lambda: None, raising=False)
+    monkeypatch.setattr(mcp_log_store, "ensure_central_log_tables", lambda: None)
+    monkeypatch.setattr(mcp_log_store, "migrate_legacy_logs", lambda days=90: None)
     monkeypatch.setattr(
         db, "get_tenant_schema_names", lambda: ["wbd_a"], raising=False
     )
@@ -113,6 +136,27 @@ def test_startup_migration_failure_propagates(monkeypatch):
 
     with pytest.raises(RuntimeError, match="ddl denied"):
         db.run_startup_migrations()
+
+
+def test_central_log_table_failure_stops_startup(monkeypatch):
+    from app import mcp_log_store
+
+    events = []
+    monkeypatch.setattr(db, "ensure_central_columns", lambda: events.append("center"))
+    monkeypatch.setattr(
+        mcp_log_store,
+        "ensure_central_log_tables",
+        lambda: (_ for _ in ()).throw(RuntimeError("central ddl denied")),
+    )
+    monkeypatch.setattr(
+        db,
+        "get_tenant_schema_names",
+        lambda: events.append("enumerate") or [],
+    )
+
+    with pytest.raises(RuntimeError, match="central ddl denied"):
+        db.run_startup_migrations()
+    assert events == ["center"]
 
 
 def test_lifespan_runs_migrations_before_mcp_and_scheduler():
