@@ -13,7 +13,7 @@ from datetime import datetime, timedelta, timezone
 from typing import Annotated, Any, Literal
 
 from fastapi import APIRouter, Depends, HTTPException, Query, Request
-from pydantic import BaseModel, ConfigDict, Field, model_validator
+from pydantic import BaseModel, BeforeValidator, ConfigDict, Field, model_validator
 
 from .admin import SESSION_COOKIE, _require_auth
 from .config import get_settings
@@ -61,7 +61,29 @@ Status = Literal["ok", "partial", "error", "denied"]
 DeleteMode = Literal["ids", "filter", "before_date", "all"]
 MAX_DELETE_IDS = 200
 MAX_CONFIRM_TOKEN_LENGTH = 8192
-StrictPositiveInt = Annotated[int, Field(strict=True, gt=0)]
+MAX_LOG_ID = 2**63 - 1
+MAX_SAFE_INTEGER = 2**53 - 1
+
+
+def _normalize_delete_id(value: Any) -> int:
+    if type(value) is int:
+        if not 1 <= value <= MAX_SAFE_INTEGER:
+            raise ValueError("integer log IDs must be JavaScript-safe positive integers")
+        return value
+    if type(value) is not str or not value or not value.isascii() or not value.isdecimal():
+        raise ValueError("log IDs must be canonical decimal strings or safe integers")
+    if value[0] == "0":
+        raise ValueError("decimal log IDs must not contain leading zeroes")
+    max_text = str(MAX_LOG_ID)
+    if len(value) > len(max_text) or (len(value) == len(max_text) and value > max_text):
+        raise ValueError("log ID exceeds signed BIGINT range")
+    return int(value)
+
+
+DeleteId = Annotated[
+    int,
+    BeforeValidator(_normalize_delete_id, json_schema_input_type=int | str),
+]
 StrictNonNegativeInt = Annotated[int, Field(strict=True, ge=0)]
 
 
@@ -237,7 +259,7 @@ class DeleteRequestBase(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
     mode: DeleteMode
-    ids: list[StrictPositiveInt] = Field(
+    ids: list[DeleteId] = Field(
         default_factory=list,
         max_length=MAX_DELETE_IDS,
     )
@@ -443,7 +465,12 @@ def _store_call(operation, *args, transform=None):
 
 def _safe_log_item(item: Any) -> dict[str, Any]:
     values = dict(item)
-    return {field: values.get(field) for field in SAFE_LOG_FIELDS}
+    safe_item = {field: values.get(field) for field in SAFE_LOG_FIELDS}
+    log_id = values.get("id")
+    if type(log_id) is not int or not 1 <= log_id <= MAX_LOG_ID:
+        raise TypeError("expected a signed BIGINT log ID")
+    safe_item["id"] = str(log_id)
+    return safe_item
 
 
 def _is_nonnegative_int(value: Any) -> bool:

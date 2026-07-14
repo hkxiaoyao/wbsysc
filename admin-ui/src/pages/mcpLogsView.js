@@ -2,6 +2,7 @@ const DAY_MS = 24 * 60 * 60 * 1000
 const DEFAULT_PAGE = 1
 const DEFAULT_PAGE_SIZE = 20
 export const MAX_DELETE_IDS = 200
+export const MAX_LOG_ID = '9223372036854775807'
 
 const CATEGORY_VALUES = new Set(['tool', 'protocol', 'auth'])
 const STATUS_VALUES = new Set(['ok', 'partial', 'error', 'denied'])
@@ -118,6 +119,30 @@ function hasValue(value) {
   return value !== null && value !== undefined && normalizeText(value) !== ''
 }
 
+function normalizeDeleteId(value) {
+  let text
+  if (typeof value === 'string') {
+    text = value
+  } else if (typeof value === 'number' && Number.isSafeInteger(value) && value > 0) {
+    text = String(value)
+  } else {
+    throw new TypeError('Each log ID must be a valid decimal log ID or safe integer')
+  }
+
+  if (!/^[1-9][0-9]*$/.test(text)) {
+    throw new TypeError('Each log ID must be a valid decimal log ID without signs or leading zeroes')
+  }
+  if (text.length > MAX_LOG_ID.length
+    || (text.length === MAX_LOG_ID.length && text > MAX_LOG_ID)) {
+    throw new RangeError('Each log ID must be a valid decimal log ID within signed BIGINT range')
+  }
+  return text
+}
+
+export function isDeleteSelectionOverLimit(selectedIds = []) {
+  return selectedIds.length > MAX_DELETE_IDS
+}
+
 function validateDeleteFilters(filters) {
   if (hasValue(filters?.category) && !CATEGORY_VALUES.has(normalizeText(filters.category))) {
     throw new TypeError('Delete filter category must be a supported value')
@@ -182,9 +207,7 @@ export function buildLogQuery(filters = DEFAULT_LOG_FILTERS, page = DEFAULT_PAGE
 
 export function buildDeleteSpec(mode, filters = DEFAULT_LOG_FILTERS, selectedIds = [], beforeDate = null) {
   if (mode === 'ids') {
-    const ids = [...new Set(selectedIds
-      .map((value) => Number(value))
-      .filter((value) => Number.isSafeInteger(value) && value > 0))]
+    const ids = [...new Set(selectedIds.map(normalizeDeleteId))]
     if (ids.length === 0) throw new RangeError('At least one log ID is required')
     if (ids.length > MAX_DELETE_IDS) {
       throw new RangeError(`一次最多清理 ${MAX_DELETE_IDS} 条日志 ID`)

@@ -5,6 +5,7 @@ import {
   buildDeleteSpec,
   buildLogQuery,
   formatDuration,
+  isDeleteSelectionOverLimit,
   normalizeLogKeyword,
   parseLogLocation,
   serializeLogFilters,
@@ -122,9 +123,9 @@ test('buildLogQuery maps filters to API fields and normalizes pagination', () =>
 test('buildDeleteSpec produces every supported delete payload without UI pagination', () => {
   const pollutedFilters = { ...EXPLICIT_FILTERS, page: 9, pageSize: 100 }
 
-  assert.deepEqual(buildDeleteSpec('ids', pollutedFilters, ['9', 2, 9, -1, 'no'], null), {
+  assert.deepEqual(buildDeleteSpec('ids', pollutedFilters, ['9', 2, '9'], null), {
     mode: 'ids',
-    ids: [9, 2],
+    ids: ['9', '2'],
   })
   assert.deepEqual(buildDeleteSpec('filter', pollutedFilters, [], null), {
     mode: 'filter',
@@ -151,16 +152,64 @@ test('buildDeleteSpec produces every supported delete payload without UI paginat
 })
 
 test('buildDeleteSpec accepts 200 IDs and rejects 201 before requesting a preview', () => {
-  const maximumBatch = Array.from({ length: 200 }, (_, index) => index + 1)
+  const maxBigInt = 9223372036854775807n
+  const maximumBatch = Array.from(
+    { length: 200 },
+    (_, index) => String(maxBigInt - BigInt(index)),
+  )
 
   assert.deepEqual(buildDeleteSpec('ids', DEFAULT_LOG_FILTERS, maximumBatch), {
     mode: 'ids',
     ids: maximumBatch,
   })
   assert.throws(
-    () => buildDeleteSpec('ids', DEFAULT_LOG_FILTERS, [...maximumBatch, 201]),
+    () => buildDeleteSpec('ids', DEFAULT_LOG_FILTERS, [...maximumBatch, '1']),
     /200.*日志 id/i,
   )
+})
+
+test('buildDeleteSpec preserves IDs above Number.MAX_SAFE_INTEGER as decimal strings', () => {
+  assert.deepEqual(
+    buildDeleteSpec('ids', DEFAULT_LOG_FILTERS, [
+      '9007199254740993',
+      '9223372036854775807',
+      '9007199254740993',
+      7,
+    ]),
+    {
+      mode: 'ids',
+      ids: ['9007199254740993', '9223372036854775807', '7'],
+    },
+  )
+})
+
+test('buildDeleteSpec rejects noncanonical and out-of-range log IDs', () => {
+  const invalidIds = [
+    true,
+    1.5,
+    Number.MAX_SAFE_INTEGER + 1,
+    '0',
+    '-1',
+    '+1',
+    ' 1',
+    '1 ',
+    '01',
+    '1.0',
+    '9223372036854775808',
+    '１',
+  ]
+
+  for (const invalidId of invalidIds) {
+    assert.throws(
+      () => buildDeleteSpec('ids', DEFAULT_LOG_FILTERS, [invalidId]),
+      /valid decimal log id/i,
+    )
+  }
+})
+
+test('isDeleteSelectionOverLimit exposes the 200-row UI boundary', () => {
+  assert.equal(isDeleteSelectionOverLimit(Array.from({ length: 200 })), false)
+  assert.equal(isDeleteSelectionOverLimit(Array.from({ length: 201 })), true)
 })
 
 test('buildDeleteSpec filter mode omits empty values and pagination fields', () => {

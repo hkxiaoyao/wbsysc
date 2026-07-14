@@ -36,6 +36,7 @@ import {
   buildDeleteSpec,
   buildLogQuery,
   formatDuration,
+  isDeleteSelectionOverLimit,
   MAX_DELETE_IDS,
   normalizeLogKeyword,
   parseLogLocation,
@@ -563,6 +564,7 @@ export default function McpLogs({ filters, onFiltersChange = () => {} }) {
   const activeTenantLabel = tenantOptions.find((option) => option.value === activeFilters.tenantId)?.label
     || activeFilters.tenantId
     || '全部租户'
+  const deleteSelectionOverLimit = isDeleteSelectionOverLimit(selectedRowKeys)
 
   const summaryTags = [
     activeFilters.tenantId && `租户：${activeTenantLabel}`,
@@ -744,7 +746,7 @@ export default function McpLogs({ filters, onFiltersChange = () => {} }) {
             <div>
               <strong>已选择 {selectedRowKeys.length} 条</strong>
               <span>
-                {selectedRowKeys.length > MAX_DELETE_IDS
+                {deleteSelectionOverLimit
                   ? `单次最多清理 ${MAX_DELETE_IDS} 条，请减少选择后重试`
                   : '仅会清理这些日志 ID'}
               </span>
@@ -757,6 +759,7 @@ export default function McpLogs({ filters, onFiltersChange = () => {} }) {
                 type="primary"
                 icon={<DeleteOutlined />}
                 loading={cleanupLoading}
+                disabled={deleteSelectionOverLimit}
                 onClick={() => requestDelete('ids')}
               >清理所选</Button>
             </Space>

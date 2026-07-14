@@ -61,7 +61,7 @@ def test_list_logs_defaults_to_24_hours_and_whitelists_output(
         captured.update(filters=filters, page=page, page_size=page_size)
         return {
             "items": [{
-                "id": 7,
+                "id": 2**53 + 1,
                 "tenant_id": "tenant-a",
                 "category": "tool",
                 "event_name": "wecom_list_reports",
@@ -98,6 +98,7 @@ def test_list_logs_defaults_to_24_hours_and_whitelists_output(
     payload = response.json()
     assert set(payload) == {"items", "total", "page", "page_size"}
     assert set(payload["items"][0]) == api.SAFE_LOG_FIELDS
+    assert payload["items"][0]["id"] == "9007199254740993"
 
 
 def test_list_converts_only_structured_query_fields(monkeypatch, authed_client):
@@ -227,7 +228,8 @@ def test_maximum_id_batch_fits_confirmation_token_and_execute_binds_canonical_sp
     monkeypatch, authed_client
 ):
     max_bigint = 2**63 - 1
-    ids = [max_bigint - index for index in range(200)]
+    ids = [str(max_bigint - index) for index in range(200)]
+    normalized_ids = tuple(sorted(int(value) for value in ids))
     captured = {}
     monkeypatch.setattr(api, "_now", lambda: 1_000.0)
     monkeypatch.setattr(
@@ -262,7 +264,7 @@ def test_maximum_id_batch_fits_confirmation_token_and_execute_binds_canonical_sp
     assert execute_response.status_code == 200
     assert execute_response.json() == {"deleted": 200}
     assert captured["max_id"] == max_bigint
-    assert captured["spec"] == DeleteSpec(mode="ids", ids=tuple(sorted(ids)))
+    assert captured["spec"] == DeleteSpec(mode="ids", ids=normalized_ids)
 
 
 def test_delete_confirmation_binds_deduplicated_id_spec(monkeypatch, authed_client):
@@ -280,16 +282,99 @@ def test_delete_confirmation_binds_deduplicated_id_spec(monkeypatch, authed_clie
     )
     preview = authed_client.post(
         "/admin/mcp-logs/delete-preview",
-        json={"mode": "ids", "ids": [9, 2, 9]},
+        json={"mode": "ids", "ids": ["9", 2, "9"]},
     ).json()
 
     response = authed_client.post(
         "/admin/mcp-logs/delete",
-        json={"mode": "ids", "ids": [2, 9], "confirm_token": preview["confirm_token"]},
+        json={"mode": "ids", "ids": ["2", "9"], "confirm_token": preview["confirm_token"]},
     )
 
     assert response.status_code == 200
     assert captured["spec"] == DeleteSpec(mode="ids", ids=(2, 9))
+
+
+def test_delete_accepts_decimal_strings_and_safe_ints_across_bigint_range(
+    monkeypatch, authed_client
+):
+    max_bigint = 2**63 - 1
+    max_safe_integer = 2**53 - 1
+    captured = {}
+    monkeypatch.setattr(api, "_now", lambda: 1_000.0)
+    monkeypatch.setattr(
+        api,
+        "preview_delete",
+        lambda spec: captured.update(preview_spec=spec)
+        or {"matched_count": len(spec.ids), "max_id": max_bigint},
+    )
+    monkeypatch.setattr(
+        api,
+        "delete_matching",
+        lambda spec, max_id: captured.update(execute_spec=spec, max_id=max_id)
+        or len(spec.ids),
+    )
+    preview = authed_client.post(
+        "/admin/mcp-logs/delete-preview",
+        json={
+            "mode": "ids",
+            "ids": [str(max_bigint), max_safe_integer, "9007199254740993", "1"],
+        },
+    )
+
+    assert preview.status_code == 200
+    expected = DeleteSpec(
+        mode="ids",
+        ids=(1, max_safe_integer, 9007199254740993, max_bigint),
+    )
+    assert captured["preview_spec"] == expected
+
+    response = authed_client.post(
+        "/admin/mcp-logs/delete",
+        json={
+            "mode": "ids",
+            "ids": [
+                "1",
+                str(max_bigint),
+                "9007199254740993",
+                str(max_safe_integer),
+            ],
+            "confirm_token": preview.json()["confirm_token"],
+        },
+    )
+
+    assert response.status_code == 200
+    assert captured["execute_spec"] == expected
+
+
+@pytest.mark.parametrize(
+    "invalid_id",
+    [
+        0,
+        -1,
+        2**53,
+        2**63,
+        True,
+        1.0,
+        "0",
+        "-1",
+        "+1",
+        " 1",
+        "1 ",
+        "01",
+        "1.0",
+        "9223372036854775808",
+        "１",
+    ],
+)
+def test_delete_rejects_noncanonical_or_out_of_bigint_range_ids(
+    authed_client, invalid_id
+):
+    response = authed_client.post(
+        "/admin/mcp-logs/delete-preview",
+        json={"mode": "ids", "ids": [invalid_id]},
+    )
+
+    assert response.status_code == 422
 
 
 @pytest.mark.parametrize(
