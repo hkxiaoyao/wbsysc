@@ -26,6 +26,9 @@ from starlette.middleware.cors import CORSMiddleware
 from . import db
 from .auth import BearerTokenMiddleware
 from .config import get_settings
+from .connections.sync import ResolverConnectionContextBuilder, SyncOrchestrator
+from .connectors.registry import ConnectorRegistry
+from .connectors.wecom import WeComConnector
 from .mcp_audit import (
     McpProtocolAuditMiddleware,
     acquire_audit_writer,
@@ -44,6 +47,18 @@ logger = logging.getLogger("wecom-gateway")
 # 全局调度器，lifespan 启动/关闭
 _scheduler: AsyncIOScheduler | None = None
 mcp_gateway = ConnectionMcpGateway()
+
+
+def _build_connection_sync_orchestrator() -> SyncOrchestrator:
+    return SyncOrchestrator(
+        ConnectorRegistry(
+            [WeComConnector(mock_enabled=lambda: get_settings().wecom_use_mock)]
+        ),
+        contexts=ResolverConnectionContextBuilder(),
+    )
+
+
+connection_sync_orchestrator = _build_connection_sync_orchestrator()
 
 
 def create_app(*, gateway: ConnectionMcpGateway | None = None) -> FastAPI:
@@ -149,17 +164,19 @@ def create_app(*, gateway: ConnectionMcpGateway | None = None) -> FastAPI:
 
 
 async def _sync_job_async():
-    """同步任务异步包装：遍历所有启用租户，线程池执行不阻塞事件循环"""
+    """Legacy WeCom scheduler entrypoint delegated to connection-scoped sync."""
     settings = get_settings()
-    if settings.wecom_use_mock:
+    if getattr(settings, "wecom_use_mock", False):
         logger.debug("mock 模式，跳过真实同步")
         return
-    from .wecom.dispatch import run_sync_all
     loop = asyncio.get_running_loop()
     try:
-        await loop.run_in_executor(None, lambda: run_sync_all())
-    except Exception as e:  # noqa: BLE001
-        logger.error("同步任务异常: %s", e)
+        await loop.run_in_executor(
+            None,
+            lambda: asyncio.run(connection_sync_orchestrator.run_scheduled()),
+        )
+    except Exception:  # noqa: BLE001
+        logger.error("Connection sync job failed code=sync_job_failed")
 
 
 async def _cleanup_logs_job_async():

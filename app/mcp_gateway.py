@@ -510,6 +510,9 @@ class ConnectionMcpGateway:
             write_event(
                 McpLogEvent(
                     tenant_id=safe_summary(event.tenant_id, 64),
+                    connection_id=safe_summary(event.connection_id, 64),
+                    connector_key=safe_summary(event.connector_key, 64),
+                    tool_key=safe_summary(event.tool_key, 128),
                     category="tool",
                     event_name=safe_summary(event.tool_key, 96),
                     target=safe_summary(event.connection_id, 256),

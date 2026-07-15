@@ -9,6 +9,8 @@ from apscheduler.triggers.interval import IntervalTrigger
 
 from app import main, mcp_audit, mcp_log_store
 from app.auth import BearerTokenMiddleware
+from app.connectors.runtime import ConnectorAuditEvent
+from app import mcp_gateway
 from app.mcp_audit import McpProtocolAuditMiddleware
 
 
@@ -61,6 +63,33 @@ def test_daily_cleanup_runs_in_executor(monkeypatch):
 
     assert cleanup_threads
     assert cleanup_threads[0] != calling_thread
+
+
+def test_runtime_audit_writes_server_resolved_connection_dimensions(monkeypatch):
+    events = []
+    monkeypatch.setattr(mcp_gateway, "write_event", events.append)
+    monkeypatch.setattr(
+        mcp_gateway,
+        "current_request_metadata",
+        lambda: {"request_id": "req-1", "client_ip": "203.0.113.8", "http_method": "POST"},
+    )
+
+    mcp_gateway.ConnectionMcpGateway._write_runtime_audit(
+        object(),
+        ConnectorAuditEvent(
+            tenant_id="tenant-a",
+            connection_id="conn-a",
+            connector_key="wecom",
+            tool_key="reports.list",
+            status="ok",
+            cost_ms=12,
+        ),
+    )
+
+    assert len(events) == 1
+    assert events[0].connection_id == "conn-a"
+    assert events[0].connector_key == "wecom"
+    assert events[0].tool_key == "reports.list"
 
 
 def test_lifespan_schedules_daily_cleanup_without_running_it_immediately(monkeypatch):

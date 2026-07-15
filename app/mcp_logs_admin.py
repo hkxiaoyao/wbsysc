@@ -35,6 +35,9 @@ SAFE_LOG_FIELDS = frozenset(
     (
         "id",
         "tenant_id",
+        "connection_id",
+        "connector_key",
+        "tool_key",
         "category",
         "event_name",
         "target",
@@ -121,6 +124,9 @@ def _complete_window(
 def _new_filters(
     *,
     tenant_id: str | None = None,
+    connection_id: str | None = None,
+    connector_key: str | None = None,
+    tool_key: str | None = None,
     category: Category | None = None,
     event_name: str | None = None,
     status: Status | None = None,
@@ -142,6 +148,9 @@ def _new_filters(
     try:
         return LogFilters(
             tenant_id=tenant_id,
+            connection_id=connection_id,
+            connector_key=connector_key,
+            tool_key=tool_key,
             category=category or "",
             event_name=event_name or "",
             status=status or "",
@@ -159,6 +168,9 @@ def _new_filters(
 
 def _query_filters(
     tenant_id: Annotated[str | None, Query(max_length=64)] = None,
+    connection_id: Annotated[str | None, Query(max_length=64)] = None,
+    connector_key: Annotated[str | None, Query(max_length=64)] = None,
+    tool_key: Annotated[str | None, Query(max_length=128)] = None,
     category: Annotated[Category | None, Query()] = None,
     event_name: Annotated[str | None, Query(max_length=96)] = None,
     status: Annotated[Status | None, Query()] = None,
@@ -172,6 +184,9 @@ def _query_filters(
 ) -> LogFilters:
     return _new_filters(
         tenant_id=tenant_id,
+        connection_id=connection_id,
+        connector_key=connector_key,
+        tool_key=tool_key,
         category=category,
         event_name=event_name,
         status=status,
@@ -190,6 +205,9 @@ class DeleteFilterBody(BaseModel):
     model_config = ConfigDict(extra="forbid", populate_by_name=True)
 
     tenant_id: str | None = Field(default=None, max_length=64)
+    connection_id: str | None = Field(default=None, max_length=64)
+    connector_key: str | None = Field(default=None, max_length=64)
+    tool_key: str | None = Field(default=None, max_length=128)
     category: Category | None = None
     event_name: str | None = Field(default=None, max_length=96)
     status: Status | None = None
@@ -226,6 +244,9 @@ class DeleteFilterBody(BaseModel):
             value not in (None, "")
             for value in (
                 self.tenant_id,
+                self.connection_id,
+                self.connector_key,
+                self.tool_key,
                 self.category,
                 self.event_name,
                 self.status,
@@ -242,6 +263,9 @@ class DeleteFilterBody(BaseModel):
     def to_filters(self) -> LogFilters:
         return _new_filters(
             tenant_id=self.tenant_id,
+            connection_id=self.connection_id,
+            connector_key=self.connector_key,
+            tool_key=self.tool_key,
             category=self.category,
             event_name=self.event_name,
             status=self.status,
@@ -374,6 +398,9 @@ def _filters_payload(filters: LogFilters) -> dict[str, Any]:
     payload: dict[str, Any] = {}
     for name in (
         "tenant_id",
+        "connection_id",
+        "connector_key",
+        "tool_key",
         "category",
         "event_name",
         "status",

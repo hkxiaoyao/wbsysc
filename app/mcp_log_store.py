@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import logging
 import math
+import uuid
 from dataclasses import replace
 from datetime import datetime, timedelta, timezone
 from typing import Any
@@ -15,7 +16,7 @@ from .mcp_log_models import DeleteSpec, LogFilters, McpLogEvent
 logger = logging.getLogger(__name__)
 
 _RETENTION_KEY = "mcp_log_retention_days"
-_LEGACY_MIGRATION_KEY = "mcp_log_legacy_migration_v1"
+_LEGACY_MIGRATION_KEY = "mcp_log_legacy_migration_v2"
 _LEGACY_MIGRATION_VALUE = "completed"
 _DEFAULT_RETENTION_DAYS = 90
 _MAX_DELETE_BATCH = 5000
@@ -24,6 +25,9 @@ _LOG_TABLE_DDL = """
 CREATE TABLE IF NOT EXISTS `mcp_call_log` (
   `id` BIGINT NOT NULL AUTO_INCREMENT,
   `tenant_id` VARCHAR(64) NOT NULL DEFAULT '',
+  `connection_id` VARCHAR(64) NULL,
+  `connector_key` VARCHAR(64) NULL,
+  `tool_key` VARCHAR(128) NULL,
   `category` VARCHAR(16) NOT NULL,
   `event_name` VARCHAR(96) NOT NULL,
   `target` VARCHAR(256) NOT NULL DEFAULT '',
@@ -41,6 +45,9 @@ CREATE TABLE IF NOT EXISTS `mcp_call_log` (
   `created_at` DATETIME(6) NOT NULL DEFAULT CURRENT_TIMESTAMP(6),
   PRIMARY KEY (`id`),
   KEY `idx_mcp_log_tenant_created` (`tenant_id`, `created_at`, `id`),
+  KEY `idx_mcp_log_connection_created` (`tenant_id`, `connection_id`, `created_at`, `id`),
+  KEY `idx_mcp_log_connector_created` (`connector_key`, `created_at`, `id`),
+  KEY `idx_mcp_log_tool_created` (`tool_key`, `created_at`, `id`),
   KEY `idx_mcp_log_created` (`created_at`, `id`),
   KEY `idx_mcp_log_event` (`category`, `event_name`, `created_at`),
   KEY `idx_mcp_log_status` (`result_status`, `created_at`),
@@ -62,9 +69,29 @@ CREATE TABLE IF NOT EXISTS `gateway_setting` (
 """
 
 _SAFE_COLUMNS = """id, tenant_id, category, event_name, target, params_summary,
-result_status, error_code, error_summary, cost_ms, request_id, client_ip,
-http_method, http_status, created_at"""
+connection_id, connector_key, tool_key, result_status, error_code, error_summary,
+cost_ms, request_id, client_ip, http_method, http_status, created_at"""
 _TREND_BUCKET_EXPRESSION = "DATE_FORMAT(created_at, '%Y-%m-%d %H:00:00')"
+
+_DIMENSION_COLUMN_DDLS = {
+    "connection_id": "ADD COLUMN `connection_id` VARCHAR(64) NULL AFTER `tenant_id`",
+    "connector_key": "ADD COLUMN `connector_key` VARCHAR(64) NULL AFTER `connection_id`",
+    "tool_key": "ADD COLUMN `tool_key` VARCHAR(128) NULL AFTER `connector_key`",
+}
+_DIMENSION_INDEX_DDLS = {
+    "idx_mcp_log_connection_created": (
+        "ADD KEY `idx_mcp_log_connection_created` "
+        "(`tenant_id`, `connection_id`, `created_at`, `id`)"
+    ),
+    "idx_mcp_log_connector_created": (
+        "ADD KEY `idx_mcp_log_connector_created` "
+        "(`connector_key`, `created_at`, `id`)"
+    ),
+    "idx_mcp_log_tool_created": (
+        "ADD KEY `idx_mcp_log_tool_created` "
+        "(`tool_key`, `created_at`, `id`)"
+    ),
+}
 
 
 def _engine():
@@ -78,6 +105,36 @@ def ensure_central_log_tables() -> None:
     with _engine().begin() as conn:
         conn.execute(text(_LOG_TABLE_DDL))
         conn.execute(text(_SETTING_TABLE_DDL))
+        existing_columns = _mysql_names(conn, "SHOW COLUMNS FROM `mcp_call_log`", "Field", 0)
+        for name, ddl in _DIMENSION_COLUMN_DDLS.items():
+            if name not in existing_columns:
+                conn.execute(text(f"ALTER TABLE `mcp_call_log` {ddl}"))
+        existing_indexes = _mysql_names(conn, "SHOW INDEX FROM `mcp_call_log`", "Key_name", 2)
+        for name, ddl in _DIMENSION_INDEX_DDLS.items():
+            if name not in existing_indexes:
+                conn.execute(text(f"ALTER TABLE `mcp_call_log` {ddl}"))
+
+
+def _mysql_names(conn: Any, statement: str, mapping_key: str, tuple_index: int) -> set[str]:
+    """Read MySQL metadata without MySQL-8-only `IF NOT EXISTS` syntax."""
+    rows = conn.execute(text(statement)).fetchall()
+    names: set[str] = set()
+    for row in rows:
+        try:
+            values = _mapping(row)
+            value = values.get(mapping_key)
+        except (TypeError, ValueError):
+            try:
+                value = row[tuple_index]
+            except (IndexError, KeyError, TypeError):
+                continue
+        if isinstance(value, str) and value:
+            names.add(value)
+    return names
+
+
+def _legacy_default_connection_id(tenant_id: str) -> str:
+    return str(uuid.uuid5(uuid.NAMESPACE_URL, f"wbsysc:legacy-wecom:{tenant_id}"))
 
 
 def migrate_legacy_logs(days: int = 90) -> None:
@@ -109,22 +166,48 @@ def migrate_legacy_logs(days: int = 90) -> None:
             logger.warning("Skipping invalid legacy audit schema for tenant_id=%s", tenant_id)
             continue
         statement = text(f"""
-            INSERT IGNORE INTO mcp_call_log
-              (tenant_id, category, event_name, target, params_summary,
-               result_status, error_code, error_summary, cost_ms, request_id,
-               client_ip, http_method, http_status, legacy_schema, legacy_id,
-               created_at)
-            SELECT :tenant_id, 'tool', tool_name, target, params_summary,
-                   CASE
-                     WHEN result_status IN ('ok','partial','error','denied')
-                       THEN result_status
-                     ELSE 'error'
+            INSERT INTO mcp_call_log
+              (tenant_id, connection_id, connector_key, tool_key, category,
+               event_name, target, params_summary, result_status, error_code,
+               error_summary, cost_ms, request_id, client_ip, http_method,
+               http_status, legacy_schema, legacy_id, created_at)
+            SELECT :tenant_id,
+                   connection_map.connection_id,
+                   CASE WHEN connection_map.connection_id IS NULL THEN NULL ELSE 'wecom' END,
+                   CASE WHEN connection_map.connection_id IS NULL THEN NULL
+                        ELSE CASE legacy.tool_name
+                          WHEN 'wecom_list_reports' THEN 'reports.list'
+                          WHEN 'wecom_get_report' THEN 'reports.get'
+                          WHEN 'wecom_list_approvals' THEN 'approvals.list'
+                          WHEN 'wecom_get_approval_detail' THEN 'approvals.get'
+                          WHEN 'wecom_list_checkins' THEN 'checkins.list'
+                          WHEN 'wecom_list_smart_table_records' THEN 'smart_tables.records.list'
+                          ELSE NULL
+                        END
                    END,
-                   '', '', GREATEST(cost_ms, 0), '', '', '', 0,
-                   :legacy_schema, id, created_at
-            FROM `{schema_name}`.`audit_log`
-            WHERE created_at >= UTC_TIMESTAMP() - INTERVAL {days} DAY
-              AND created_at >= :tenant_created_at
+                   'tool', legacy.tool_name, legacy.target, legacy.params_summary,
+                    CASE
+                      WHEN legacy.result_status IN ('ok','partial','error','denied')
+                        THEN legacy.result_status
+                      ELSE 'error'
+                    END,
+                    '', '', GREATEST(legacy.cost_ms, 0), '', '', '', 0,
+                    :legacy_schema, legacy.id, legacy.created_at
+             FROM `{schema_name}`.`audit_log` AS legacy
+             LEFT JOIN (
+               SELECT connection_id
+               FROM connection_instance
+               WHERE connection_id=:default_connection_id
+                 AND tenant_id=:tenant_id
+                 AND connector_key='wecom'
+               LIMIT 1
+             ) AS connection_map ON 1=1
+             WHERE legacy.created_at >= UTC_TIMESTAMP() - INTERVAL {days} DAY
+               AND legacy.created_at >= :tenant_created_at
+             ON DUPLICATE KEY UPDATE
+               connection_id=COALESCE(connection_id, VALUES(connection_id)),
+               connector_key=COALESCE(connector_key, VALUES(connector_key)),
+               tool_key=COALESCE(tool_key, VALUES(tool_key))
         """)
         try:
             with _engine().begin() as conn:
@@ -134,6 +217,7 @@ def migrate_legacy_logs(days: int = 90) -> None:
                         "tenant_id": tenant_id,
                         "legacy_schema": schema_name,
                         "tenant_created_at": tenant_created_at,
+                        "default_connection_id": _legacy_default_connection_id(tenant_id),
                     },
                 )
         except Exception:
@@ -165,17 +249,22 @@ def insert_event(event: McpLogEvent) -> None:
         raise TypeError("event must be McpLogEvent")
     statement = text("""
         INSERT INTO mcp_call_log
-          (tenant_id, category, event_name, target, params_summary,
-           result_status, error_code, error_summary, cost_ms, request_id,
-           client_ip, http_method, http_status, created_at)
+          (tenant_id, connection_id, connector_key, tool_key, category,
+           event_name, target, params_summary, result_status, error_code,
+           error_summary, cost_ms, request_id, client_ip, http_method,
+           http_status, created_at)
         VALUES
-          (:tenant_id, :category, :event_name, :target, :params_summary,
-           :result_status, :error_code, :error_summary, :cost_ms, :request_id,
-           :client_ip, :http_method, :http_status,
+          (:tenant_id, :connection_id, :connector_key, :tool_key, :category,
+           :event_name, :target, :params_summary, :result_status, :error_code,
+           :error_summary, :cost_ms, :request_id, :client_ip, :http_method,
+           :http_status,
            COALESCE(:created_at, UTC_TIMESTAMP(6)))
     """)
     params = {
         "tenant_id": event.tenant_id,
+        "connection_id": event.connection_id,
+        "connector_key": event.connector_key,
+        "tool_key": event.tool_key,
         "category": event.category,
         "event_name": event.event_name,
         "target": event.target,
@@ -206,6 +295,15 @@ def _filter_where(filters: LogFilters) -> tuple[list[str], dict[str, Any]]:
     if filters.tenant_id is not None:
         clauses.append("tenant_id = :tenant_id")
         params["tenant_id"] = filters.tenant_id
+    for attribute, column in (
+        ("connection_id", "connection_id"),
+        ("connector_key", "connector_key"),
+        ("tool_key", "tool_key"),
+    ):
+        value = getattr(filters, attribute)
+        if value is not None:
+            clauses.append(f"{column} = :{attribute}")
+            params[attribute] = value
     direct_fields = (
         ("category", "category"),
         ("event_name", "event_name"),
