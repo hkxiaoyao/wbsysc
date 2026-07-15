@@ -12,6 +12,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import re
 from contextlib import contextmanager
 from typing import Any, Dict, Iterator, List, Optional
 
@@ -47,6 +48,9 @@ _BUSINESS_COLUMN_DEFINITIONS = {
         "is_partial": "TINYINT NOT NULL DEFAULT 0",
     },
 }
+
+_CONNECTION_SYNC_ID_RE = re.compile(r"[A-Za-z0-9][A-Za-z0-9_.:-]{0,63}\Z")
+_CONNECTION_SYNC_LOCK_RE = re.compile(r"wbsysc:connection-sync:[0-9a-f]{40}\Z")
 
 
 def get_engine() -> Engine:
@@ -94,11 +98,21 @@ def _valid_tenant_schema(schema: str) -> bool:
 
 
 @contextmanager
-def tenant_sync_lock(schema: str, timeout: int = 0) -> Iterator[bool]:
+def tenant_sync_lock(
+    schema: str,
+    timeout: int = 0,
+    *,
+    _lock_name: str | None = None,
+) -> Iterator[bool]:
     """用独立物理连接持有租户级同步互斥锁，不占主 QueuePool。"""
     assert schema.replace("_", "").isalnum(), f"非法schema: {schema}"
-    digest = hashlib.sha256(schema.encode("utf-8")).hexdigest()[:40]
-    lock_name = f"wbsysc:tenant-sync:{digest}"
+    if _lock_name is None:
+        digest = hashlib.sha256(schema.encode("utf-8")).hexdigest()[:40]
+        lock_name = f"wbsysc:tenant-sync:{digest}"
+    else:
+        if _CONNECTION_SYNC_LOCK_RE.fullmatch(_lock_name) is None:
+            raise ValueError("invalid connection sync lock name")
+        lock_name = _lock_name
     with get_lock_engine().connect() as conn:
         acquired = conn.execute(
             text("SELECT GET_LOCK(:name, :timeout)"),
@@ -124,6 +138,31 @@ def tenant_sync_lock(schema: str, timeout: int = 0) -> Iterator[bool]:
                     finally:
                         conn.close()
                     raise RuntimeError(f"failed to release tenant sync lock: {schema}")
+
+
+@contextmanager
+def connection_sync_lock(
+    schema: str,
+    connection_id: str,
+    timeout: int = 0,
+) -> Iterator[bool]:
+    """Hold a distributed lock for one safe, bounded connection identity.
+
+    The lock still uses the established independent-connection lifecycle, but
+    its advisory key is derived from both tenant schema and connection ID so
+    sibling connections cannot make one another appear busy.
+    """
+    if not _valid_tenant_schema(schema):
+        raise ValueError("schema is required")
+    if (
+        not isinstance(connection_id, str)
+        or _CONNECTION_SYNC_ID_RE.fullmatch(connection_id) is None
+    ):
+        raise ValueError("connection_id is required")
+    material = f"{schema}\0{connection_id}".encode("utf-8")
+    lock_name = "wbsysc:connection-sync:" + hashlib.sha256(material).hexdigest()[:40]
+    with tenant_sync_lock(schema, timeout, _lock_name=lock_name) as acquired:
+        yield acquired
 
 
 def ensure_central_columns() -> None:

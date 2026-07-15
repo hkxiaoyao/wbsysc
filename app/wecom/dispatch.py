@@ -614,7 +614,11 @@ def run_sync_connection(
     if not tenant_context.schema_name:
         return {"error": "missing_schema"}
     try:
-        with db.tenant_sync_lock(tenant_context.schema_name, timeout=0) as acquired:
+        with db.connection_sync_lock(
+            tenant_context.schema_name,
+            connection_id,
+            timeout=0,
+        ) as acquired:
             if not acquired:
                 logger.warning("connection sync busy connection_id=%s", connection_id)
                 return {"busy": True}

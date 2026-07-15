@@ -28,6 +28,18 @@ _SENSITIVE_KEY_PARTS = frozenset(
         "response",
     }
 )
+_SENSITIVE_VALUE_MARKERS = frozenset(
+    {
+        "apikey",
+        "authorization",
+        "cookie",
+        "credential",
+        "password",
+        "rawresponse",
+        "secret",
+        "token",
+    }
+)
 _OMITTED = "[omitted]"
 _SAFE_SCOPE_KEY_RE = re.compile(r"[A-Za-z0-9][A-Za-z0-9_.:-]{0,127}\Z")
 T = TypeVar("T")
@@ -67,6 +79,37 @@ def _normalized_key_name(value: object) -> str:
 def _is_sensitive_key(value: object) -> bool:
     normalized = _normalized_key_name(value)
     return any(part in normalized for part in _SENSITIVE_KEY_PARTS)
+
+
+def _contains_sensitive_value(value: Any, *, depth: int = 0) -> bool:
+    """Reject values that could carry a credential or raw upstream body."""
+    if depth > 8:
+        return True
+    if value is None or isinstance(value, (bool, int)):
+        return False
+    if isinstance(value, float):
+        return not math.isfinite(value)
+    if isinstance(value, str):
+        normalized = _normalized_key_name(value)
+        return any(marker in normalized for marker in _SENSITIVE_VALUE_MARKERS)
+    if isinstance(value, (bytes, bytearray, memoryview)):
+        return True
+    if isinstance(value, Mapping):
+        if len(value) > 200:
+            return True
+        for key, child in value.items():
+            if (
+                not isinstance(key, str)
+                or _is_sensitive_key(key)
+                or _contains_sensitive_value(child, depth=depth + 1)
+            ):
+                return True
+        return False
+    if isinstance(value, (list, tuple)):
+        if len(value) > 200:
+            return True
+        return any(_contains_sensitive_value(child, depth=depth + 1) for child in value)
+    return True
 
 
 def _canonical_arguments(value: Any, *, depth: int = 0) -> Any:
@@ -202,6 +245,8 @@ class ConnectionCache:
         # response body.  Retain only structured, redacted result projections.
         if isinstance(value, (str, bytes, bytearray, memoryview)):
             return
+        if _contains_sensitive_value(value):
+            return
         entry = _Entry(
             expires_at=self._clock() + float(ttl_seconds),
             value=_safe_value(value),
@@ -250,7 +295,9 @@ class ConnectionCache:
                 owner = False
 
         if not owner:
-            ok, result = await existing
+            # A cancelling waiter must not cancel the owner's shared future.
+            # The owner separately propagates its own cancellation to peers.
+            ok, result = await asyncio.shield(existing)
             if ok:
                 return copy.deepcopy(result)
             raise CacheLoadError()
@@ -267,12 +314,20 @@ class ConnectionCache:
             safe_result = await self.get(connection_id, tool_key, args)
             existing.set_result((True, safe_result))
             return result
+        except asyncio.CancelledError:
+            # Do not convert the owner's cancellation to a cache error.  Wake
+            # all same-key waiters promptly instead of leaving them pending.
+            if not existing.done():
+                existing.cancel()
+            raise
         except Exception:
-            existing.set_result((False, None))
+            if not existing.done():
+                existing.set_result((False, None))
             raise CacheLoadError() from None
         finally:
             async with self._lock:
-                self._inflight.pop(key, None)
+                if self._inflight.get(key) is existing:
+                    self._inflight.pop(key, None)
 
     async def invalidate_connection(self, connection_id: str) -> int:
         """Remove all cached data for one connection without inspecting values."""

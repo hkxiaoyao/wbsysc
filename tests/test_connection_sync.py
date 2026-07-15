@@ -1,6 +1,9 @@
 from __future__ import annotations
 
+import asyncio
 import logging
+import threading
+from contextlib import contextmanager
 from types import SimpleNamespace
 
 import pytest
@@ -28,6 +31,22 @@ def connection(
         data_mode=data_mode,
         public_config={},
         config_version=1,
+    )
+
+
+def wecom_connection_context(connection_id: str) -> ConnectionContext:
+    return ConnectionContext(
+        connection=ConnectionRecord(
+            connection_id=connection_id,
+            tenant_id="tenant-a",
+            connector_key="wecom",
+            display_name="WeCom",
+            status="active",
+            data_mode="stored",
+            public_config={"corpid": "corp-a", "schema_name": "wbd_shared"},
+            config_version=1,
+        ),
+        credentials={"wecom_app_secret": "app-secret"},
     )
 
 
@@ -77,6 +96,114 @@ async def test_sync_orchestrator_scopes_context_and_resource_to_connection():
     assert contexts.connections == [connection("conn-b")]
     assert [(context.connection_id, resource_key) for context, resource_key in connector.calls] == [
         ("conn-b", "reports.list")
+    ]
+
+
+def test_connection_locks_serialize_across_event_loop_threads():
+    from app.connections.sync import _ConnectionLocks
+
+    locks = _ConnectionLocks()
+    first_started = threading.Event()
+    release_first = threading.Event()
+    same_connection_entered = threading.Event()
+    different_connection_entered = threading.Event()
+    failures: list[BaseException] = []
+
+    async def hold(connection_id: str, phase: str) -> None:
+        async with locks.acquire(connection_id):
+            if phase == "first":
+                first_started.set()
+                await asyncio.to_thread(release_first.wait, 1)
+            elif phase == "same":
+                same_connection_entered.set()
+            else:
+                different_connection_entered.set()
+
+    def run(connection_id: str, phase: str) -> None:
+        try:
+            asyncio.run(asyncio.wait_for(hold(connection_id, phase), timeout=1.5))
+        except BaseException as exc:  # keep thread failures observable to pytest
+            failures.append(exc)
+
+    first = threading.Thread(target=run, args=("conn-a", "first"), daemon=True)
+    same = threading.Thread(target=run, args=("conn-a", "same"), daemon=True)
+    different = threading.Thread(target=run, args=("conn-b", "different"), daemon=True)
+    first.start()
+    assert first_started.wait(0.5)
+    same.start()
+    different.start()
+
+    assert different_connection_entered.wait(0.5)
+    assert not same_connection_entered.wait(0.1)
+    release_first.set()
+    first.join(1)
+    same.join(1)
+    different.join(1)
+
+    assert not first.is_alive()
+    assert not same.is_alive()
+    assert not different.is_alive()
+    assert failures == []
+    assert same_connection_entered.is_set()
+
+
+def test_connection_sync_db_lock_uses_distinct_validated_advisory_keys(monkeypatch):
+    from app import db
+
+    calls = []
+
+    @contextmanager
+    def fake_tenant_lock(schema, timeout=0, *, _lock_name=None):
+        calls.append((schema, timeout, _lock_name))
+        yield True
+
+    monkeypatch.setattr(db, "tenant_sync_lock", fake_tenant_lock)
+
+    with db.connection_sync_lock("wbd_shared", "conn-a", timeout=0) as acquired:
+        assert acquired is True
+    with db.connection_sync_lock("wbd_shared", "conn-a", timeout=0):
+        pass
+    with db.connection_sync_lock("wbd_shared", "conn-b", timeout=0):
+        pass
+
+    assert calls[0][0:2] == ("wbd_shared", 0)
+    assert calls[0][2] == calls[1][2]
+    assert calls[0][2] != calls[2][2]
+    assert calls[0][2].startswith("wbsysc:connection-sync:")
+    with pytest.raises(ValueError, match="connection_id"):
+        with db.connection_sync_lock("wbd_shared", "token=top-secret"):
+            pass
+
+
+def test_wecom_connection_sync_busy_lock_is_scoped_to_connection(monkeypatch):
+    from app.wecom import dispatch
+
+    calls = []
+
+    @contextmanager
+    def connection_lock(schema, connection_id, timeout=0):
+        calls.append((schema, connection_id, timeout))
+        yield connection_id != "conn-a"
+
+    def legacy_lock_must_not_be_used(*args, **kwargs):
+        raise AssertionError("connection sync must not take the tenant-wide lock")
+
+    monkeypatch.setattr(dispatch.db, "connection_sync_lock", connection_lock)
+    monkeypatch.setattr(dispatch.db, "tenant_sync_lock", legacy_lock_must_not_be_used)
+    monkeypatch.setattr(
+        dispatch,
+        "_sync_one_report",
+        lambda *args, **kwargs: {"pulled": 1, "stored": 1},
+    )
+
+    busy = dispatch.run_sync_connection(wecom_connection_context("conn-a"), "reports")
+    ready = dispatch.run_sync_connection(wecom_connection_context("conn-b"), "reports")
+
+    assert busy == {"busy": True}
+    assert ready == {"pulled": 1, "stored": 1}
+    assert calls == [
+        ("wbd_shared", "conn-a", 0),
+        ("wbd_shared", "conn-b", 0),
     ]
 
 
@@ -149,6 +276,57 @@ async def test_cache_does_not_retain_a_top_level_raw_response_body():
     )
 
     assert await cache.get("conn-a", "reports.list") is None
+
+
+@pytest.mark.asyncio
+async def test_cache_bypasses_nested_sensitive_values_under_benign_keys():
+    cache = ConnectionCache()
+
+    await cache.put(
+        "conn-a",
+        "reports.list",
+        {"result": "token=top-secret raw-response-body"},
+        ttl_seconds=60,
+    )
+
+    assert await cache.get("conn-a", "reports.list") is None
+
+
+@pytest.mark.asyncio
+async def test_cache_owner_cancellation_releases_same_key_waiter():
+    cache = ConnectionCache()
+    owner_started = asyncio.Event()
+    never_complete = asyncio.Event()
+
+    async def blocked_loader():
+        owner_started.set()
+        await never_complete.wait()
+        return {"count": 1}
+
+    async def waiter_loader():
+        raise AssertionError("same-key waiter must join the owner")
+
+    owner = asyncio.create_task(
+        cache.get_or_load("conn-a", "reports.list", loader=blocked_loader)
+    )
+    await owner_started.wait()
+    waiter = asyncio.create_task(
+        cache.get_or_load("conn-a", "reports.list", loader=waiter_loader)
+    )
+    await asyncio.sleep(0)
+
+    owner.cancel()
+
+    with pytest.raises(asyncio.CancelledError):
+        await owner
+    with pytest.raises(asyncio.CancelledError):
+        await asyncio.wait_for(waiter, timeout=0.5)
+
+    assert await cache.get_or_load(
+        "conn-a",
+        "reports.list",
+        loader=lambda: {"count": 2},
+    ) == {"count": 2}
 
 
 @pytest.mark.asyncio

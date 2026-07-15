@@ -6,6 +6,7 @@ import inspect
 import json
 import logging
 import re
+import threading
 from collections.abc import Callable, Iterable, Mapping
 from contextlib import asynccontextmanager
 from typing import Any, Protocol
@@ -77,18 +78,29 @@ class ResolverConnectionContextBuilder:
 
 
 class _ConnectionLocks:
-    """One async lock per opaque connection ID, with no credential-bearing keys."""
+    """One nonblocking process-local lock per opaque connection ID.
+
+    The scheduler invokes this orchestrator from separate event loops in worker
+    threads.  ``asyncio.Lock`` is loop-bound under contention, so this registry
+    uses thread-safe locks and short cooperative polling instead.
+    """
 
     def __init__(self) -> None:
-        self._locks: dict[str, asyncio.Lock] = {}
-        self._guard = asyncio.Lock()
+        self._locks: dict[str, threading.Lock] = {}
+        self._guard = threading.Lock()
 
     @asynccontextmanager
     async def acquire(self, connection_id: str):
-        async with self._guard:
-            lock = self._locks.setdefault(connection_id, asyncio.Lock())
-        async with lock:
+        with self._guard:
+            lock = self._locks.setdefault(connection_id, threading.Lock())
+        while not lock.acquire(blocking=False):
+            # This never blocks an event loop and, unlike a blocking worker
+            # acquire, cannot claim a lock after its coroutine is cancelled.
+            await asyncio.sleep(0.01)
+        try:
             yield
+        finally:
+            lock.release()
 
 
 def _safe_resource_key(value: str | None) -> str:
