@@ -64,6 +64,7 @@ def test_prod_accepts_credential_key_with_at_least_32_utf8_bytes():
         "   ",
         "CHANGE_ME",
         "<强随机串>",
+        "PoC_DEFAULT_KEY_DO_NOT_USE_IN_PRODUCTION_32bytes!",
         "h" * 31,
         "密" * 10,
     ],
@@ -81,6 +82,19 @@ def test_prod_accepts_mcp_token_hmac_key_with_at_least_32_utf8_bytes():
 def test_prod_rejects_mcp_hmac_key_that_reuses_the_credential_key():
     with pytest.raises(ValidationError, match="MCP_TOKEN_HMAC_KEY"):
         prod_settings(mcp_token_hmac_key="k" * 32)
+
+
+def test_production_template_and_deployer_manage_a_distinct_hmac_key():
+    root = Path(__file__).resolve().parents[1]
+    template = (root / ".env.prod.example").read_text(encoding="utf-8")
+    deployer = (root / "deploy" / "server_deploy.sh").read_text(encoding="utf-8")
+
+    assert "MCP_TOKEN_HMAC_KEY=<独立强随机串>" in template
+    assert 'MCP_TOKEN_HMAC_KEY="$(read_env_value MCP_TOKEN_HMAC_KEY)"' in deployer
+    assert "已自动生成 MCP_TOKEN_HMAC_KEY" in deployer
+    assert "MCP_TOKEN_HMAC_KEY 必须为非示例值且至少 32 UTF-8 字节" in deployer
+    assert '"$MCP_TOKEN_HMAC_KEY" = "$CREDENTIAL_KEY"' in deployer
+    assert "unset ADMIN_PASSWORD CREDENTIAL_KEY MCP_TOKEN_HMAC_KEY" in deployer
 
 
 def test_dev_keeps_mock_and_empty_key_fallback():

@@ -16,8 +16,10 @@ EXAMPLE_PASSWORDS = {"CHANGE_ME", "<强密码，与开发库不同>", "<强密�
 EXAMPLE_MCP_TOKEN_HMAC_KEYS = {
     "CHANGE_ME",
     "<强随机串>",
+    "<独立强随机串>",
     "MCP_TOKEN_HMAC_KEY",
     "<MCP_TOKEN_HMAC_KEY>",
+    "PoC_DEFAULT_KEY_DO_NOT_USE_IN_PRODUCTION_32bytes!",
 }
 
 

@@ -37,6 +37,13 @@ is_example_password() {
   esac
 }
 
+is_example_mcp_token_hmac_key() {
+  case "$1" in
+    ""|"CHANGE_ME"|"<强随机串>"|"<独立强随机串>"|"MCP_TOKEN_HMAC_KEY"|"<MCP_TOKEN_HMAC_KEY>"|"PoC_DEFAULT_KEY_DO_NOT_USE_IN_PRODUCTION_32bytes!") return 0 ;;
+    *) return 1 ;;
+  esac
+}
+
 byte_length() {
   LC_ALL=C printf '%s' "$1" | wc -c | tr -d '[:space:]'
 }
@@ -76,12 +83,12 @@ if [ ! -f .env ]; then
   echo "首次运行：生成 .env 模板，请编辑填入真实值后重新运行本脚本"
   cp .env.prod.example .env
   echo ""
-  echo "生产必填：APP_ENV=prod / WECOM_USE_MOCK=false / DB_PASSWORD / ADMIN_PASSWORD / CREDENTIAL_KEY"
+  echo "生产必填：APP_ENV=prod / WECOM_USE_MOCK=false / DB_PASSWORD / ADMIN_PASSWORD / CREDENTIAL_KEY / MCP_TOKEN_HMAC_KEY"
   echo "  ADMIN_PASSWORD = 管理后台登录强密码"
   echo "  DB_PASSWORD    = MySQL websysc 账户密码（需与 MySQL 一致）"
   echo "  DB_HOST 已默认 host.docker.internal（同台部署容器访问宿主MySQL）"
-  echo "  CREDENTIAL_KEY 可保留模板占位符，下次运行会自动生成 32 字节以上强密钥"
-  echo "  CREDENTIAL_KEY 不能长期留空；弱的自定义值会被拒绝"
+  echo "  CREDENTIAL_KEY 和 MCP_TOKEN_HMAC_KEY 可保留模板占位符，下次运行会分别自动生成 32 字节以上强密钥"
+  echo "  两把密钥必须保持独立；弱的自定义值会被拒绝"
   echo ""
   echo "编辑：vim $APP_DIR/.env"
   exit 1
@@ -111,6 +118,27 @@ if [ -z "$CREDENTIAL_KEY" ] || [ "$CREDENTIAL_KEY" = "<强随机串>" ]; then
   echo "✓ 已自动生成 CREDENTIAL_KEY"
 fi
 
+# MCP Token HMAC 密钥必须与凭证加密密钥独立生成，禁止复用或派生。
+MCP_TOKEN_HMAC_KEY="$(read_env_value MCP_TOKEN_HMAC_KEY)"
+if is_example_mcp_token_hmac_key "$MCP_TOKEN_HMAC_KEY"; then
+  if command -v python3 &>/dev/null; then
+    GENERATED_MCP_TOKEN_HMAC_KEY="$(python3 -c "import secrets;print(secrets.token_urlsafe(48))")"
+  elif command -v openssl &>/dev/null; then
+    GENERATED_MCP_TOKEN_HMAC_KEY="$(openssl rand -hex 32)"
+  else
+    echo "❌ 无法自动生成 MCP_TOKEN_HMAC_KEY：需要 python3 或 openssl"
+    exit 1
+  fi
+  if grep -q '^MCP_TOKEN_HMAC_KEY=' .env; then
+    sed -i "s|^MCP_TOKEN_HMAC_KEY=.*|MCP_TOKEN_HMAC_KEY=$GENERATED_MCP_TOKEN_HMAC_KEY|" .env
+  else
+    printf '\nMCP_TOKEN_HMAC_KEY=%s\n' "$GENERATED_MCP_TOKEN_HMAC_KEY" >> .env
+  fi
+  unset GENERATED_MCP_TOKEN_HMAC_KEY
+  MCP_TOKEN_HMAC_KEY="$(read_env_value MCP_TOKEN_HMAC_KEY)"
+  echo "✓ 已自动生成 MCP_TOKEN_HMAC_KEY"
+fi
+
 chmod 600 .env
 
 CONFIG_INVALID=0
@@ -136,11 +164,19 @@ if [ "$CREDENTIAL_KEY" = "<强随机串>" ] || [ "$(byte_length "$CREDENTIAL_KEY
   echo "❌ CREDENTIAL_KEY 必须为非示例值且至少 32 UTF-8 字节"
   CONFIG_INVALID=1
 fi
+if is_example_mcp_token_hmac_key "$MCP_TOKEN_HMAC_KEY" || [ "$(byte_length "$MCP_TOKEN_HMAC_KEY")" -lt 32 ]; then
+  echo "❌ MCP_TOKEN_HMAC_KEY 必须为非示例值且至少 32 UTF-8 字节"
+  CONFIG_INVALID=1
+fi
+if [ "$MCP_TOKEN_HMAC_KEY" = "$CREDENTIAL_KEY" ]; then
+  echo "❌ MCP_TOKEN_HMAC_KEY 必须与 CREDENTIAL_KEY 保持独立"
+  CONFIG_INVALID=1
+fi
 if [ "$CONFIG_INVALID" -ne 0 ]; then
   echo "❌ .env 生产配置校验失败，尚未拉取镜像或启动应用"
   exit 1
 fi
-unset ADMIN_PASSWORD CREDENTIAL_KEY
+unset ADMIN_PASSWORD CREDENTIAL_KEY MCP_TOKEN_HMAC_KEY
 echo "✓ .env 生产配置校验通过"
 
 echo ""
