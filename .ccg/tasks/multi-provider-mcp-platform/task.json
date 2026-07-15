@@ -6,7 +6,7 @@
   "risk": "high",
   "domain": "architecture",
   "currentPhase": "planning",
-  "nextAction": "自审已确认设计文档并等待用户审阅",
+  "nextAction": "计划已完成并等待用户选择执行方式",
   "createdAt": "2026-07-15T00:00:00+08:00",
   "branch": "main"
 }
