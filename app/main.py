@@ -31,7 +31,7 @@ from .mcp_audit import (
     acquire_audit_writer,
     release_audit_writer,
 )
-from .mcp_server import mcp
+from .mcp_gateway import ConnectionMcpGateway
 from .admin import router as admin_router
 from .mcp_logs_admin import router as mcp_logs_admin_router
 
@@ -43,18 +43,26 @@ logger = logging.getLogger("wecom-gateway")
 
 # 全局调度器，lifespan 启动/关闭
 _scheduler: AsyncIOScheduler | None = None
+mcp_gateway = ConnectionMcpGateway()
 
 
-def create_app() -> FastAPI:
+def create_app(*, gateway: ConnectionMcpGateway | None = None) -> FastAPI:
     settings = get_settings()
+    gateway = gateway or mcp_gateway
     app = FastAPI(title="企微数据中转 MCP Gateway", version="0.1.0")
+    app.state.mcp_gateway = gateway
 
     # WorkBuddy 等客户端 POST /mcp（无尾斜杠）。Starlette Mount("/mcp") 时
     # 子应用拿到 path=""，匹配不到 FastMCP 的 "/"，会 405。进入路由前补上斜杠。
     @app.middleware("http")
     async def _mcp_trailing_slash(request, call_next):
-        if request.scope.get("path") == "/mcp":
+        path = request.scope.get("path")
+        if path == "/mcp":
             request.scope["path"] = "/mcp/"
+        elif isinstance(path, str) and path.startswith("/mcp/") and path.count("/") == 2:
+            # A parameterized Mount needs its terminal slash to win over the
+            # legacy `/mcp` catch-all mount for `/mcp/{connection_id}`.
+            request.scope["path"] = f"{path}/"
         return await call_next(request)
 
     # 管理后台 API（独立路由，不经 MCP 鉴权，自带 session 校验）
@@ -106,32 +114,37 @@ def create_app() -> FastAPI:
     if os.path.isdir(dist_dir):
         app.mount("/admin/ui", StaticFiles(directory=dist_dir, html=True), name="admin-ui")
 
-    # MCP Streamable HTTP 子 app（内部路径已设为 "/"，见 mcp_server.py）
-    mcp_app = mcp.streamable_http_app()
-
+    # Each route reaches the same connection-aware gateway, but authentication
+    # happens before it can create or dispatch a protocol session.
     from starlette.applications import Starlette
     from starlette.routing import Mount
 
-    mcp_glyph = Starlette(
-        routes=[Mount("/", app=mcp_app)],
-        middleware=[
-            Middleware(BearerTokenMiddleware),
-            Middleware(McpProtocolAuditMiddleware),
-            Middleware(
-                CORSMiddleware,
-                allow_origins=["*"],
-                allow_methods=["GET", "POST", "DELETE"],
-                allow_headers=["*"],
-                expose_headers=["Mcp-Session-Id"],
-            ),
-        ],
-    )
-    # 关键：只挂 /mcp，不挂根 /（避免吞掉 /admin/ui 导致 401）。
-    # 最终对外 endpoint = /mcp（兼容 WorkBuddy streamableHttp + 后台复制的配置）
-    app.mount("/mcp", mcp_glyph)
+    def mcp_subapp(*, legacy: bool) -> Starlette:
+        return Starlette(
+            routes=[Mount("/", app=gateway)],
+            middleware=[
+                Middleware(BearerTokenMiddleware, resolver=gateway.resolver, legacy=legacy),
+                Middleware(McpProtocolAuditMiddleware),
+                Middleware(
+                    CORSMiddleware,
+                    allow_origins=["*"],
+                    allow_methods=["GET", "POST", "DELETE"],
+                    allow_headers=["*"],
+                    expose_headers=["Mcp-Session-Id"],
+                ),
+            ],
+        )
 
-    logger.info("MCP Gateway 挂载于 /mcp (Streamable HTTP)，含 Bearer Token 鉴权")
-    logger.info("已注册工具: %s", list(mcp._tool_manager._tools.keys()))  # noqa: SLF001
+    dynamic_mcp_app = mcp_subapp(legacy=False)
+    legacy_mcp_app = mcp_subapp(legacy=True)
+
+    # The parameterized mount must come first so a valid bearer token is bound
+    # to the exact path connection ID before MCP handling.  `/mcp` remains for
+    # callers using the Task 1 default legacy WeCom connection.
+    app.mount("/mcp/{connection_id}", dynamic_mcp_app)
+    app.mount("/mcp", legacy_mcp_app)
+
+    logger.info("MCP Gateway mounted at /mcp/{connection_id} and legacy /mcp")
     return app
 
 
@@ -188,9 +201,13 @@ async def lifespan(app):
                     type(exc).__name__,
                 )
 
-    # 2. MCP 会话管理器
+    # 2. Connection-scoped MCP session manager cache
+    gateway = getattr(getattr(app, "state", None), "mcp_gateway", mcp_gateway)
+    # The gateway owns a cache of low-level Streamable HTTP session managers;
+    # retain this lifecycle name for the established startup ordering contract.
+    session_manager = gateway
     try:
-        async with mcp.session_manager.run():
+        async with session_manager.run():
             scheduler = None
             try:
                 # 3. APScheduler 定时同步

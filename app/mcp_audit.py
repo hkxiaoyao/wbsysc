@@ -407,6 +407,17 @@ def _tenant_id() -> str:
         return ""
 
 
+def _connection_id() -> str:
+    """Return a resolved connection ID only; never echo an untrusted route value."""
+    try:
+        from .auth import current_ctx
+
+        connection_id = getattr(current_ctx(), "connection_id", "")
+        return safe_summary(connection_id, 256) if isinstance(connection_id, str) else ""
+    except Exception:
+        return ""
+
+
 class McpProtocolAuditMiddleware:
     """Pure ASGI middleware recording bounded MCP protocol metadata."""
 
@@ -511,6 +522,7 @@ class McpProtocolAuditMiddleware:
                         tenant_id=_tenant_id(),
                         category="protocol",
                         event_name=event_name,
+                        target=_connection_id(),
                         result_status=status,
                         error_code=str(http_status) if http_status >= 400 else "",
                         cost_ms=cost_ms,
