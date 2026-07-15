@@ -25,7 +25,7 @@ FULL_WINDOW_DAYS = 180
 MAX_DETAIL_PER_RUN = 500
 MIN_WINDOW_SECONDS = 60
 
-# userid 缓存：tenant_id -> (userids, expire_at)，避免每次同步都拉通讯录
+# userid 缓存：租户或连接身份 -> (userids, expire_at)，避免每次同步都拉通讯录
 _userid_cache: dict = {}
 _USERID_CACHE_TTL = 600   # 10分钟
 
@@ -49,11 +49,15 @@ def _bounded_windows(
     yield from _bounded_windows(fetch, midpoint, endtime, limit)
 
 
-def _resolve_checkin_userids(t: _TenantCtx) -> list:
+def _resolve_checkin_userids(t: _TenantCtx, cache_key: str | None = None) -> list:
     """解析打卡用 useridlist：优先自动拉通讯录，失败回退手动配"""
     import time as _t
     now = _t.time()
-    cached = _userid_cache.get(t.tenant_id)
+    # Tenant sync retains its historical tenant-scoped cache.  Connection sync
+    # supplies a connection identity because distinct connections may share a
+    # tenant but use different contact credentials.
+    resolved_cache_key = ("connection", cache_key) if cache_key else t.tenant_id
+    cached = _userid_cache.get(resolved_cache_key)
     if cached and now < cached[1]:
         return cached[0]
 
@@ -61,7 +65,7 @@ def _resolve_checkin_userids(t: _TenantCtx) -> list:
     if t.contact_secret:
         try:
             uids = fetch_all_userids(t.corpid, t.contact_secret)
-            _userid_cache[t.tenant_id] = (uids, now + _USERID_CACHE_TTL)
+            _userid_cache[resolved_cache_key] = (uids, now + _USERID_CACHE_TTL)
             logger.info("租户 %s 自动拉取userid=%s人", t.tenant_id, len(uids))
             return uids
         except Exception as e:
@@ -119,6 +123,7 @@ def _sync_one_checkin(
     lookback_days: int,
     force: bool = False,
     cursor_key: str = "",
+    userid_cache_key: str | None = None,
 ) -> dict:
     """打卡同步：需租户配置了 checkin_userids / contact_secret"""
     starttime, endtime = _window(
@@ -148,7 +153,7 @@ def _sync_one_checkin(
         logger.warning("租户 %s 启用打卡但既无通讯录secret也无checkin_userids，跳过", t.tenant_id)
         return {**stats, "error": "no userid source (需配contact_secret或checkin_userids)"}
 
-    userids = _resolve_checkin_userids(t)
+    userids = _resolve_checkin_userids(t, cache_key=userid_cache_key)
     if not userids:
         return {**stats, "error": "userid list 为空"}
 
@@ -196,11 +201,19 @@ def _detail_ok_report(info: dict) -> bool:
     return True
 
 
+def _without_internal_detail_error(info: object) -> object:
+    """Keep connection-scoped detail records free of legacy exception text."""
+    if not isinstance(info, dict):
+        return info
+    return {key: value for key, value in info.items() if key != "_partial_error"}
+
+
 def _sync_one_report(
     t: _TenantCtx,
     lookback_days: int,
     force: bool = False,
     cursor_key: str = "",
+    safe_errors: bool = False,
 ) -> dict:
     starttime, endtime = _window(
         t.schema_name,
@@ -233,13 +246,20 @@ def _sync_one_report(
                     info = fetch_report_detail(t.corpid, t.secret, ju)
                     if not _detail_ok_report(info if isinstance(info, dict) else {}):
                         # 详情失败也不丢单号：用列表 uuid 写最小记录，避免「企微3条库只有2条」
-                        logger.warning(
-                            "汇报详情异常仍落最小记录 ju=%s keys=%s errcode=%s errmsg=%s",
-                            ju[:16],
-                            list(info.keys())[:12] if isinstance(info, dict) else type(info).__name__,
-                            (info or {}).get("errcode") if isinstance(info, dict) else None,
-                            (info or {}).get("errmsg") if isinstance(info, dict) else None,
-                        )
+                        if safe_errors:
+                            logger.warning(
+                                "connection report detail unavailable ju=%s errcode=%s",
+                                ju[:16],
+                                (info or {}).get("errcode") if isinstance(info, dict) else None,
+                            )
+                        else:
+                            logger.warning(
+                                "汇报详情异常仍落最小记录 ju=%s keys=%s errcode=%s errmsg=%s",
+                                ju[:16],
+                                list(info.keys())[:12] if isinstance(info, dict) else type(info).__name__,
+                                (info or {}).get("errcode") if isinstance(info, dict) else None,
+                                (info or {}).get("errmsg") if isinstance(info, dict) else None,
+                            )
                         info = {
                             "journaluuid": ju,
                             "journal_uuid": ju,
@@ -260,7 +280,14 @@ def _sync_one_report(
                         if isinstance(sub, str):
                             info = {**info, "submitter": {"userid": sub}}
                 except Exception as e:
-                    logger.warning("汇报详情拉取失败 %s: %s", ju[:16], e)
+                    if safe_errors:
+                        logger.warning(
+                            "connection report detail failed ju=%s type=%s",
+                            ju[:16],
+                            type(e).__name__,
+                        )
+                    else:
+                        logger.warning("汇报详情拉取失败 %s: %s", ju[:16], e)
                     stats["err"] += 1
                     info = {
                         "journaluuid": ju,
@@ -270,8 +297,11 @@ def _sync_one_report(
                         "report_time": 0,
                         "submitter": {},
                         "_partial": True,
-                        "_partial_error": str(e),
                     }
+                    if not safe_errors:
+                        info["_partial_error"] = str(e)
+                if safe_errors:
+                    info = _without_internal_detail_error(info)
                 try:
                     db.upsert_report(
                         t.schema_name,
@@ -281,9 +311,23 @@ def _sync_one_report(
                     )
                     stats["stored"] += 1
                 except Exception as e:
-                    logger.warning("汇报落库失败 %s: %s", ju[:16], e)
+                    if safe_errors:
+                        logger.warning(
+                            "connection report storage failed ju=%s type=%s",
+                            ju[:16],
+                            type(e).__name__,
+                        )
+                    else:
+                        logger.warning("汇报落库失败 %s: %s", ju[:16], e)
                     stats["write_err"] += 1
     except Exception as e:
+        if safe_errors:
+            logger.error(
+                "connection report sync failed tenant=%s type=%s",
+                t.tenant_id,
+                type(e).__name__,
+            )
+            return {"error": "sync_failed", **stats}
         logger.error("汇报拉取失败 tenant=%s: %s", t.tenant_id, e)
         return {"error": str(e), **stats}
     # 游标存真实 now，不用放宽后的 endtime，避免下次窗异常
@@ -300,6 +344,7 @@ def _sync_one_approval(
     lookback_days: int,
     force: bool = False,
     cursor_key: str = "",
+    safe_errors: bool = False,
 ) -> dict:
     starttime, endtime = _window(
         t.schema_name,
@@ -331,12 +376,19 @@ def _sync_one_approval(
                 try:
                     info = fetch_approval_detail(t.corpid, t.secret, sp)
                     if not isinstance(info, dict) or info.get("errcode") not in (None, 0):
-                        logger.warning(
-                            "审批详情异常仍落最小记录 sp=%s errcode=%s errmsg=%s",
-                            sp,
-                            (info or {}).get("errcode") if isinstance(info, dict) else None,
-                            (info or {}).get("errmsg") if isinstance(info, dict) else None,
-                        )
+                        if safe_errors:
+                            logger.warning(
+                                "connection approval detail unavailable sp=%s errcode=%s",
+                                sp,
+                                (info or {}).get("errcode") if isinstance(info, dict) else None,
+                            )
+                        else:
+                            logger.warning(
+                                "审批详情异常仍落最小记录 sp=%s errcode=%s errmsg=%s",
+                                sp,
+                                (info or {}).get("errcode") if isinstance(info, dict) else None,
+                                (info or {}).get("errmsg") if isinstance(info, dict) else None,
+                            )
                         info = {"sp_no": sp, "sp_name": "", "sp_status": 0, "template_id": "",
                                 "apply_time": 0, "applyer": {}, "_partial": True}
                         stats["err"] += 1
@@ -346,7 +398,14 @@ def _sync_one_approval(
                     if isinstance(applyer, str):
                         info = {**info, "applyer": {"userid": applyer}}
                 except Exception as e:
-                    logger.warning("审批详情拉取失败 %s: %s", sp, e)
+                    if safe_errors:
+                        logger.warning(
+                            "connection approval detail failed sp=%s type=%s",
+                            sp,
+                            type(e).__name__,
+                        )
+                    else:
+                        logger.warning("审批详情拉取失败 %s: %s", sp, e)
                     stats["err"] += 1
                     info = {
                         "sp_no": sp,
@@ -356,8 +415,11 @@ def _sync_one_approval(
                         "apply_time": 0,
                         "applyer": {},
                         "_partial": True,
-                        "_partial_error": str(e),
                     }
+                    if not safe_errors:
+                        info["_partial_error"] = str(e)
+                if safe_errors:
+                    info = _without_internal_detail_error(info)
                 try:
                     db.upsert_approval(
                         t.schema_name,
@@ -367,9 +429,23 @@ def _sync_one_approval(
                     )
                     stats["stored"] += 1
                 except Exception as e:
-                    logger.warning("审批落库失败 %s: %s", sp, e)
+                    if safe_errors:
+                        logger.warning(
+                            "connection approval storage failed sp=%s type=%s",
+                            sp,
+                            type(e).__name__,
+                        )
+                    else:
+                        logger.warning("审批落库失败 %s: %s", sp, e)
                     stats["write_err"] += 1
     except Exception as e:
+        if safe_errors:
+            logger.error(
+                "connection approval sync failed tenant=%s type=%s",
+                t.tenant_id,
+                type(e).__name__,
+            )
+            return {"error": "sync_failed", **stats}
         logger.error("审批拉取失败 tenant=%s: %s", t.tenant_id, e)
         return {"error": str(e), **stats}
     if stats["write_err"] == 0:
@@ -516,6 +592,9 @@ def run_sync_connection(
     """
     if not isinstance(context, ConnectionContext):
         raise TypeError("context must be a ConnectionContext")
+    connection_id = context.connection_id
+    if not isinstance(connection_id, str) or not connection_id.strip():
+        raise ValueError("connection_id is required")
     resource_aliases = {
         "report": ("report", _sync_one_report),
         "reports": ("report", _sync_one_report),
@@ -537,15 +616,28 @@ def run_sync_connection(
     try:
         with db.tenant_sync_lock(tenant_context.schema_name, timeout=0) as acquired:
             if not acquired:
-                logger.warning("connection sync busy connection_id=%s", context.connection_id)
+                logger.warning("connection sync busy connection_id=%s", connection_id)
                 return {"busy": True}
-            return _safe_connection_sync_result(
-                sync_resource(
+            sync_kwargs = {
+                "force": force,
+                "cursor_key": connection_id,
+            }
+            if _resource == "checkin":
+                result = sync_resource(
                     tenant_context,
                     lookback_days,
-                    force=force,
-                    cursor_key=context.connection_id,
+                    **sync_kwargs,
+                    userid_cache_key=connection_id,
                 )
+            else:
+                result = sync_resource(
+                    tenant_context,
+                    lookback_days,
+                    **sync_kwargs,
+                    safe_errors=True,
+                )
+            return _safe_connection_sync_result(
+                result
             )
     except Exception as exc:
         # A sync result must not surface raw third-party/API exception text.

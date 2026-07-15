@@ -182,7 +182,7 @@ def _error_result(
     else:
         data = {
             "tenant": context.tenant_id,
-            "source": "wecom" if context.data_mode == "direct" else "db",
+            "source": "db" if context.data_mode == "stored" else "wecom",
             "errcode": 502,
             "errmsg": "数据访问失败",
         }

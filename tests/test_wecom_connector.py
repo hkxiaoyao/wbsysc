@@ -230,6 +230,187 @@ def test_connection_sync_does_not_return_raw_failure_text(monkeypatch):
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize(
+    (
+        "resource_key",
+        "tool_key",
+        "identifier",
+        "sync_name",
+        "detail_name",
+        "upsert_name",
+        "stored_detail_name",
+        "args",
+    ),
+    [
+        (
+            "reports",
+            "reports.get",
+            "report-1",
+            "sync_reports_window",
+            "fetch_report_detail",
+            "upsert_report",
+            "get_report_detail",
+            {"journaluuid": "report-1"},
+        ),
+        (
+            "approvals",
+            "approvals.get",
+            "approval-1",
+            "sync_approvals_window",
+            "fetch_approval_detail",
+            "upsert_approval",
+            "get_approval_detail",
+            {"sp_no": "approval-1"},
+        ),
+    ],
+)
+async def test_connection_sync_never_persists_upstream_exception_text(
+    monkeypatch,
+    resource_key,
+    tool_key,
+    identifier,
+    sync_name,
+    detail_name,
+    upsert_name,
+    stored_detail_name,
+    args,
+):
+    from app import data_access
+    from app.wecom import dispatch
+
+    secret_marker = "secret=connection-sync-marker"
+    stored = {}
+
+    class Lock:
+        def __enter__(self):
+            return True
+
+        def __exit__(self, *args):
+            return False
+
+    monkeypatch.setattr(dispatch.db, "tenant_sync_lock", lambda *args, **kwargs: Lock())
+    monkeypatch.setattr(dispatch.db, "get_cursor", lambda *args: "")
+    monkeypatch.setattr(dispatch.db, "save_cursor", lambda *args: None)
+    monkeypatch.setattr(dispatch, sync_name, lambda *args, **kwargs: [identifier])
+    monkeypatch.setattr(
+        dispatch,
+        detail_name,
+        lambda *args: (_ for _ in ()).throw(RuntimeError(secret_marker)),
+    )
+
+    def upsert(*values, **kwargs):
+        stored.update(values[2])
+
+    monkeypatch.setattr(dispatch.db, upsert_name, upsert)
+    monkeypatch.setattr(data_access.db, stored_detail_name, lambda *args: dict(stored))
+
+    sync_result = dispatch.run_sync_connection(
+        connection_context("conn-a", "stored"), resource_key
+    )
+    result = await WeComConnector(mock_enabled=lambda: False).execute(
+        connection_context("conn-a", "stored"), tool_key, args
+    )
+
+    assert stored["_partial"] is True
+    assert "_partial_error" not in stored
+    assert secret_marker not in repr(stored)
+    assert secret_marker not in repr(sync_result)
+    assert result.data["detail"]["_partial"] is True
+    assert secret_marker not in repr(result.data)
+
+
+def test_connection_checkin_user_cache_is_partitioned_by_connection_id(monkeypatch):
+    from dataclasses import replace
+
+    from app.wecom import dispatch
+
+    class Lock:
+        def __enter__(self):
+            return True
+
+        def __exit__(self, *args):
+            return False
+
+    class FetchResult:
+        attempted = 0
+        failed = 0
+        records = []
+        errors = []
+
+    fetches = []
+    monkeypatch.setattr(dispatch, "_userid_cache", {})
+    monkeypatch.setattr(dispatch.db, "tenant_sync_lock", lambda *args, **kwargs: Lock())
+    monkeypatch.setattr(dispatch.db, "get_cursor", lambda *args: "")
+    monkeypatch.setattr(dispatch.db, "save_cursor", lambda *args: None)
+    monkeypatch.setattr(dispatch.db, "upsert_checkin", lambda *args: None)
+    monkeypatch.setattr(
+        dispatch,
+        "fetch_all_userids",
+        lambda corpid, secret: fetches.append(secret) or [secret],
+    )
+    monkeypatch.setattr(
+        dispatch,
+        "fetch_checkin_records_with_stats",
+        lambda *args: FetchResult(),
+    )
+    context_a = replace(
+        connection_context("conn-a", "stored"),
+        credentials={"wecom_app_secret": "app-a", "wecom_contact_secret": "contact-a"},
+    )
+    context_b = replace(
+        connection_context("conn-b", "stored"),
+        credentials={"wecom_app_secret": "app-b", "wecom_contact_secret": "contact-b"},
+    )
+
+    dispatch.run_sync_connection(context_a, "checkins")
+    dispatch.run_sync_connection(context_b, "checkins")
+
+    assert fetches == ["contact-a", "contact-b"]
+
+
+def test_connection_sync_rejects_a_blank_connection_id_before_using_cursor(monkeypatch):
+    from app.wecom import dispatch
+
+    def forbidden(*args, **kwargs):
+        raise AssertionError("blank connection IDs must not touch sync state")
+
+    monkeypatch.setattr(dispatch.db, "tenant_sync_lock", forbidden)
+    monkeypatch.setattr(dispatch.db, "get_cursor", forbidden)
+    monkeypatch.setattr(dispatch.db, "save_cursor", forbidden)
+    monkeypatch.setattr(
+        dispatch,
+        "_sync_one_report",
+        forbidden,
+    )
+
+    with pytest.raises(ValueError, match="connection_id"):
+        dispatch.run_sync_connection(connection_context("", "stored"), "reports")
+
+
+@pytest.mark.asyncio
+async def test_hybrid_fallback_error_uses_wecom_source(monkeypatch):
+    from app import data_access
+
+    secret_marker = "secret=hybrid-fallback-marker"
+    context = connection_context("conn-a", "hybrid")
+    monkeypatch.setattr(data_access.db, "query_reports_by_window", lambda *args: [])
+    monkeypatch.setattr(
+        data_access,
+        "sync_reports_window",
+        lambda *args, **kwargs: (_ for _ in ()).throw(RuntimeError(secret_marker)),
+    )
+
+    result = await WeComConnector(mock_enabled=lambda: False).execute(
+        context,
+        "reports.list",
+        {"starttime": 1, "endtime": 2, "limit": 10},
+    )
+
+    assert result.data["source"] == "wecom"
+    assert secret_marker not in repr(result.data)
+
+
+@pytest.mark.asyncio
 async def test_wecom_sync_uses_connection_scoped_cursor(monkeypatch):
     from app.connectors import wecom
 
