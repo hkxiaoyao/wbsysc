@@ -139,7 +139,7 @@ class ConnectionResolver:
         if record is None:
             return None
         try:
-            return _connection_ctx(record)
+            return _connection_ctx(record, expected_connection_id=connection_id)
         except Exception as exc:
             logger.warning("MCP connection record rejected type=%s", type(exc).__name__)
             return None
@@ -186,9 +186,17 @@ def _nonempty_string(value: object) -> bool:
     return isinstance(value, str) and bool(value)
 
 
-def _connection_ctx(record: ConnectionRecord) -> ConnectionCtx:
+def _connection_ctx(
+    record: ConnectionRecord,
+    *,
+    expected_connection_id: str,
+) -> ConnectionCtx:
     if not isinstance(record, ConnectionRecord):
         raise TypeError("resolved record must be a ConnectionRecord")
+    if record.connection_id != expected_connection_id:
+        raise ValueError("resolved record does not match requested connection")
+    if record.status != "active":
+        raise ValueError("resolved record is not active")
     return ConnectionCtx(
         tenant_id=record.tenant_id,
         connection_id=record.connection_id,
@@ -269,8 +277,7 @@ class _DatabaseToolPolicyStore(ToolPolicyStore):
 
 @dataclass
 class _SessionEntry:
-    manager: StreamableHTTPSessionManager
-    run_context: Any
+    server: Server
 
 
 class ConnectionMcpGateway:
@@ -291,6 +298,8 @@ class ConnectionMcpGateway:
         self._entries: dict[tuple[str, int], _SessionEntry] = {}
         self._manager_lock: asyncio.Lock | None = None
         self._run_count = 0
+        self._invalidation_loop: asyncio.AbstractEventLoop | None = None
+        self._store_invalidator: Callable[[str, int], None] | None = None
 
     def _default_runtime(self) -> ConnectorRuntime:
         registry = ConnectorRegistry(
@@ -304,30 +313,76 @@ class ConnectionMcpGateway:
 
     @contextlib.asynccontextmanager
     async def run(self) -> AsyncIterator[None]:
-        """Keep all lazy session managers alive for the application lifespan."""
+        """Keep the safe connection/version server cache for the app lifespan."""
         if self._run_count == 0:
             self._manager_lock = asyncio.Lock()
+            self._invalidation_loop = asyncio.get_running_loop()
+            self._store_invalidator = self._invalidate_after_connection_mutation
+            connection_store.register_connection_cache_invalidator(
+                self._store_invalidator
+            )
         self._run_count += 1
         try:
             yield
         finally:
             self._run_count -= 1
             if self._run_count == 0:
+                invalidator = self._store_invalidator
+                if invalidator is not None:
+                    connection_store.unregister_connection_cache_invalidator(invalidator)
                 lock = self._manager_lock
                 if lock is not None:
                     async with lock:
-                        entries = list(self._entries.values())
                         self._entries.clear()
-                        for entry in reversed(entries):
-                            await self._close_entry(entry)
                 self._manager_lock = None
+                self._invalidation_loop = None
+                self._store_invalidator = None
+
+    def _invalidate_after_connection_mutation(
+        self,
+        connection_id: str,
+        config_version: int,
+    ) -> None:
+        """Schedule raw-secret-free exact cache retirement from a store commit."""
+        loop = self._invalidation_loop
+        if loop is None or loop.is_closed():
+            return
+        coroutine = self.invalidate_connection(connection_id, config_version)
+        try:
+            running_loop = asyncio.get_running_loop()
+        except RuntimeError:
+            running_loop = None
+        if running_loop is loop:
+            task = loop.create_task(coroutine)
+            task.add_done_callback(self._report_invalidation_failure)
+            return
+        try:
+            future = asyncio.run_coroutine_threadsafe(coroutine, loop)
+        except Exception as exc:
+            coroutine.close()
+            logger.warning(
+                "MCP cache invalidation scheduling failed type=%s",
+                type(exc).__name__,
+            )
+            return
+        future.add_done_callback(self._report_invalidation_failure)
+
+    @staticmethod
+    def _report_invalidation_failure(future) -> None:
+        try:
+            future.result()
+        except Exception as exc:
+            logger.warning(
+                "MCP cache invalidation failed type=%s",
+                type(exc).__name__,
+            )
 
     async def invalidate_connection(
         self,
         connection_id: str,
         config_version: int,
     ) -> bool:
-        """Retire precisely one cached `(connection_id, config_version)` manager.
+        """Retire precisely one cached `(connection_id, config_version)` server.
 
         Call this after credential, Token, policy, status, or declarative
         revision changes.  The key is deliberately exact so another connection
@@ -339,10 +394,7 @@ class ConnectionMcpGateway:
             return False
         async with lock:
             entry = self._entries.pop(key, None)
-            if entry is None:
-                return False
-            await self._close_entry(entry)
-            return True
+            return entry is not None
 
     @property
     def cached_session_keys(self) -> tuple[tuple[str, int], ...]:
@@ -373,6 +425,11 @@ class ConnectionMcpGateway:
 
         try:
             manager = await self._manager_for(ctx)
+            # Streamable HTTP is stateless here, so its manager is request-local.
+            # Entering and closing it in this task avoids retaining request
+            # context in a long-lived cache or crossing anyio task boundaries.
+            async with manager.run():
+                await manager.handle_request(scope, receive, send)
         except Exception as exc:
             logger.warning("MCP session setup failed type=%s", type(exc).__name__)
             await JSONResponse(
@@ -380,9 +437,9 @@ class ConnectionMcpGateway:
                 status_code=503,
             )(scope, receive, send)
             return
-        await manager.handle_request(scope, receive, send)
 
     async def _manager_for(self, ctx: ConnectionCtx) -> StreamableHTTPSessionManager:
+        """Build a request-local manager around a safe cached server definition."""
         key = (ctx.connection_id, ctx.config_version)
         lock = self._manager_lock
         if lock is None:
@@ -390,41 +447,40 @@ class ConnectionMcpGateway:
         async with lock:
             entry = self._entries.get(key)
             if entry is not None:
-                return entry.manager
+                server = entry.server
+            else:
+                # A newer connection revision is a precise boundary: sessions tied
+                # to older versions of this connection must not remain routable.
+                stale_keys = [
+                    cached_key
+                    for cached_key in self._entries
+                    if cached_key[0] == ctx.connection_id and cached_key != key
+                ]
+                for stale_key in stale_keys:
+                    self._entries.pop(stale_key)
 
-            # A newer connection revision is a precise boundary: sessions tied
-            # to older versions of this connection must not remain routable.
-            stale_keys = [
-                cached_key
-                for cached_key in self._entries
-                if cached_key[0] == ctx.connection_id and cached_key != key
-            ]
-            for stale_key in stale_keys:
-                stale_entry = self._entries.pop(stale_key)
-                await self._close_entry(stale_entry)
+                # Only ConnectionCtx is retained by the cached server.  It carries
+                # public connection/version state, never request metadata or
+                # credentials.  Handlers create those sensitive values per call.
+                server = self._build_server(ctx)
+                self._entries[key] = _SessionEntry(server=server)
 
-            execution_context = self.resolver.execution_context(ctx)
-            server = self._build_server(execution_context)
-            manager = StreamableHTTPSessionManager(
-                app=server,
-                json_response=self._json_response,
-                # Stateless Streamable HTTP permits a direct protocol request
-                # at `/mcp/{connection_id}` while the cached manager still
-                # isolates the connection-specific low-level Server/tool cache.
-                stateless=True,
-                security_settings=self._transport_security,
-            )
-            run_context = manager.run()
-            await run_context.__aenter__()
-            self._entries[key] = _SessionEntry(manager=manager, run_context=run_context)
-            return manager
+        return StreamableHTTPSessionManager(
+            app=server,
+            json_response=self._json_response,
+            # Stateless Streamable HTTP permits a direct protocol request at
+            # `/mcp/{connection_id}` without caching request-bound managers.
+            stateless=True,
+            security_settings=self._transport_security,
+        )
 
-    def _build_server(self, execution_context: ConnectionContext) -> Server:
+    def _build_server(self, connection_ctx: ConnectionCtx) -> Server:
         server = Server("connection-mcp-gateway")
 
         @server.list_tools()
         async def list_tools() -> list[types.Tool]:
             try:
+                execution_context = self.resolver.execution_context(connection_ctx)
                 tools = self._runtime.list_enabled_tools(execution_context)
                 return [_to_mcp_tool(tool) for tool in tools]
             except Exception as exc:
@@ -434,6 +490,7 @@ class ConnectionMcpGateway:
         @server.call_tool(validate_input=True)
         async def call_tool(name: str, arguments: dict[str, Any]):
             try:
+                execution_context = self.resolver.execution_context(connection_ctx)
                 result = await self._runtime.execute(execution_context, name, arguments)
                 return result.data
             except Exception as exc:
@@ -446,12 +503,6 @@ class ConnectionMcpGateway:
                 )
 
         return server
-
-    async def _close_entry(self, entry: _SessionEntry) -> None:
-        try:
-            await entry.run_context.__aexit__(None, None, None)
-        except Exception as exc:
-            logger.warning("MCP session shutdown failed type=%s", type(exc).__name__)
 
     def _write_runtime_audit(self, event: ConnectorAuditEvent) -> None:
         try:

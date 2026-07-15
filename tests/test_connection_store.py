@@ -167,6 +167,27 @@ class RacingLegacyBackfillConnection(LegacyBackfillConnection):
         return super().execute(statement, params)
 
 
+class MutationConnection(FakeConnection):
+    def __init__(self, *, fail_policy_write=False):
+        super().__init__()
+        self.commit_succeeded = False
+        self.fail_policy_write = fail_policy_write
+
+    def __exit__(self, exc_type, _exc, _traceback):
+        self.commit_succeeded = exc_type is None
+        return False
+
+    def execute(self, statement, params=None):
+        params = params or {}
+        sql = str(statement)
+        self.statements.append((sql, params))
+        if "SELECT config_version FROM connection_instance" in sql:
+            return Result(scalar_value=7)
+        if self.fail_policy_write and "INSERT INTO connection_tool_policy" in sql:
+            raise RuntimeError("write failed")
+        return Result()
+
+
 def test_token_resolution_requires_matching_connection_id(monkeypatch):
     fake_connection = FakeConnection()
     monkeypatch.setattr(db, "get_engine", lambda: FakeEngine(fake_connection))
@@ -282,9 +303,17 @@ def test_create_connection_binds_public_config_and_encrypts_credentials(monkeypa
 
     store.create_connection(record, credentials={"app_secret": "plain-secret"})
 
-    connection_params = fake_connection.statements[0][1]
-    credential_params = fake_connection.statements[1][1]
-    assert "tenant-a" not in fake_connection.statements[0][0]
+    connection_sql, connection_params = next(
+        (sql, params)
+        for sql, params in fake_connection.statements
+        if "INSERT INTO connection_instance" in sql
+    )
+    _credential_sql, credential_params = next(
+        (sql, params)
+        for sql, params in fake_connection.statements
+        if "INSERT INTO connection_credential" in sql
+    )
+    assert "tenant-a" not in connection_sql
     assert connection_params["tenant_id"] == "tenant-a"
     assert credential_params["encrypted_value"] == b"ciphertext"
     assert "plain-secret" not in repr(credential_params)
@@ -393,3 +422,64 @@ def test_set_tool_policy_uses_bound_json_and_returns_typed_policy(monkeypatch):
     assert policy.policy == {"reason": "restricted"}
     assert "restricted" not in sql
     assert params["policy_json"] == '{"reason":"restricted"}'
+
+
+def test_successful_connection_mutations_notify_after_commit_without_raw_secrets(
+    monkeypatch,
+):
+    from app.connections.models import ConnectionRecord
+
+    fake_connection = MutationConnection()
+    events = []
+    monkeypatch.setattr(db, "get_engine", lambda: FakeEngine(fake_connection))
+    monkeypatch.setattr(store, "encrypt_credential", lambda _value: b"ciphertext")
+    monkeypatch.setattr(store, "token_hmac", lambda _value: "a" * 64)
+
+    def invalidator(connection_id, config_version):
+        assert fake_connection.commit_succeeded is True
+        events.append((connection_id, config_version))
+
+    store.register_connection_cache_invalidator(invalidator)
+    try:
+        store.create_connection(
+            ConnectionRecord(
+                connection_id="conn-a",
+                tenant_id="tenant-a",
+                connector_key="wecom",
+                display_name="WeCom",
+                status="disabled",
+                data_mode="stored",
+                public_config={},
+                config_version=8,
+            ),
+            credentials={"app_secret": "plain-secret"},
+        )
+        store.issue_token("conn-a", "raw-token")
+        store.set_tool_policy("conn-a", "reports.list", enabled=False)
+    finally:
+        store.unregister_connection_cache_invalidator(invalidator)
+
+    assert events == [("conn-a", 7), ("conn-a", 7), ("conn-a", 7)]
+    assert "plain-secret" not in repr(events)
+    assert "raw-token" not in repr(events)
+
+
+def test_failed_connection_mutation_does_not_notify_before_transaction_commit(
+    monkeypatch,
+):
+    fake_connection = MutationConnection(fail_policy_write=True)
+    events = []
+    monkeypatch.setattr(db, "get_engine", lambda: FakeEngine(fake_connection))
+
+    def invalidator(connection_id, config_version):
+        events.append((connection_id, config_version))
+
+    store.register_connection_cache_invalidator(invalidator)
+    try:
+        with pytest.raises(RuntimeError, match="write failed"):
+            store.set_tool_policy("conn-a", "reports.list", enabled=False)
+    finally:
+        store.unregister_connection_cache_invalidator(invalidator)
+
+    assert fake_connection.commit_succeeded is False
+    assert events == []

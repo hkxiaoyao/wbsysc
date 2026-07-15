@@ -1,12 +1,14 @@
 import asyncio
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from types import SimpleNamespace
 from typing import Any
 
 from fastapi.testclient import TestClient
 
+from app import db
 from app import main
 from app.auth import ConnectionCtx
+from app.connections import store as connection_store
 from app.connections.models import ConnectionRecord, ToolPolicy
 from app.connectors import (
     ConnectionContext,
@@ -21,9 +23,12 @@ from app.mcp_gateway import (
     ConnectionResolver,
     default_wecom_connection_id,
 )
+from app.mcp_audit import current_request_metadata
 
 
 TOOLS_LIST = {"jsonrpc": "2.0", "id": 2, "method": "tools/list", "params": {}}
+
+
 def bearer(token: str) -> dict[str, str]:
     return {
         "Authorization": f"Bearer {token}",
@@ -40,6 +45,7 @@ def tool_names(payload: dict[str, Any]) -> set[str]:
 class _FakeResolver:
     by_connection: dict[tuple[str, str], ConnectionCtx]
     legacy_tokens: dict[str, ConnectionCtx]
+    execution_request_ids: list[str] = field(default_factory=list)
 
     def resolve(self, connection_id: str, bearer_token: str) -> ConnectionCtx | None:
         return self.by_connection.get((connection_id, bearer_token))
@@ -48,6 +54,8 @@ class _FakeResolver:
         return self.legacy_tokens.get(bearer_token)
 
     def execution_context(self, ctx: ConnectionCtx) -> ConnectionContext:
+        metadata = current_request_metadata()
+        self.execution_request_ids.append(metadata.get("request_id", ""))
         return ConnectionContext(
             connection=ConnectionRecord(
                 connection_id=ctx.connection_id,
@@ -60,12 +68,14 @@ class _FakeResolver:
                 config_version=ctx.config_version,
             ),
             credentials={},
+            request_metadata=metadata,
         )
 
 
 class _FakeConnector:
     def __init__(self) -> None:
         self.calls: list[tuple[str, dict[str, Any]]] = []
+        self.request_ids: list[str] = []
         self.spec_calls = 0
 
     def spec(self) -> ConnectorSpec:
@@ -111,6 +121,7 @@ class _FakeConnector:
         args: dict[str, Any],
     ) -> ExecutionResult:
         self.calls.append((tool_key, dict(args)))
+        self.request_ids.append(context.request_metadata.get("request_id", ""))
         return ExecutionResult.ok({"tenant": context.tenant_id, "records": []})
 
     async def sync(self, context: ConnectionContext, resource_key: str):  # pragma: no cover
@@ -218,6 +229,64 @@ def test_low_level_server_validates_tool_input_before_connector_execution(monkey
     assert connector.calls == []
 
 
+def test_direct_tool_call_cannot_execute_a_hidden_tool(monkeypatch):
+    client, active_connection, connector = _client(monkeypatch)
+    hidden_call = {
+        "jsonrpc": "2.0",
+        "id": 4,
+        "method": "tools/call",
+        "params": {"name": "wecom_hidden_report", "arguments": {}},
+    }
+
+    with client:
+        response = _mcp_post(
+            client,
+            f"/mcp/{active_connection.connection_id}",
+            "token-a",
+            hidden_call,
+        )
+
+    assert response.status_code == 200
+    assert response.json()["result"]["isError"] is True
+    assert connector.calls == []
+
+
+def test_cached_server_builds_execution_metadata_for_each_request(monkeypatch):
+    client, active_connection, connector = _client(monkeypatch)
+    resolver = client.app.state.mcp_gateway.resolver
+    call = {
+        "jsonrpc": "2.0",
+        "id": 5,
+        "method": "tools/call",
+        "params": {
+            "name": "wecom_list_reports",
+            "arguments": {"starttime": 1, "endtime": 2},
+        },
+    }
+
+    first_headers = bearer("token-a")
+    first_headers["X-Request-Id"] = "request-one"
+    second_headers = bearer("token-a")
+    second_headers["X-Request-Id"] = "request-two"
+
+    with client:
+        first = client.post(
+            f"/mcp/{active_connection.connection_id}",
+            headers=first_headers,
+            json=TOOLS_LIST,
+        )
+        second = client.post(
+            f"/mcp/{active_connection.connection_id}",
+            headers=second_headers,
+            json=call,
+        )
+
+    assert first.status_code == 200
+    assert second.status_code == 200
+    assert resolver.execution_request_ids == ["request-one", "request-two"]
+    assert connector.request_ids == ["request-two"]
+
+
 def test_cache_invalidation_retires_only_the_exact_connection_version():
     active_connection = _connection("conn-a")
     other_connection = _connection("conn-b", tenant_id="tenant-b")
@@ -239,6 +308,57 @@ def test_cache_invalidation_retires_only_the_exact_connection_version():
             assert await gateway.invalidate_connection("conn-a", 1) is True
             assert set(gateway.cached_session_keys) == {("conn-b", 1)}
             assert await gateway.invalidate_connection("conn-a", 1) is False
+
+    asyncio.run(exercise())
+
+
+def test_store_policy_mutation_invalidates_only_its_cached_gateway_entry(monkeypatch):
+    active_connection = _connection("conn-a")
+    other_connection = _connection("conn-b", tenant_id="tenant-b")
+    gateway = ConnectionMcpGateway(
+        resolver=_FakeResolver(by_connection={}, legacy_tokens={}),
+        runtime=ConnectorRuntime(ConnectorRegistry([_FakeConnector()])),
+    )
+
+    class Result:
+        def scalar(self):
+            return 1
+
+    class Connection:
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *_args):
+            return False
+
+        def execute(self, statement, _params=None):
+            if "SELECT config_version FROM connection_instance" in str(statement):
+                return Result()
+            return Result()
+
+    class Engine:
+        def __init__(self):
+            self.connection = Connection()
+
+        def begin(self):
+            return self.connection
+
+    monkeypatch.setattr(db, "get_engine", lambda: Engine())
+
+    async def exercise() -> None:
+        async with gateway.run():
+            await gateway._manager_for(active_connection)
+            await gateway._manager_for(other_connection)
+
+            connection_store.set_tool_policy(
+                "conn-a", "reports.list", enabled=False
+            )
+            for _ in range(3):
+                if set(gateway.cached_session_keys) == {("conn-b", 1)}:
+                    break
+                await asyncio.sleep(0)
+
+            assert set(gateway.cached_session_keys) == {("conn-b", 1)}
 
     asyncio.run(exercise())
 
@@ -274,3 +394,39 @@ def test_resolver_never_falls_back_from_wrong_path_and_maps_legacy_token_to_defa
     assert legacy is not None
     assert legacy.connection_id == resolved_id
     assert calls == [("legacy-token", "conn-b"), ("legacy-token", resolved_id)]
+
+
+def test_resolver_rejects_mismatched_and_inactive_records_for_dynamic_and_legacy():
+    legacy_connection_id = default_wecom_connection_id("tenant-a")
+
+    def record(connection_id: str, status: str) -> ConnectionRecord:
+        return ConnectionRecord(
+            connection_id=connection_id,
+            tenant_id="tenant-a",
+            connector_key="wecom",
+            display_name="test",
+            status=status,
+            data_mode="stored",
+            public_config={},
+            config_version=1,
+        )
+
+    records = {
+        ("dynamic-mismatch", "conn-a"): record("conn-b", "active"),
+        ("dynamic-inactive", "conn-a"): record("conn-a", "disabled"),
+        ("legacy-mismatch", legacy_connection_id): record("conn-b", "active"),
+        ("legacy-inactive", legacy_connection_id): record(
+            legacy_connection_id, "disabled"
+        ),
+    }
+    resolver = ConnectionResolver(
+        token_resolver=lambda token, connection_id: records.get((token, connection_id)),
+        legacy_tenant_lookup=lambda _token: SimpleNamespace(tenant_id="tenant-a"),
+        legacy_tenant_reload=lambda: None,
+        credential_loader=lambda _connection_id: {},
+    )
+
+    assert resolver.resolve("conn-a", "dynamic-mismatch") is None
+    assert resolver.resolve("conn-a", "dynamic-inactive") is None
+    assert resolver.resolve_legacy("legacy-mismatch") is None
+    assert resolver.resolve_legacy("legacy-inactive") is None

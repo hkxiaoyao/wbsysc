@@ -3,7 +3,9 @@ from __future__ import annotations
 import json
 import logging
 import secrets
+import threading
 import uuid
+from collections.abc import Callable
 from typing import Any, Mapping
 
 from sqlalchemy import text
@@ -16,6 +18,13 @@ logger = logging.getLogger(__name__)
 
 _LEGACY_WATERMARK_KEY = "legacy_wecom_backfill_v1"
 _LEGACY_WATERMARK_STATUS = "completed"
+
+# The gateway owns the callback registration.  The store only emits the safe,
+# exact cache key after a transaction has committed; it never receives raw
+# credentials or bearer tokens.
+ConnectionCacheInvalidator = Callable[[str, int], None]
+_connection_cache_invalidators: list[ConnectionCacheInvalidator] = []
+_connection_cache_invalidator_lock = threading.Lock()
 
 
 _CONNECTION_DDLS = (
@@ -125,6 +134,63 @@ def _engine():
     return get_engine()
 
 
+def register_connection_cache_invalidator(
+    invalidator: ConnectionCacheInvalidator,
+) -> None:
+    """Register one lifecycle-owned post-commit cache invalidator."""
+    if not callable(invalidator):
+        raise TypeError("invalidator must be callable")
+    with _connection_cache_invalidator_lock:
+        if not any(existing is invalidator for existing in _connection_cache_invalidators):
+            _connection_cache_invalidators.append(invalidator)
+
+
+def unregister_connection_cache_invalidator(
+    invalidator: ConnectionCacheInvalidator,
+) -> None:
+    """Remove one lifecycle-owned invalidator without disturbing other apps."""
+    with _connection_cache_invalidator_lock:
+        _connection_cache_invalidators[:] = [
+            existing
+            for existing in _connection_cache_invalidators
+            if existing is not invalidator
+        ]
+
+
+def _retired_connection_version(conn: Any, connection_id: str) -> int | None:
+    """Return the cached revision that was live before a mutation, if any."""
+    value = conn.execute(
+        text("""
+            SELECT config_version FROM connection_instance
+            WHERE connection_id=:connection_id
+            LIMIT 1
+        """),
+        {"connection_id": connection_id},
+    ).scalar()
+    if isinstance(value, bool) or not isinstance(value, int):
+        return None
+    return value
+
+
+def _notify_connection_cache_invalidator(
+    connection_id: str,
+    config_version: int | None,
+) -> None:
+    """Best-effort cache retirement after commit, with no secret-bearing data."""
+    if config_version is None:
+        return
+    with _connection_cache_invalidator_lock:
+        invalidators = tuple(_connection_cache_invalidators)
+    for invalidator in invalidators:
+        try:
+            invalidator(connection_id, config_version)
+        except Exception as exc:
+            logger.warning(
+                "Connection cache invalidation hook failed type=%s",
+                type(exc).__name__,
+            )
+
+
 def _connection_from_row(row: Any) -> ConnectionRecord:
     values = dict(row._mapping) if hasattr(row, "_mapping") else dict(row)
     return ConnectionRecord(
@@ -160,7 +226,9 @@ def create_connection(
     if record.data_mode not in {"direct", "stored", "hybrid"}:
         raise ValueError("invalid connection data_mode")
 
+    retired_version: int | None
     with _engine().begin() as conn:
+        retired_version = _retired_connection_version(conn, record.connection_id)
         conn.execute(
             text("""
                 INSERT INTO connection_instance
@@ -211,6 +279,10 @@ def create_connection(
                     "metadata_json": json.dumps({"source": "runtime"}),
                 },
             )
+    _notify_connection_cache_invalidator(
+        record.connection_id,
+        record.config_version if retired_version is None else retired_version,
+    )
     return record
 
 
@@ -269,7 +341,9 @@ def set_tool_policy(
         enabled=enabled,
         policy=dict(policy or {}),
     )
+    retired_version: int | None
     with _engine().begin() as conn:
+        retired_version = _retired_connection_version(conn, connection_id)
         conn.execute(
             text("""
                 INSERT INTO connection_tool_policy
@@ -288,6 +362,7 @@ def set_tool_policy(
                 ),
             },
         )
+    _notify_connection_cache_invalidator(connection_id, retired_version)
     return record
 
 
@@ -306,7 +381,9 @@ def issue_token(connection_id: str, raw_value: str | None = None) -> IssuedToken
         raw_value=token_value,
         prefix=digest[:12],
     )
+    retired_version: int | None
     with _engine().begin() as conn:
+        retired_version = _retired_connection_version(conn, connection_id)
         conn.execute(
             text("""
                 INSERT INTO connection_token
@@ -322,6 +399,7 @@ def issue_token(connection_id: str, raw_value: str | None = None) -> IssuedToken
                 "token_prefix": issued.prefix,
             },
         )
+    _notify_connection_cache_invalidator(connection_id, retired_version)
     return issued
 
 
