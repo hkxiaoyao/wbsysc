@@ -1,9 +1,11 @@
 from __future__ import annotations
 
 import re
+from typing import Any
 
 from . import db
 from .auth import TenantCtx
+from .connectors.contracts import ConnectionContext
 from .wecom.approval_sync import fetch_approval_detail, sync_approvals_window
 from .wecom.checkin_sync import fetch_checkin_records_with_stats
 from .wecom.contact import fetch_all_userids
@@ -18,6 +20,93 @@ class PublicDataAccessError(Exception):
         self.errcode = int(errcode)
         self.public_message = public_message
         self.source = source
+
+
+class WeComStorageAdapter:
+    """Keeps the existing per-tenant WeCom schema behind a connection context.
+
+    Connection instances own their configuration, while the first migration
+    deliberately continues to use the established tenant schemas for stored
+    WeCom records.  This adapter is the narrow compatibility boundary between
+    those two representations.
+    """
+
+    def __init__(self, context: ConnectionContext | TenantCtx) -> None:
+        self._context = context
+
+    @property
+    def schema_name(self) -> str:
+        if isinstance(self._context, ConnectionContext):
+            value = self._context.public_config.get("schema_name", "")
+        else:
+            value = self._context.schema_name
+        if not isinstance(value, str) or not value:
+            raise ValueError("WeCom stored mode requires a schema_name")
+        return value
+
+    def list_reports(self, starttime: int, endtime: int, limit: int) -> list[dict]:
+        return db.query_reports_by_window(self.schema_name, starttime, endtime, limit)
+
+    def get_report(self, journaluuid: str) -> dict | None:
+        return db.get_report_detail(self.schema_name, journaluuid)
+
+    def list_approvals(self, starttime: int, endtime: int, limit: int) -> list[dict]:
+        return db.query_approvals_by_window(self.schema_name, starttime, endtime, limit)
+
+    def get_approval(self, sp_no: str) -> dict | None:
+        return db.get_approval_detail(self.schema_name, sp_no)
+
+    def list_checkins(self, starttime: int, endtime: int, limit: int) -> list[dict]:
+        return db.query_checkins_by_window(self.schema_name, starttime, endtime, limit)
+
+
+def _config_value(
+    context: ConnectionContext | TenantCtx,
+    key: str,
+    legacy_attribute: str,
+    default: Any = "",
+) -> Any:
+    if isinstance(context, ConnectionContext):
+        return context.public_config.get(key, default)
+    return getattr(context, legacy_attribute, default)
+
+
+def _credential_value(
+    context: ConnectionContext | TenantCtx,
+    key: str,
+    legacy_attribute: str,
+) -> str:
+    if isinstance(context, ConnectionContext):
+        value = context.credentials.get(key)
+        if value is None:
+            # The two aliases make direct construction of a ConnectionContext
+            # ergonomic without changing the persisted credential key names.
+            value = context.credentials.get(legacy_attribute)
+        return value if isinstance(value, str) else ""
+    value = getattr(context, legacy_attribute, "")
+    return value if isinstance(value, str) else ""
+
+
+def _corpid(context: ConnectionContext | TenantCtx) -> str:
+    value = _config_value(context, "corpid", "corpid")
+    return value if isinstance(value, str) else ""
+
+
+def _app_secret(context: ConnectionContext | TenantCtx) -> str:
+    return _credential_value(context, "wecom_app_secret", "secret")
+
+
+def _contact_secret(context: ConnectionContext | TenantCtx) -> str:
+    return _credential_value(context, "wecom_contact_secret", "contact_secret")
+
+
+def _checkin_userids(context: ConnectionContext | TenantCtx) -> list[str]:
+    values = _config_value(context, "checkin_userids", "checkin_userids", [])
+    if isinstance(values, str):
+        return [value.strip() for value in values.split(",") if value.strip()]
+    if isinstance(values, (list, tuple, set)):
+        return [value for value in values if isinstance(value, str) and value]
+    return []
 
 
 def _limit(value: int) -> int:
@@ -54,10 +143,15 @@ def _wecom_partial(identifier: str, response: dict, public_message: str) -> dict
     }
 
 
-def list_reports(ctx: TenantCtx, starttime: int, endtime: int, limit: int) -> dict:
+def list_reports(
+    ctx: ConnectionContext | TenantCtx,
+    starttime: int,
+    endtime: int,
+    limit: int,
+) -> dict:
     size = _limit(limit)
-    if ctx.data_mode == "stored":
-        rows = db.query_reports_by_window(ctx.schema_name, starttime, endtime, size)
+    if ctx.data_mode in {"stored", "hybrid"}:
+        rows = WeComStorageAdapter(ctx).list_reports(starttime, endtime, size)
         records = [{
             "journaluuid": row["journaluuid"],
             "template_id": row["template_id"],
@@ -66,23 +160,25 @@ def list_reports(ctx: TenantCtx, starttime: int, endtime: int, limit: int) -> di
             "submitter": row["submitter_userid"],
             "_partial": bool(row.get("is_partial", 0)),
         } for row in rows]
-        return {
+        stored_result = {
             "tenant": ctx.tenant_id,
             "source": "db",
             "count": len(records),
             "records": records,
             "partial_count": sum(bool(record["_partial"]) for record in records),
         }
+        if ctx.data_mode == "stored" or records:
+            return stored_result
 
     identifiers = _known_wecom_call(
         lambda: sync_reports_window(
-            ctx.corpid, ctx.secret, starttime, endtime, max_records=size
+            _corpid(ctx), _app_secret(ctx), starttime, endtime, max_records=size
         ),
         "企微汇报请求失败",
     )
     records = []
     for identifier in identifiers:
-        detail = fetch_report_detail(ctx.corpid, ctx.secret, identifier)
+        detail = fetch_report_detail(_corpid(ctx), _app_secret(ctx), identifier)
         if detail.get("errcode") not in (None, 0):
             partial = _wecom_partial(identifier, detail, "企微汇报详情请求失败")
             partial["journaluuid"] = identifier
@@ -104,13 +200,15 @@ def list_reports(ctx: TenantCtx, starttime: int, endtime: int, limit: int) -> di
     }
 
 
-def get_report(ctx: TenantCtx, journaluuid: str) -> dict:
-    if ctx.data_mode == "stored":
-        detail = db.get_report_detail(ctx.schema_name, journaluuid)
+def get_report(ctx: ConnectionContext | TenantCtx, journaluuid: str) -> dict:
+    if ctx.data_mode in {"stored", "hybrid"}:
+        detail = WeComStorageAdapter(ctx).get_report(journaluuid)
         if not detail:
-            return {"source": "db", "errcode": 404, "errmsg": "汇报单号不存在"}
-        return {"source": "db", "detail": detail}
-    detail = fetch_report_detail(ctx.corpid, ctx.secret, journaluuid)
+            if ctx.data_mode == "stored":
+                return {"source": "db", "errcode": 404, "errmsg": "汇报单号不存在"}
+        else:
+            return {"source": "db", "detail": detail}
+    detail = fetch_report_detail(_corpid(ctx), _app_secret(ctx), journaluuid)
     if detail.get("errcode") not in (None, 0):
         raise PublicDataAccessError(
             _safe_errcode(detail.get("errcode")), "企微汇报请求失败", "wecom"
@@ -118,10 +216,15 @@ def get_report(ctx: TenantCtx, journaluuid: str) -> dict:
     return {"source": "wecom", "detail": detail}
 
 
-def list_approvals(ctx: TenantCtx, starttime: int, endtime: int, limit: int) -> dict:
+def list_approvals(
+    ctx: ConnectionContext | TenantCtx,
+    starttime: int,
+    endtime: int,
+    limit: int,
+) -> dict:
     size = _limit(limit)
-    if ctx.data_mode == "stored":
-        rows = db.query_approvals_by_window(ctx.schema_name, starttime, endtime, size)
+    if ctx.data_mode in {"stored", "hybrid"}:
+        rows = WeComStorageAdapter(ctx).list_approvals(starttime, endtime, size)
         records = [{
             "sp_no": row["sp_no"],
             "sp_name": row["sp_name"],
@@ -131,23 +234,25 @@ def list_approvals(ctx: TenantCtx, starttime: int, endtime: int, limit: int) -> 
             "applyer": row["applyer_userid"],
             "_partial": bool(row.get("is_partial", 0)),
         } for row in rows]
-        return {
+        stored_result = {
             "tenant": ctx.tenant_id,
             "source": "db",
             "count": len(records),
             "records": records,
             "partial_count": sum(bool(record["_partial"]) for record in records),
         }
+        if ctx.data_mode == "stored" or records:
+            return stored_result
 
     identifiers = _known_wecom_call(
         lambda: sync_approvals_window(
-            ctx.corpid, ctx.secret, starttime, endtime, max_records=size
+            _corpid(ctx), _app_secret(ctx), starttime, endtime, max_records=size
         ),
         "企微审批请求失败",
     )
     records = []
     for identifier in identifiers:
-        detail = fetch_approval_detail(ctx.corpid, ctx.secret, identifier)
+        detail = fetch_approval_detail(_corpid(ctx), _app_secret(ctx), identifier)
         if detail.get("errcode") not in (None, 0):
             partial = _wecom_partial(identifier, detail, "企微审批详情请求失败")
             partial["sp_no"] = identifier
@@ -178,13 +283,15 @@ def list_approvals(ctx: TenantCtx, starttime: int, endtime: int, limit: int) -> 
     }
 
 
-def get_approval(ctx: TenantCtx, sp_no: str) -> dict:
-    if ctx.data_mode == "stored":
-        detail = db.get_approval_detail(ctx.schema_name, sp_no)
+def get_approval(ctx: ConnectionContext | TenantCtx, sp_no: str) -> dict:
+    if ctx.data_mode in {"stored", "hybrid"}:
+        detail = WeComStorageAdapter(ctx).get_approval(sp_no)
         if not detail:
-            return {"source": "db", "errcode": 404, "errmsg": "审批单号不存在"}
-        return {"source": "db", "detail": detail}
-    detail = fetch_approval_detail(ctx.corpid, ctx.secret, sp_no)
+            if ctx.data_mode == "stored":
+                return {"source": "db", "errcode": 404, "errmsg": "审批单号不存在"}
+        else:
+            return {"source": "db", "detail": detail}
+    detail = fetch_approval_detail(_corpid(ctx), _app_secret(ctx), sp_no)
     if detail.get("errcode") not in (None, 0):
         raise PublicDataAccessError(
             _safe_errcode(detail.get("errcode")), "企微审批请求失败", "wecom"
@@ -192,10 +299,15 @@ def get_approval(ctx: TenantCtx, sp_no: str) -> dict:
     return {"source": "wecom", "detail": detail}
 
 
-def list_checkins(ctx: TenantCtx, starttime: int, endtime: int, limit: int) -> dict:
+def list_checkins(
+    ctx: ConnectionContext | TenantCtx,
+    starttime: int,
+    endtime: int,
+    limit: int,
+) -> dict:
     size = _limit(limit)
-    if ctx.data_mode == "stored":
-        rows = db.query_checkins_by_window(ctx.schema_name, starttime, endtime, size)
+    if ctx.data_mode in {"stored", "hybrid"}:
+        rows = WeComStorageAdapter(ctx).list_checkins(starttime, endtime, size)
         records = [{
             "userid": row["userid"],
             "checkin_type": row["checkin_type"],
@@ -204,21 +316,24 @@ def list_checkins(ctx: TenantCtx, starttime: int, endtime: int, limit: int) -> d
             "location_title": row["location_title"],
             "group_name": row["group_name"],
         } for row in rows]
-        return {
+        stored_result = {
             "tenant": ctx.tenant_id,
             "source": "db",
             "count": len(records),
             "records": records,
             "partial_count": 0,
         }
+        if ctx.data_mode == "stored" or records:
+            return stored_result
 
-    if ctx.contact_secret:
+    contact_secret = _contact_secret(ctx)
+    if contact_secret:
         userids = _known_wecom_call(
-            lambda: fetch_all_userids(ctx.corpid, ctx.contact_secret),
+            lambda: fetch_all_userids(_corpid(ctx), contact_secret),
             "企微打卡请求失败",
         )
     else:
-        userids = list(ctx.checkin_userids)
+        userids = _checkin_userids(ctx)
     if not userids:
         raise PublicDataAccessError(
             400,
@@ -226,7 +341,7 @@ def list_checkins(ctx: TenantCtx, starttime: int, endtime: int, limit: int) -> d
             "wecom",
         )
     fetch_result = fetch_checkin_records_with_stats(
-        ctx.corpid, ctx.secret, starttime, endtime, userids
+        _corpid(ctx), _app_secret(ctx), starttime, endtime, userids
     )
     if fetch_result.attempted and fetch_result.failed == fetch_result.attempted:
         first_error = fetch_result.errors[0] if fetch_result.errors else {}
