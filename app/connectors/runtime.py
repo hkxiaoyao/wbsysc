@@ -25,6 +25,7 @@ from .registry import ConnectorRegistry
 
 
 MAX_TIMEOUT_MS = 300_000
+_CONNECTOR_EXECUTION_ERROR_CODE = "connector_error"
 
 
 class RateLimitError(PermissionError):
@@ -73,6 +74,15 @@ class ToolPolicyStore(Protocol):
     def get(self, connection_id: str, tool_key: str) -> ToolPolicy | None: ...
 
 
+def _optional_policy_bool(values: Mapping[str, Any], key: str) -> bool | None:
+    if key not in values:
+        return None
+    value = values[key]
+    if not isinstance(value, bool):
+        raise InvalidToolPolicyError("invalid boolean policy control")
+    return value
+
+
 class PolicyGuard:
     """Converts persisted policy JSON into a narrow, fail-safe execution policy."""
 
@@ -85,12 +95,16 @@ class PolicyGuard:
             enabled = policy.enabled is True
             values = policy.policy if isinstance(policy.policy, Mapping) else {}
 
+        allow_write = _optional_policy_bool(values, "allow_write")
+        read_only = _optional_policy_bool(values, "read_only")
+        readonly = _optional_policy_bool(values, "readonly")
+
         return ResolvedToolPolicy(
             enabled=enabled,
             allow_write=(
-                values.get("allow_write") is True
-                and values.get("read_only") is not True
-                and values.get("readonly") is not True
+                allow_write is True
+                and read_only is not True
+                and readonly is not True
             ),
             timeout_ms=normalize_timeout_ms(
                 values.get("timeout_ms"),
@@ -333,13 +347,13 @@ class ConnectorRuntime:
                 "execution timed out",
             )
             raise
-        except Exception as exc:
+        except Exception:
             await self._audit(
                 context,
                 tool,
                 "error",
                 self._cost_ms(started_at),
-                _safe_exception_code(exc),
+                _CONNECTOR_EXECUTION_ERROR_CODE,
                 "connector execution failed",
             )
             raise
@@ -369,19 +383,13 @@ class ConnectorRuntime:
             return None
         if isinstance(store, Mapping):
             policy = store.get((context.connection.connection_id, tool.tool_key))
-            if policy is None and tool.mcp_name != tool.tool_key:
-                policy = store.get((context.connection.connection_id, tool.mcp_name))
         else:
             policy = store.get(context.connection.connection_id, tool.tool_key)
-            if policy is None and tool.mcp_name != tool.tool_key:
-                policy = store.get(context.connection.connection_id, tool.mcp_name)
-        if policy is not None and policy.connection_id != context.connection.connection_id:
-            return ToolPolicy(
-                connection_id=context.connection.connection_id,
-                tool_name=tool.tool_key,
-                enabled=False,
-                policy={},
-            )
+        if policy is not None and (
+            policy.connection_id != context.connection.connection_id
+            or policy.tool_name != tool.tool_key
+        ):
+            return None
         return policy
 
     async def _audit(
@@ -416,9 +424,3 @@ class ConnectorRuntime:
 
     def _cost_ms(self, started_at: float) -> int:
         return max(0, int((self._clock() - started_at) * 1000))
-
-
-def _safe_exception_code(exc: BaseException) -> str:
-    """Use class metadata only; never call str() or repr() on an exception."""
-    name = type(exc).__name__
-    return name[:64] if name else "ExecutionError"

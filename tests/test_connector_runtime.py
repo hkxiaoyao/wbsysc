@@ -173,6 +173,52 @@ async def test_runtime_allows_a_write_only_with_an_explicit_connection_policy():
 
 
 @pytest.mark.asyncio
+async def test_runtime_rejects_a_misrouted_policy_for_another_tool():
+    stale_read_policy = ToolPolicy(
+        "conn-a",
+        "reports.list",
+        enabled=True,
+        policy={"allow_write": True},
+    )
+
+    class MisroutedPolicyStore:
+        def get(self, connection_id, tool_key):
+            return stale_read_policy
+
+    connector = FakeConnector()
+    runtime = ConnectorRuntime(
+        registry_with(connector),
+        policy_store=MisroutedPolicyStore(),
+    )
+
+    with pytest.raises(WritePolicyError):
+        await runtime.execute(context(), "reports.delete", {"id": "1"})
+
+    assert connector.calls == []
+
+
+@pytest.mark.asyncio
+async def test_runtime_rejects_a_malformed_read_only_write_control():
+    connector = FakeConnector()
+    policies = FakePolicyStore(
+        (
+            ToolPolicy(
+                "conn-a",
+                "reports.delete",
+                enabled=True,
+                policy={"allow_write": True, "read_only": "true"},
+            ),
+        )
+    )
+    runtime = ConnectorRuntime(registry_with(connector), policy_store=policies)
+
+    with pytest.raises(InvalidToolPolicyError):
+        await runtime.execute(context(), "reports.delete", {"id": "1"})
+
+    assert connector.calls == []
+
+
+@pytest.mark.asyncio
 async def test_runtime_fails_closed_for_a_non_active_connection():
     connector = FakeConnector()
     runtime = ConnectorRuntime(registry_with(connector))
@@ -337,9 +383,27 @@ async def test_runtime_audit_handoff_omits_credentials_bodies_and_exception_text
     assert event.connector_key == "wecom"
     assert event.tool_key == "reports.list"
     assert event.status == "error"
-    assert event.error_code == "OpaqueFailure"
+    assert event.error_code == "connector_error"
     assert event.error_summary == "connector execution failed"
     assert event.args_summary == "omitted"
     assert event.result_summary == "omitted"
     assert "secret-value" not in repr(event)
     assert "raw-request-body" not in repr(event)
+
+
+@pytest.mark.asyncio
+async def test_runtime_audit_uses_a_fixed_code_for_an_adversarial_exception_name():
+    AdversarialFailure = type("Authorization=Bearer-secret-value", (RuntimeError,), {})
+
+    class FailingConnector(FakeConnector):
+        async def execute(self, context, tool_key, args):
+            raise AdversarialFailure()
+
+    events = []
+    runtime = ConnectorRuntime(registry_with(FailingConnector()), audit_sink=events.append)
+
+    with pytest.raises(AdversarialFailure):
+        await runtime.execute(context(), "reports.list", {})
+
+    assert events[0].error_code == "connector_error"
+    assert "Bearer-secret-value" not in repr(events[0])
