@@ -411,6 +411,75 @@ async def test_hybrid_fallback_error_uses_wecom_source(monkeypatch):
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("tool_key", "args", "storage_name", "direct_name"),
+    [
+        (
+            "reports.list",
+            {"starttime": 1, "endtime": 2, "limit": 10},
+            "query_reports_by_window",
+            "sync_reports_window",
+        ),
+        (
+            "reports.get",
+            {"journaluuid": "report-1"},
+            "get_report_detail",
+            "fetch_report_detail",
+        ),
+        (
+            "approvals.list",
+            {"starttime": 1, "endtime": 2, "limit": 10},
+            "query_approvals_by_window",
+            "sync_approvals_window",
+        ),
+        (
+            "approvals.get",
+            {"sp_no": "approval-1"},
+            "get_approval_detail",
+            "fetch_approval_detail",
+        ),
+        (
+            "checkins.list",
+            {"starttime": 1, "endtime": 2, "limit": 10},
+            "query_checkins_by_window",
+            "fetch_all_userids",
+        ),
+    ],
+)
+async def test_hybrid_storage_failure_uses_db_source(
+    monkeypatch, tool_key, args, storage_name, direct_name
+):
+    from app import data_access
+
+    secret_marker = "secret=hybrid-storage-marker"
+    direct_calls = []
+
+    def storage_failure(*args, **kwargs):
+        raise RuntimeError(secret_marker)
+
+    def record_direct_call(*args, **kwargs):
+        direct_calls.append((args, kwargs))
+        return []
+
+    monkeypatch.setattr(data_access.db, storage_name, storage_failure)
+    monkeypatch.setattr(data_access, direct_name, record_direct_call)
+
+    result = await WeComConnector(mock_enabled=lambda: False).execute(
+        connection_context("conn-a", "hybrid"), tool_key, args
+    )
+
+    assert result.status == "error"
+    assert result.data == {
+        "tenant": "tenant-a",
+        "source": "db",
+        "errcode": 502,
+        "errmsg": "数据访问失败",
+    }
+    assert direct_calls == []
+    assert secret_marker not in repr(result.data)
+
+
+@pytest.mark.asyncio
 async def test_wecom_sync_uses_connection_scoped_cursor(monkeypatch):
     from app.connectors import wecom
 

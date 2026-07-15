@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 import re
-from typing import Any
+from typing import Any, Callable
 
 from . import db
 from .auth import TenantCtx
@@ -120,6 +120,16 @@ def _safe_errcode(value, default: int = 502) -> int:
         return default
 
 
+def _storage_read(call: Callable[[], Any]) -> Any:
+    """Convert a failed stored-data read to the established safe DB envelope."""
+    try:
+        return call()
+    except PublicDataAccessError:
+        raise
+    except Exception as exc:
+        raise PublicDataAccessError(502, "数据访问失败", "db") from exc
+
+
 def _known_wecom_call(call, public_message: str):
     errcode = None
     try:
@@ -151,7 +161,9 @@ def list_reports(
 ) -> dict:
     size = _limit(limit)
     if ctx.data_mode in {"stored", "hybrid"}:
-        rows = WeComStorageAdapter(ctx).list_reports(starttime, endtime, size)
+        rows = _storage_read(
+            lambda: WeComStorageAdapter(ctx).list_reports(starttime, endtime, size)
+        )
         records = [{
             "journaluuid": row["journaluuid"],
             "template_id": row["template_id"],
@@ -202,7 +214,9 @@ def list_reports(
 
 def get_report(ctx: ConnectionContext | TenantCtx, journaluuid: str) -> dict:
     if ctx.data_mode in {"stored", "hybrid"}:
-        detail = WeComStorageAdapter(ctx).get_report(journaluuid)
+        detail = _storage_read(
+            lambda: WeComStorageAdapter(ctx).get_report(journaluuid)
+        )
         if not detail:
             if ctx.data_mode == "stored":
                 return {"source": "db", "errcode": 404, "errmsg": "汇报单号不存在"}
@@ -224,7 +238,9 @@ def list_approvals(
 ) -> dict:
     size = _limit(limit)
     if ctx.data_mode in {"stored", "hybrid"}:
-        rows = WeComStorageAdapter(ctx).list_approvals(starttime, endtime, size)
+        rows = _storage_read(
+            lambda: WeComStorageAdapter(ctx).list_approvals(starttime, endtime, size)
+        )
         records = [{
             "sp_no": row["sp_no"],
             "sp_name": row["sp_name"],
@@ -285,7 +301,9 @@ def list_approvals(
 
 def get_approval(ctx: ConnectionContext | TenantCtx, sp_no: str) -> dict:
     if ctx.data_mode in {"stored", "hybrid"}:
-        detail = WeComStorageAdapter(ctx).get_approval(sp_no)
+        detail = _storage_read(
+            lambda: WeComStorageAdapter(ctx).get_approval(sp_no)
+        )
         if not detail:
             if ctx.data_mode == "stored":
                 return {"source": "db", "errcode": 404, "errmsg": "审批单号不存在"}
@@ -307,7 +325,9 @@ def list_checkins(
 ) -> dict:
     size = _limit(limit)
     if ctx.data_mode in {"stored", "hybrid"}:
-        rows = WeComStorageAdapter(ctx).list_checkins(starttime, endtime, size)
+        rows = _storage_read(
+            lambda: WeComStorageAdapter(ctx).list_checkins(starttime, endtime, size)
+        )
         records = [{
             "userid": row["userid"],
             "checkin_type": row["checkin_type"],
