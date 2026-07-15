@@ -191,8 +191,75 @@ async def test_runtime_rejects_a_misrouted_policy_for_another_tool():
         policy_store=MisroutedPolicyStore(),
     )
 
-    with pytest.raises(WritePolicyError):
+    with pytest.raises(ToolDisabledError):
         await runtime.execute(context(), "reports.delete", {"id": "1"})
+
+    assert connector.calls == []
+
+
+@pytest.mark.asyncio
+async def test_runtime_rejects_a_misrouted_disabled_policy_for_a_read_tool():
+    disabled_other_tool_policy = ToolPolicy(
+        "conn-a",
+        "reports.delete",
+        enabled=False,
+        policy={},
+    )
+
+    class MisroutedPolicyStore:
+        def get(self, connection_id, tool_key):
+            return disabled_other_tool_policy
+
+    connector = FakeConnector()
+    runtime = ConnectorRuntime(
+        registry_with(connector),
+        policy_store=MisroutedPolicyStore(),
+    )
+
+    with pytest.raises(ToolDisabledError):
+        await runtime.execute(context(), "reports.list", {})
+
+    assert connector.calls == []
+
+
+@pytest.mark.asyncio
+async def test_runtime_honors_a_disabled_policy_stored_under_the_mcp_name():
+    connector = FakeConnector()
+    policies = FakePolicyStore(
+        (
+            ToolPolicy(
+                "conn-a",
+                "wecom_list_reports",
+                enabled=False,
+                policy={},
+            ),
+        )
+    )
+    runtime = ConnectorRuntime(registry_with(connector), policy_store=policies)
+
+    with pytest.raises(ToolDisabledError):
+        await runtime.execute(context(), "reports.list", {})
+
+    assert connector.calls == []
+
+
+@pytest.mark.asyncio
+async def test_runtime_rejects_a_non_mapping_policy_for_a_read_tool():
+    connector = FakeConnector()
+    policies = FakePolicyStore(
+        (
+            ToolPolicy(
+                "conn-a",
+                "reports.list",
+                enabled=True,
+                policy="not-a-mapping",
+            ),
+        )
+    )
+    runtime = ConnectorRuntime(registry_with(connector), policy_store=policies)
+
+    with pytest.raises(InvalidToolPolicyError):
+        await runtime.execute(context(), "reports.list", {})
 
     assert connector.calls == []
 

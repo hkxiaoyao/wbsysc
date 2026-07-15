@@ -93,7 +93,9 @@ class PolicyGuard:
             values = {}
         else:
             enabled = policy.enabled is True
-            values = policy.policy if isinstance(policy.policy, Mapping) else {}
+            if not isinstance(policy.policy, Mapping):
+                raise InvalidToolPolicyError("policy must be a mapping")
+            values = policy.policy
 
         allow_write = _optional_policy_bool(values, "allow_write")
         read_only = _optional_policy_bool(values, "read_only")
@@ -383,13 +385,23 @@ class ConnectorRuntime:
             return None
         if isinstance(store, Mapping):
             policy = store.get((context.connection.connection_id, tool.tool_key))
+            if policy is None and tool.mcp_name != tool.tool_key:
+                policy = store.get((context.connection.connection_id, tool.mcp_name))
         else:
             policy = store.get(context.connection.connection_id, tool.tool_key)
+            if policy is None and tool.mcp_name != tool.tool_key:
+                policy = store.get(context.connection.connection_id, tool.mcp_name)
+        accepted_tool_names = {tool.tool_key, tool.mcp_name}
         if policy is not None and (
             policy.connection_id != context.connection.connection_id
-            or policy.tool_name != tool.tool_key
+            or policy.tool_name not in accepted_tool_names
         ):
-            return None
+            return ToolPolicy(
+                connection_id=context.connection.connection_id,
+                tool_name=tool.tool_key,
+                enabled=False,
+                policy={},
+            )
         return policy
 
     async def _audit(
