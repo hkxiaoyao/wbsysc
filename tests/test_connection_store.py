@@ -1,0 +1,395 @@
+from dataclasses import FrozenInstanceError
+
+import pytest
+
+from app import db
+from app.connections import store
+
+
+class Result:
+    def __init__(self, row=None, rows=(), scalar_value=None):
+        self.row = row
+        self.rows = list(rows)
+        self.scalar_value = scalar_value
+
+    def fetchone(self):
+        return self.row
+
+    def fetchall(self):
+        return self.rows
+
+    def scalar(self):
+        return self.scalar_value
+
+    def mappings(self):
+        return self
+
+    def all(self):
+        return self.rows
+
+
+class FakeConnection:
+    def __init__(self):
+        self.statements = []
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *args):
+        return False
+
+    def execute(self, statement, params=None):
+        params = params or {}
+        self.statements.append((str(statement), params))
+        if "FROM connection_token" in str(statement):
+            if params["connection_id"] == "conn-a":
+                return Result(
+                    {
+                        "connection_id": "conn-a",
+                        "tenant_id": "tenant-a",
+                        "connector_key": "wecom",
+                        "display_name": "WeCom",
+                        "status": "active",
+                        "data_mode": "stored",
+                        "public_config_json": "{}",
+                        "config_version": 1,
+                    }
+                )
+            return Result()
+        return Result()
+
+
+class FakeEngine:
+    def __init__(self, connection):
+        self.connection = connection
+
+    def begin(self):
+        return self.connection
+
+    def connect(self):
+        return self.connection
+
+
+class LegacyBackfillConnection(FakeConnection):
+    def __init__(self):
+        super().__init__()
+        self.completed_connection_ids = set()
+        self.token_connection_ids = {}
+
+    def execute(self, statement, params=None):
+        params = params or {}
+        sql = str(statement)
+        self.statements.append((sql, params))
+        if "FROM tenant_config" in sql:
+            return Result(
+                rows=[
+                    {
+                        "tenant_id": "tenant-a",
+                        "display_name": "Legacy tenant",
+                        "corpid": "ww123",
+                        "secret_encrypted": b"encrypted-app-secret",
+                        "mcp_token": "legacy-token",
+                        "schema_name": "wbd_abc",
+                        "sync_interval_min": 30,
+                        "enabled_modules": "report,approval",
+                        "checkin_userids": "u1,u2",
+                        "contact_secret_encrypted": b"encrypted-contact-secret",
+                        "trusted_domain": "example.test",
+                        "data_mode": "stored",
+                        "enabled": 1,
+                    }
+                ]
+            )
+        if "SELECT state_json FROM connection_sync_state" in sql:
+            connection_id = params["connection_id"]
+            return Result(
+                scalar_value=(
+                    '{"status":"completed"}'
+                    if connection_id in self.completed_connection_ids
+                    else None
+                )
+            )
+        if "SELECT connection_id FROM connection_token" in sql:
+            return Result(scalar_value=self.token_connection_ids.get(params["token_hmac"]))
+        if "INSERT INTO connection_token" in sql:
+            self.token_connection_ids[params["token_hmac"]] = params["connection_id"]
+        if "INSERT INTO connection_sync_state" in sql:
+            self.completed_connection_ids.add(params["connection_id"])
+        return Result()
+
+
+class QueryConnection(FakeConnection):
+    def execute(self, statement, params=None):
+        params = params or {}
+        sql = str(statement)
+        self.statements.append((sql, params))
+        row = {
+            "connection_id": "conn-a",
+            "tenant_id": "tenant-a",
+            "connector_key": "wecom",
+            "display_name": "WeCom",
+            "status": "active",
+            "data_mode": "stored",
+            "public_config_json": '{"corpid":"ww123"}',
+            "config_version": 2,
+        }
+        if "FROM connection_instance" in sql and "LIMIT 1" in sql:
+            return Result(row=row)
+        if "FROM connection_instance" in sql:
+            return Result(rows=[row])
+        return Result()
+
+
+class CollidingLegacyBackfillConnection(LegacyBackfillConnection):
+    def execute(self, statement, params=None):
+        if "SELECT connection_id FROM connection_token" in str(statement):
+            params = params or {}
+            self.statements.append((str(statement), params))
+            return Result(scalar_value="other-connection")
+        return super().execute(statement, params)
+
+
+class RacingLegacyBackfillConnection(LegacyBackfillConnection):
+    def __init__(self):
+        super().__init__()
+        self.token_owner_reads = 0
+
+    def execute(self, statement, params=None):
+        if "SELECT connection_id FROM connection_token" in str(statement):
+            params = params or {}
+            self.statements.append((str(statement), params))
+            self.token_owner_reads += 1
+            return Result(
+                scalar_value=(
+                    None if self.token_owner_reads == 1 else "other-connection"
+                )
+            )
+        return super().execute(statement, params)
+
+
+def test_token_resolution_requires_matching_connection_id(monkeypatch):
+    fake_connection = FakeConnection()
+    monkeypatch.setattr(db, "get_engine", lambda: FakeEngine(fake_connection))
+    monkeypatch.setattr(store, "token_hmac", lambda raw_token: "a" * 64)
+
+    token = store.issue_token("conn-a", "token-a")
+
+    assert store.resolve_connection_token("token-a", "conn-a").connection_id == "conn-a"
+    assert store.resolve_connection_token("token-a", "conn-b") is None
+    assert token.raw_value == "token-a"
+
+
+def test_token_row_never_contains_raw_value(monkeypatch):
+    fake_connection = FakeConnection()
+    monkeypatch.setattr(db, "get_engine", lambda: FakeEngine(fake_connection))
+    monkeypatch.setattr(store, "token_hmac", lambda raw_token: "a" * 64)
+
+    store.issue_token("conn-a", "token-a")
+
+    params = fake_connection.statements[-1][1]
+    assert "token-a" not in repr(params)
+    assert params["token_hmac"] != "token-a"
+
+
+def test_issue_token_is_idempotent_without_reassigning_an_existing_digest(
+    monkeypatch,
+):
+    fake_connection = FakeConnection()
+    monkeypatch.setattr(db, "get_engine", lambda: FakeEngine(fake_connection))
+    monkeypatch.setattr(store, "token_hmac", lambda raw_token: "a" * 64)
+
+    store.issue_token("conn-a", "token-a")
+
+    sql, _ = fake_connection.statements[-1]
+    assert "ON DUPLICATE KEY UPDATE" in sql
+    assert "connection_id=VALUES(connection_id)" not in sql
+
+
+@pytest.mark.parametrize("raw_value", ["", 0])
+def test_issue_token_rejects_an_explicit_invalid_raw_value(raw_value):
+    with pytest.raises(ValueError, match="raw_value"):
+        store.issue_token("conn-a", raw_value)
+
+
+def test_connection_contracts_are_immutable_and_keep_secrets_encrypted():
+    from app.connections.models import (
+        ConnectionToken,
+        CredentialRecord,
+        SyncState,
+        ToolPolicy,
+    )
+
+    credential = CredentialRecord(
+        connection_id="conn-a",
+        credential_key="app_secret",
+        encrypted_value=b"ciphertext",
+        metadata={"source": "test"},
+    )
+    token = ConnectionToken(
+        token_id="token-id",
+        connection_id="conn-a",
+        token_hmac="a" * 64,
+        prefix="a" * 12,
+    )
+    policy = ToolPolicy(
+        connection_id="conn-a",
+        tool_name="wecom_list_reports",
+        enabled=True,
+        policy={"allow": True},
+    )
+    state = SyncState(
+        connection_id="conn-a",
+        state_key="report",
+        state={"cursor": "123"},
+    )
+
+    assert credential.encrypted_value == b"ciphertext"
+    assert token.token_hmac == "a" * 64
+    assert policy.enabled is True
+    assert state.state["cursor"] == "123"
+    with pytest.raises(FrozenInstanceError):
+        policy.enabled = False
+
+
+def test_connection_crypto_reuses_the_existing_secret_cipher(monkeypatch):
+    from app.connections import crypto
+
+    monkeypatch.setattr(crypto, "encrypt_secret", lambda value: f"enc:{value}".encode())
+    monkeypatch.setattr(crypto, "decrypt_secret", lambda value: value.decode()[4:])
+
+    encrypted = crypto.encrypt_credential("plain-secret")
+
+    assert encrypted == b"enc:plain-secret"
+    assert crypto.decrypt_credential(encrypted) == "plain-secret"
+
+
+def test_create_connection_binds_public_config_and_encrypts_credentials(monkeypatch):
+    from app.connections.models import ConnectionRecord
+
+    fake_connection = FakeConnection()
+    monkeypatch.setattr(db, "get_engine", lambda: FakeEngine(fake_connection))
+    monkeypatch.setattr(store, "encrypt_credential", lambda value: b"ciphertext")
+    record = ConnectionRecord(
+        connection_id="conn-a",
+        tenant_id="tenant-a",
+        connector_key="wecom",
+        display_name="WeCom",
+        status="active",
+        data_mode="stored",
+        public_config={"corpid": "ww123"},
+        config_version=1,
+    )
+
+    store.create_connection(record, credentials={"app_secret": "plain-secret"})
+
+    connection_params = fake_connection.statements[0][1]
+    credential_params = fake_connection.statements[1][1]
+    assert "tenant-a" not in fake_connection.statements[0][0]
+    assert connection_params["tenant_id"] == "tenant-a"
+    assert credential_params["encrypted_value"] == b"ciphertext"
+    assert "plain-secret" not in repr(credential_params)
+
+
+def test_ensure_connection_tables_uses_mysql57_compatible_ddl(monkeypatch):
+    fake_connection = FakeConnection()
+    monkeypatch.setattr(db, "get_engine", lambda: FakeEngine(fake_connection))
+
+    store.ensure_connection_tables()
+
+    sql = "\n".join(statement for statement, _ in fake_connection.statements).lower()
+    for table in (
+        "connection_instance",
+        "connection_credential",
+        "connection_token",
+        "connection_tool_policy",
+        "connection_sync_state",
+        "declarative_spec_revision",
+        "declarative_spec_operation",
+    ):
+        assert f"create table if not exists `{table}`" in sql
+    assert "unique key `uk_connection_token_hmac` (`token_hmac`)" in sql
+    assert "add column if not exists" not in sql
+
+
+def test_legacy_wecom_backfill_is_idempotent_and_never_repersists_raw_token(
+    monkeypatch,
+):
+    fake_connection = LegacyBackfillConnection()
+    monkeypatch.setattr(db, "get_engine", lambda: FakeEngine(fake_connection))
+    monkeypatch.setattr(store, "token_hmac", lambda raw_token: "b" * 64)
+
+    assert store.migrate_legacy_wecom_connections() == 1
+    assert store.migrate_legacy_wecom_connections() == 0
+
+    statements = fake_connection.statements
+    assert all("legacy-token" not in repr(params) for _, params in statements)
+    copy_index = next(
+        index
+        for index, (sql, _) in enumerate(statements)
+        if "INSERT INTO connection_instance" in sql
+    )
+    watermark_index = next(
+        index
+        for index, (sql, _) in enumerate(statements)
+        if "INSERT INTO connection_sync_state" in sql
+    )
+    assert copy_index < watermark_index
+
+
+def test_legacy_backfill_does_not_reassign_an_existing_token_digest(monkeypatch):
+    fake_connection = CollidingLegacyBackfillConnection()
+    monkeypatch.setattr(db, "get_engine", lambda: FakeEngine(fake_connection))
+    monkeypatch.setattr(store, "token_hmac", lambda raw_token: "b" * 64)
+
+    assert store.migrate_legacy_wecom_connections() == 0
+
+    sql = "\n".join(statement for statement, _ in fake_connection.statements)
+    assert "SELECT connection_id FROM connection_token" in sql
+    assert "INSERT INTO connection_token" not in sql
+    assert "INSERT INTO connection_sync_state" not in sql
+
+
+def test_legacy_backfill_rechecks_token_owner_before_writing_a_watermark(
+    monkeypatch,
+):
+    fake_connection = RacingLegacyBackfillConnection()
+    monkeypatch.setattr(db, "get_engine", lambda: FakeEngine(fake_connection))
+    monkeypatch.setattr(store, "token_hmac", lambda raw_token: "b" * 64)
+
+    assert store.migrate_legacy_wecom_connections() == 0
+
+    sql = "\n".join(statement for statement, _ in fake_connection.statements)
+    assert sql.count("SELECT connection_id FROM connection_token") == 2
+    assert "INSERT INTO connection_sync_state" not in sql
+
+
+def test_connection_queries_are_tenant_scoped_and_return_typed_records(monkeypatch):
+    fake_connection = QueryConnection()
+    monkeypatch.setattr(db, "get_engine", lambda: FakeEngine(fake_connection))
+
+    record = store.get_connection("conn-a", tenant_id="tenant-a")
+    records = store.list_connections("tenant-a")
+
+    assert record.connection_id == "conn-a"
+    assert record.public_config == {"corpid": "ww123"}
+    assert records == [record]
+    get_sql, get_params = fake_connection.statements[0]
+    list_sql, list_params = fake_connection.statements[1]
+    assert "tenant-a" not in get_sql and "tenant-a" not in list_sql
+    assert get_params == {"connection_id": "conn-a", "tenant_id": "tenant-a"}
+    assert list_params == {"tenant_id": "tenant-a"}
+
+
+def test_set_tool_policy_uses_bound_json_and_returns_typed_policy(monkeypatch):
+    fake_connection = FakeConnection()
+    monkeypatch.setattr(db, "get_engine", lambda: FakeEngine(fake_connection))
+
+    policy = store.set_tool_policy(
+        "conn-a", "wecom_list_reports", enabled=False, policy={"reason": "restricted"}
+    )
+
+    sql, params = fake_connection.statements[-1]
+    assert policy.enabled is False
+    assert policy.policy == {"reason": "restricted"}
+    assert "restricted" not in sql
+    assert params["policy_json"] == '{"reason":"restricted"}'

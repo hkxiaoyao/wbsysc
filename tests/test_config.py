@@ -13,6 +13,7 @@ def prod_settings(**overrides):
     values = {
         "app_env": "prod",
         "credential_key": "k" * 32,
+        "mcp_token_hmac_key": "h" * 32,
         "admin_password": "admin-password-123",
         "db_password": "db-password-123",
         "wecom_use_mock": False,
@@ -54,6 +55,32 @@ def test_prod_rejects_unsafe_credential_key(value):
 def test_prod_accepts_credential_key_with_at_least_32_utf8_bytes():
     settings = prod_settings(credential_key="密" * 11)
     assert len(settings.credential_key.encode("utf-8")) == 33
+
+
+@pytest.mark.parametrize(
+    "value",
+    [
+        "",
+        "   ",
+        "CHANGE_ME",
+        "<强随机串>",
+        "h" * 31,
+        "密" * 10,
+    ],
+)
+def test_prod_rejects_unsafe_mcp_token_hmac_key(value):
+    with pytest.raises(ValidationError, match="MCP_TOKEN_HMAC_KEY"):
+        prod_settings(mcp_token_hmac_key=value)
+
+
+def test_prod_accepts_mcp_token_hmac_key_with_at_least_32_utf8_bytes():
+    settings = prod_settings(mcp_token_hmac_key="密" * 11)
+    assert len(settings.mcp_token_hmac_key.encode("utf-8")) == 33
+
+
+def test_prod_rejects_mcp_hmac_key_that_reuses_the_credential_key():
+    with pytest.raises(ValidationError, match="MCP_TOKEN_HMAC_KEY"):
+        prod_settings(mcp_token_hmac_key="k" * 32)
 
 
 def test_dev_keeps_mock_and_empty_key_fallback():
