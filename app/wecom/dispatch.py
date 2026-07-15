@@ -620,7 +620,7 @@ def run_sync_connection(
             timeout=0,
         ) as acquired:
             if not acquired:
-                logger.warning("connection sync busy connection_id=%s", connection_id)
+                logger.warning("connection sync busy")
                 return {"busy": True}
             sync_kwargs = {
                 "force": force,

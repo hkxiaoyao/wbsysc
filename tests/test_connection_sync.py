@@ -207,6 +207,31 @@ def test_wecom_connection_sync_busy_lock_is_scoped_to_connection(monkeypatch):
     ]
 
 
+@pytest.mark.parametrize(
+    "connection_id",
+    ["token.marker", "authorization.bearer-secret"],
+)
+def test_wecom_connection_sync_busy_log_does_not_echo_connection_id(
+    monkeypatch,
+    caplog,
+    connection_id,
+):
+    from app.wecom import dispatch
+
+    @contextmanager
+    def busy_connection_lock(*args, **kwargs):
+        yield False
+
+    monkeypatch.setattr(dispatch.db, "connection_sync_lock", busy_connection_lock)
+
+    with caplog.at_level(logging.WARNING, logger="wecom-sync"):
+        result = dispatch.run_sync_connection(wecom_connection_context(connection_id), "reports")
+
+    assert result == {"busy": True}
+    assert "connection sync busy" in caplog.text
+    assert connection_id not in caplog.text
+
+
 @pytest.mark.asyncio
 async def test_scheduler_runs_only_active_stored_and_eligible_hybrid_connections():
     connector = SyncingConnector()
@@ -289,6 +314,65 @@ async def test_cache_bypasses_nested_sensitive_values_under_benign_keys():
         ttl_seconds=60,
     )
 
+    assert await cache.get("conn-a", "reports.list") is None
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "credential_value",
+    [
+        "bEaReR opaque-value",
+        "eyJhbGciOiJIUzI1NiJ9.eyJzdWIiOiJ1c2VyIn0.signature",
+        "session_id=opaque-session-value",
+    ],
+)
+async def test_cache_bypasses_standard_credential_value_forms(credential_value):
+    cache = ConnectionCache()
+
+    await cache.put(
+        "conn-a",
+        "reports.list",
+        {"result": credential_value},
+        ttl_seconds=60,
+    )
+
+    assert await cache.get("conn-a", "reports.list") is None
+
+
+@pytest.mark.asyncio
+async def test_sensitive_singleflight_owner_forces_waiter_to_load_independently():
+    cache = ConnectionCache()
+    owner_started = asyncio.Event()
+    release_owner = asyncio.Event()
+    waiter_calls = 0
+
+    async def sensitive_owner_loader():
+        owner_started.set()
+        await release_owner.wait()
+        return {"result": "Bearer opaque-value"}
+
+    async def waiter_loader():
+        nonlocal waiter_calls
+        waiter_calls += 1
+        return {"count": waiter_calls}
+
+    owner = asyncio.create_task(
+        cache.get_or_load("conn-a", "reports.list", loader=sensitive_owner_loader)
+    )
+    await owner_started.wait()
+    waiter = asyncio.create_task(
+        cache.get_or_load("conn-a", "reports.list", loader=waiter_loader)
+    )
+    await asyncio.sleep(0)
+    assert waiter_calls == 0
+
+    release_owner.set()
+    owner_result, waiter_result = await asyncio.gather(owner, waiter)
+
+    assert owner_result == {"result": "Bearer opaque-value"}
+    assert waiter_result == {"count": 1}
+    assert waiter_calls == 1
+    assert "Bearer" not in repr(waiter_result)
     assert await cache.get("conn-a", "reports.list") is None
 
 

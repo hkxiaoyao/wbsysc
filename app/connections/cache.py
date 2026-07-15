@@ -16,10 +16,12 @@ from typing import Any, TypeVar
 _SENSITIVE_KEY_PARTS = frozenset(
     {
         "authorization",
+        "bearer",
         "cookie",
         "credential",
         "password",
         "secret",
+        "session",
         "token",
         "apikey",
         "body",
@@ -32,16 +34,25 @@ _SENSITIVE_VALUE_MARKERS = frozenset(
     {
         "apikey",
         "authorization",
+        "bearer",
         "cookie",
         "credential",
         "password",
         "rawresponse",
         "secret",
+        "session",
         "token",
     }
 )
 _OMITTED = "[omitted]"
 _SAFE_SCOPE_KEY_RE = re.compile(r"[A-Za-z0-9][A-Za-z0-9_.:-]{0,127}\Z")
+_JWT_LIKE_RE = re.compile(
+    r"\beyJ[A-Za-z0-9_-]*\.[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+\b",
+    re.IGNORECASE,
+)
+_INFLIGHT_CACHED = "cached"
+_INFLIGHT_BYPASS = "bypass"
+_INFLIGHT_FAILED = "failed"
 T = TypeVar("T")
 
 
@@ -91,7 +102,10 @@ def _contains_sensitive_value(value: Any, *, depth: int = 0) -> bool:
         return not math.isfinite(value)
     if isinstance(value, str):
         normalized = _normalized_key_name(value)
-        return any(marker in normalized for marker in _SENSITIVE_VALUE_MARKERS)
+        return (
+            _JWT_LIKE_RE.search(value) is not None
+            or any(marker in normalized for marker in _SENSITIVE_VALUE_MARKERS)
+        )
     if isinstance(value, (bytes, bytearray, memoryview)):
         return True
     if isinstance(value, Mapping):
@@ -190,7 +204,7 @@ class ConnectionCache:
     def __init__(self, *, clock: Callable[[], float] = time.monotonic) -> None:
         self._clock = clock
         self._entries: dict[tuple[str, str, str], _Entry] = {}
-        self._inflight: dict[tuple[str, str, str], asyncio.Future[tuple[bool, Any]]] = {}
+        self._inflight: dict[tuple[str, str, str], asyncio.Future[tuple[str, Any]]] = {}
         self._lock = asyncio.Lock()
 
     def _key(
@@ -230,7 +244,7 @@ class ConnectionCache:
         *,
         ttl_seconds: float,
         args: Mapping[str, Any] | None = None,
-    ) -> None:
+    ) -> bool:
         if (
             isinstance(ttl_seconds, bool)
             or not isinstance(ttl_seconds, (int, float))
@@ -240,19 +254,20 @@ class ConnectionCache:
             raise ValueError("ttl_seconds must be a positive finite number")
         key = self._key(connection_id, tool_key, args)
         if key is None:
-            return
+            return False
         # A bare textual/binary result is indistinguishable from a raw upstream
         # response body.  Retain only structured, redacted result projections.
-        if isinstance(value, (str, bytes, bytearray, memoryview)):
-            return
+        if value is None or isinstance(value, (str, bytes, bytearray, memoryview)):
+            return False
         if _contains_sensitive_value(value):
-            return
+            return False
         entry = _Entry(
             expires_at=self._clock() + float(ttl_seconds),
             value=_safe_value(value),
         )
         async with self._lock:
             self._entries[key] = entry
+        return True
 
     async def get_or_load(
         self,
@@ -297,22 +312,29 @@ class ConnectionCache:
         if not owner:
             # A cancelling waiter must not cancel the owner's shared future.
             # The owner separately propagates its own cancellation to peers.
-            ok, result = await asyncio.shield(existing)
-            if ok:
+            outcome, result = await asyncio.shield(existing)
+            if outcome == _INFLIGHT_CACHED:
                 return copy.deepcopy(result)
+            if outcome == _INFLIGHT_BYPASS:
+                # Never put an uncacheable owner value in the shared future.
+                # Each waiter instead performs its own loader call.
+                return await _resolve_loader(loader)
             raise CacheLoadError()
 
         try:
             result = await _resolve_loader(loader)
-            await self.put(
+            retained = await self.put(
                 connection_id,
                 tool_key,
                 result,
                 ttl_seconds=ttl_seconds,
                 args=args,
             )
-            safe_result = await self.get(connection_id, tool_key, args)
-            existing.set_result((True, safe_result))
+            if retained:
+                safe_result = await self.get(connection_id, tool_key, args)
+                existing.set_result((_INFLIGHT_CACHED, safe_result))
+            else:
+                existing.set_result((_INFLIGHT_BYPASS, None))
             return result
         except asyncio.CancelledError:
             # Do not convert the owner's cancellation to a cache error.  Wake
@@ -322,7 +344,7 @@ class ConnectionCache:
             raise
         except Exception:
             if not existing.done():
-                existing.set_result((False, None))
+                existing.set_result((_INFLIGHT_FAILED, None))
             raise CacheLoadError() from None
         finally:
             async with self._lock:
