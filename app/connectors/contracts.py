@@ -55,10 +55,12 @@ class ConnectorSpec:
 
     def __post_init__(self) -> None:
         tools = tuple(self.tools)
-        tool_keys = [tool.tool_key for tool in tools]
-        mcp_names = [tool.mcp_name for tool in tools]
-        if len(tool_keys) != len(set(tool_keys)) or len(mcp_names) != len(set(mcp_names)):
-            raise ValueError("duplicate tool_key or mcp_name in ConnectorSpec")
+        identifiers: set[str] = set()
+        for tool in tools:
+            for identifier in {tool.tool_key, tool.mcp_name}:
+                if identifier in identifiers:
+                    raise ValueError("duplicate tool identifier in ConnectorSpec")
+                identifiers.add(identifier)
         object.__setattr__(self, "tools", tools)
 
     def tool(self, tool_key: str) -> ToolSpec:

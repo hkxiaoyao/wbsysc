@@ -131,6 +131,39 @@ def test_contracts_are_immutable_and_resolve_tool_keys_and_mcp_names():
         ConnectorSpec(connector_key="wecom", tools=(READ_TOOL, READ_TOOL))
 
 
+def test_connector_spec_rejects_a_cross_tool_key_name_collision():
+    colliding_tool = ToolSpec(
+        tool_key="wecom_list_reports",
+        mcp_name="reports.refresh",
+        description="Refresh reports.",
+        input_schema={"type": "object"},
+        output_schema={"type": "object"},
+        operation_kind="read",
+        default_timeout_ms=125,
+        cache_ttl_seconds=None,
+    )
+
+    with pytest.raises(ValueError, match="duplicate tool identifier"):
+        ConnectorSpec(connector_key="wecom", tools=(READ_TOOL, colliding_tool))
+
+
+def test_connector_spec_allows_one_tool_to_share_its_key_and_mcp_name():
+    same_identity_tool = ToolSpec(
+        tool_key="reports.status",
+        mcp_name="reports.status",
+        description="Report status.",
+        input_schema={"type": "object"},
+        output_schema={"type": "object"},
+        operation_kind="read",
+        default_timeout_ms=125,
+        cache_ttl_seconds=None,
+    )
+
+    spec = ConnectorSpec(connector_key="wecom", tools=(same_identity_tool,))
+
+    assert spec.tool("reports.status") is same_identity_tool
+
+
 @pytest.mark.asyncio
 async def test_runtime_rejects_disabled_or_write_prohibited_tools():
     connector = FakeConnector()
