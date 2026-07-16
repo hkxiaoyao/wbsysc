@@ -105,11 +105,40 @@ def test_update_connection_locks_row_and_rejects_illegal_status_transition(monke
             data_mode="stored",
             public_config={},
             status="draft",
+            expected_config_version=7,
         )
 
     selects = [sql for sql, _ in connection.statements if sql.lstrip().startswith("SELECT")]
     assert any("FOR UPDATE" in sql for sql in selects)
     assert not any(sql.lstrip().startswith("UPDATE") for sql, _ in connection.statements)
+
+
+def test_update_connection_rejects_stale_expected_version_without_writing(monkeypatch):
+    connection = LockedMutationConnection()
+    events = []
+    monkeypatch.setattr(db, "get_engine", lambda: FakeEngine(connection))
+
+    def invalidator(connection_id, config_version):
+        events.append((connection_id, config_version))
+
+    store.register_connection_cache_invalidator(invalidator)
+    try:
+        with pytest.raises(store.ConnectionVersionConflictError):
+            store.update_connection(
+                "conn-a",
+                "tenant-a",
+                display_name="stale",
+                data_mode="stored",
+                public_config={},
+                expected_config_version=6,
+            )
+    finally:
+        store.unregister_connection_cache_invalidator(invalidator)
+
+    assert not any(
+        sql.lstrip().startswith("UPDATE") for sql, _ in connection.statements
+    )
+    assert events == []
 
 
 def test_replacement_mutations_lock_connection_version_before_writes(monkeypatch):
@@ -130,13 +159,17 @@ def test_replacement_mutations_lock_connection_version_before_writes(monkeypatch
     monkeypatch.setattr(store, "token_hmac", lambda _value: "a" * 64)
     calls = (
         lambda: store.replace_credentials(
-            "conn-a", "tenant-a", {"app_secret": "plain-secret"}
+            "conn-a",
+            "tenant-a",
+            {"app_secret": "plain-secret"},
+            expected_config_version=7,
         ),
         lambda: store.rotate_token("conn-a", "tenant-a"),
         lambda: store.replace_tool_policies(
             "conn-a",
             "tenant-a",
             [ToolPolicy("conn-a", "reports.list", True, {})],
+            expected_config_version=7,
         ),
     )
 
@@ -149,6 +182,52 @@ def test_replacement_mutations_lock_connection_version_before_writes(monkeypatch
         assert "SELECT config_version" in first_sql
         assert "FOR UPDATE" in first_sql
         assert "plain-secret" not in repr(connection.statements)
+
+
+@pytest.mark.parametrize("mutation", ["credentials", "policies"])
+def test_replacement_mutations_reject_stale_versions_without_writing(
+    monkeypatch, mutation
+):
+    from app.connections.models import ToolPolicy
+
+    class StaleConnection(FakeConnection):
+        def execute(self, statement, params=None):
+            params = params or {}
+            sql = str(statement)
+            self.statements.append((sql, params))
+            if "SELECT config_version" in sql:
+                return Result(scalar_value=7)
+            raise AssertionError("stale mutation reached a write or owner lookup")
+
+    connection = StaleConnection()
+    events = []
+    monkeypatch.setattr(db, "get_engine", lambda: FakeEngine(connection))
+    def invalidator(connection_id, config_version):
+        events.append((connection_id, config_version))
+
+    store.register_connection_cache_invalidator(invalidator)
+    if mutation == "credentials":
+        def call():
+            return store.replace_credentials(
+                "conn-a", "tenant-a", {}, expected_config_version=6
+            )
+    else:
+        def call():
+            return store.replace_tool_policies(
+                "conn-a",
+                "tenant-a",
+                [ToolPolicy("conn-a", "reports.list", True, {})],
+                expected_config_version=6,
+            )
+
+    try:
+        with pytest.raises(store.ConnectionVersionConflictError):
+            call()
+    finally:
+        store.unregister_connection_cache_invalidator(invalidator)
+
+    assert len(connection.statements) == 1
+    assert events == []
 
 
 def test_publish_locks_scope_revalidates_and_invalidates_committed_version(monkeypatch):
@@ -221,9 +300,13 @@ def test_publish_locks_scope_revalidates_and_invalidates_committed_version(monke
         events.append((cid, version, connection.commit_succeeded))
     store.register_connection_cache_invalidator(invalidator)
     try:
-        published = store.publish_declarative_revision(
-            "spec-a", 1, "tenant-a", "conn-a"
-        )
+            published = store.publish_declarative_revision(
+                "spec-a",
+                1,
+                "tenant-a",
+                "conn-a",
+                expected_config_version=4,
+            )
     finally:
         store.unregister_connection_cache_invalidator(invalidator)
 
@@ -240,6 +323,95 @@ def test_publish_locks_scope_revalidates_and_invalidates_committed_version(monke
         "revision": 1,
     }
     assert events == [("conn-a", 4, True)]
+
+
+@pytest.mark.parametrize("operation", ["publish", "activate"])
+def test_declarative_lifecycle_rejects_stale_connection_version_before_revision_write(
+    monkeypatch, operation
+):
+    class StaleLifecycleConnection(FakeConnection):
+        def execute(self, statement, params=None):
+            params = params or {}
+            sql = str(statement)
+            self.statements.append((sql, params))
+            if "FROM connection_instance" in sql:
+                return Result(
+                    {
+                        "connection_id": "conn-a",
+                        "tenant_id": "tenant-a",
+                        "connector_key": "http_declarative",
+                        "display_name": "API",
+                        "status": "disabled",
+                        "data_mode": "direct",
+                        "public_config_json": '{"pending_spec_id":"spec-a","pending_revision":1}',
+                        "config_version": 7,
+                    }
+                )
+            raise AssertionError("stale lifecycle reached revision mutation")
+
+    connection = StaleLifecycleConnection()
+    events = []
+    monkeypatch.setattr(db, "get_engine", lambda: FakeEngine(connection))
+
+    def invalidator(connection_id, config_version):
+        events.append((connection_id, config_version))
+
+    store.register_connection_cache_invalidator(invalidator)
+    lifecycle = (
+        store.publish_declarative_revision
+        if operation == "publish"
+        else store.activate_declarative_revision
+    )
+    try:
+        with pytest.raises(store.ConnectionVersionConflictError):
+            lifecycle(
+                "spec-a",
+                1,
+                "tenant-a",
+                "conn-a",
+                expected_config_version=6,
+            )
+    finally:
+        store.unregister_connection_cache_invalidator(invalidator)
+
+    assert len(connection.statements) == 1
+    assert events == []
+
+
+def test_activation_rejects_a_published_revision_that_is_not_staged(monkeypatch):
+    class PendingConnection(FakeConnection):
+        def execute(self, statement, params=None):
+            params = params or {}
+            sql = str(statement)
+            self.statements.append((sql, params))
+            if "FROM connection_instance" in sql:
+                return Result(
+                    {
+                        "connection_id": "conn-a",
+                        "tenant_id": "tenant-a",
+                        "connector_key": "http_declarative",
+                        "display_name": "API",
+                        "status": "disabled",
+                        "data_mode": "direct",
+                        "public_config_json": '{"spec_id":"spec-a","revision":1,"pending_spec_id":"spec-b","pending_revision":2}',
+                        "config_version": 7,
+                    }
+                )
+            raise AssertionError("unstaged revision reached revision lookup")
+
+    connection = PendingConnection()
+    monkeypatch.setattr(db, "get_engine", lambda: FakeEngine(connection))
+
+    with pytest.raises(ValueError, match="pending"):
+        store.activate_declarative_revision(
+            "spec-c",
+            3,
+            "tenant-a",
+            "conn-a",
+            expected_config_version=7,
+        )
+
+    assert len(connection.statements) == 1
 
 
 class LegacyBackfillConnection(FakeConnection):

@@ -133,16 +133,46 @@ def _declarative_candidate_spec(
 def _credential_spec_for_record(
     request: Request, record: ConnectionRecord
 ) -> ConnectorSpec:
-    if record.connector_key == DECLARATIVE_CONNECTOR_KEY:
-        spec_id = record.public_config.get("pending_spec_id")
-        revision = record.public_config.get("pending_revision")
-        if isinstance(spec_id, str) and isinstance(revision, int) and not isinstance(
-            revision, bool
-        ):
-            return _declarative_candidate_spec(
-                request, record, spec_id, revision
-            )
-    return _spec_for_record(request, record)
+    return _management_spec_for_record(request, record)
+
+
+def _pending_revision_identity(
+    record: ConnectionRecord,
+) -> tuple[str, int] | None:
+    if record.connector_key != DECLARATIVE_CONNECTOR_KEY or record.status == "active":
+        return None
+    spec_id = record.public_config.get("pending_spec_id")
+    revision = record.public_config.get("pending_revision")
+    if not isinstance(spec_id, str) or not spec_id:
+        spec_id = record.public_config.get("spec_id")
+        revision = record.public_config.get("revision")
+    if (
+        isinstance(spec_id, str)
+        and spec_id
+        and isinstance(revision, int)
+        and not isinstance(revision, bool)
+        and revision > 0
+    ):
+        return spec_id, revision
+    return None
+
+
+def _management_record(record: ConnectionRecord) -> ConnectionRecord:
+    pending = _pending_revision_identity(record)
+    if pending is None:
+        return record
+    public_config = dict(record.public_config)
+    public_config.update({"spec_id": pending[0], "revision": pending[1]})
+    return replace(record, public_config=public_config)
+
+
+def _management_spec_for_record(
+    request: Request, record: ConnectionRecord
+) -> ConnectorSpec:
+    pending = _pending_revision_identity(record)
+    if pending is None:
+        return _spec_for_record(request, record)
+    return _declarative_candidate_spec(request, record, *pending)
 
 
 def _load_connection_credentials(
@@ -259,6 +289,18 @@ def _safe_config(value: Any, schema: Mapping[str, Any]) -> Any:
         if name and _is_sensitive(name, declaration):
             return _OMIT
         expected = declaration.get("type")
+        expected_types = expected if isinstance(expected, list) else [expected]
+        matches = {
+            "object": isinstance(item, Mapping),
+            "array": isinstance(item, list),
+            "string": isinstance(item, str),
+            "integer": isinstance(item, int) and not isinstance(item, bool),
+            "number": isinstance(item, (int, float)) and not isinstance(item, bool),
+            "boolean": isinstance(item, bool),
+            "null": item is None,
+        }
+        if not any(matches.get(schema_type, False) for schema_type in expected_types):
+            return _OMIT
         if expected == "object" or isinstance(item, Mapping):
             if not isinstance(item, Mapping):
                 return _OMIT
@@ -364,6 +406,8 @@ def _mutate(operation, *args, **kwargs):
     """Execute a store mutation without exposing its inputs or exception text."""
     try:
         return operation(*args, **kwargs)
+    except store.ConnectionVersionConflictError:
+        raise HTTPException(409, "connection configuration changed") from None
     except HTTPException:
         raise
     except Exception as exc:
@@ -465,6 +509,7 @@ def update_connection(tenant_id: str, connection_id: str, body: ConnectionUpdate
         data_mode=body.data_mode,
         public_config=body.public_config,
         status=body.status,
+        expected_config_version=current.config_version,
     )
     if updated is None:
         raise HTTPException(404, "connection not found")
@@ -503,7 +548,13 @@ def replace_connection_credentials(tenant_id: str, connection_id: str, body: Cre
     _validate_schema(
         values, _credential_spec_for_record(request, record).credential_schema
     )
-    if not _mutate(store.replace_credentials, connection_id, tenant_id, values):
+    if not _mutate(
+        store.replace_credentials,
+        connection_id,
+        tenant_id,
+        values,
+        expected_config_version=record.config_version,
+    ):
         raise HTTPException(404, "connection not found")
     _audit(record, "connection_credentials_replaced")
     return {"ok": True, "credential_keys": sorted(values)}
@@ -560,7 +611,7 @@ def revoke_connection_token_global(connection_id: str, token_id: str, request: R
 @router.get("/tenants/{tenant_id}/connections/{connection_id}/tools")
 def list_connection_tools(tenant_id: str, connection_id: str, request: Request):
     record = _owned(tenant_id, connection_id)
-    spec = _spec_for_record(request, record)
+    spec = _management_spec_for_record(request, record)
     configured = {item.tool_name: item for item in store.list_tool_policies(connection_id)}
     return {"items": [{
         "tool_key": tool.tool_key,
@@ -579,7 +630,7 @@ def list_connection_tools_global(connection_id: str, request: Request):
 @router.put("/tenants/{tenant_id}/connections/{connection_id}/tools")
 def update_connection_tools(tenant_id: str, connection_id: str, body: ToolPoliciesRequest, request: Request):
     record = _owned(tenant_id, connection_id)
-    spec = _spec_for_record(request, record)
+    spec = _management_spec_for_record(request, record)
     declared = {tool.tool_key: tool for tool in spec.tools}
     policies: list[ToolPolicy] = []
     seen = set()
@@ -596,7 +647,13 @@ def update_connection_tools(tenant_id: str, connection_id: str, body: ToolPolici
         if item.rate_limit_per_minute is not None:
             policy["rate_limit"] = {"limit": item.rate_limit_per_minute, "window_seconds": 60}
         policies.append(ToolPolicy(connection_id, item.tool_key, item.enabled, policy))
-    if not _mutate(store.replace_tool_policies, connection_id, tenant_id, policies):
+    if not _mutate(
+        store.replace_tool_policies,
+        connection_id,
+        tenant_id,
+        policies,
+        expected_config_version=record.config_version,
+    ):
         raise HTTPException(404, "connection not found")
     _audit(record, "connection_tools_updated")
     return {"ok": True}
@@ -610,18 +667,19 @@ def update_connection_tools_global(connection_id: str, body: ToolPoliciesRequest
 @router.post("/tenants/{tenant_id}/connections/{connection_id}/test")
 async def test_connection(tenant_id: str, connection_id: str, request: Request):
     record = _owned(tenant_id, connection_id)
-    if record.status != "active":
+    execution_record = _management_record(record)
+    if record.status != "active" and execution_record is record:
         raise HTTPException(409, "connection test is unsupported")
     gateway = getattr(request.app.state, "mcp_gateway", None)
     try:
         execution_context = gateway.resolver.execution_context(
             ConnectionCtx(
-                tenant_id=record.tenant_id,
-                connection_id=record.connection_id,
-                connector_key=record.connector_key,
-                data_mode=record.data_mode,
-                public_config=record.public_config,
-                config_version=record.config_version,
+                tenant_id=execution_record.tenant_id,
+                connection_id=execution_record.connection_id,
+                connector_key=execution_record.connector_key,
+                data_mode=execution_record.data_mode,
+                public_config=execution_record.public_config,
+                config_version=execution_record.config_version,
             )
         )
         tools = gateway._runtime.list_enabled_tools(execution_context)
@@ -682,6 +740,8 @@ async def sync_connection_global(connection_id: str, request: Request):
 def import_connection_spec(tenant_id: str, connection_id: str, body: OpenApiImportRequest, request: Request):
     record = _owned(tenant_id, connection_id)
     _require_declarative(record)
+    if record.status not in {"draft", "disabled"}:
+        raise HTTPException(409, "disable connection before changing revision")
     try:
         revision = import_openapi_revision(
             body.document,
@@ -694,7 +754,11 @@ def import_connection_spec(tenant_id: str, connection_id: str, body: OpenApiImpo
             sync_spec=body.sync_spec,
         )
         validate_revision(revision, data_mode=record.data_mode)
-        store.save_declarative_revision(revision)
+        store.save_declarative_revision(
+            revision, expected_config_version=record.config_version
+        )
+    except store.ConnectionVersionConflictError:
+        raise HTTPException(409, "connection configuration changed") from None
     except (SpecValidationError, ValueError, TypeError) as exc:
         logger.warning("Declarative import rejected type=%s", type(exc).__name__)
         raise HTTPException(422, "invalid declarative specification") from None
@@ -742,8 +806,18 @@ def publish_connection_spec(
 ):
     record = _owned(tenant_id, connection_id)
     _require_declarative(record)
+    if record.status not in {"draft", "disabled"}:
+        raise HTTPException(409, "disable connection before changing revision")
     try:
-        published = store.publish_declarative_revision(spec_id, revision, tenant_id, connection_id)
+        published = store.publish_declarative_revision(
+            spec_id,
+            revision,
+            tenant_id,
+            connection_id,
+            expected_config_version=record.config_version,
+        )
+    except store.ConnectionVersionConflictError:
+        raise HTTPException(409, "connection configuration changed") from None
     except (SpecValidationError, ValueError, TypeError):
         raise HTTPException(422, "invalid declarative specification") from None
     if published is None:
@@ -767,6 +841,8 @@ def activate_connection_spec(
 ):
     current = _owned(tenant_id, connection_id)
     _require_declarative(current)
+    if _pending_revision_identity(current) != (spec_id, revision):
+        raise HTTPException(409, "pending declarative revision is unavailable")
     spec = _declarative_candidate_spec(
         request, current, spec_id, revision
     )
@@ -774,8 +850,22 @@ def activate_connection_spec(
         _load_connection_credentials(request, current),
         spec.credential_schema,
     )
+    declared_tools = {tool.tool_key for tool in spec.tools}
+    configured_tools = {
+        policy.tool_name for policy in store.list_tool_policies(connection_id)
+    }
+    if configured_tools != declared_tools:
+        raise HTTPException(409, "pending tool policies are incomplete")
     try:
-        activated = store.activate_declarative_revision(spec_id, revision, tenant_id, connection_id)
+        activated = store.activate_declarative_revision(
+            spec_id,
+            revision,
+            tenant_id,
+            connection_id,
+            expected_config_version=current.config_version,
+        )
+    except store.ConnectionVersionConflictError:
+        raise HTTPException(409, "connection configuration changed") from None
     except (SpecValidationError, ValueError, TypeError):
         raise HTTPException(422, "invalid declarative specification") from None
     if activated is None:

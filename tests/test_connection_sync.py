@@ -4,6 +4,7 @@ import asyncio
 import logging
 import threading
 from contextlib import contextmanager
+from dataclasses import replace
 from types import SimpleNamespace
 
 import pytest
@@ -88,9 +89,14 @@ async def test_sync_orchestrator_never_syncs_direct_connection():
 async def test_sync_orchestrator_scopes_context_and_resource_to_connection():
     connector = SyncingConnector()
     contexts = Contexts()
-    orchestrator = SyncOrchestrator(ConnectorRegistry([connector]), contexts=contexts)
+    current = connection("conn-b")
+    orchestrator = SyncOrchestrator(
+        ConnectorRegistry([connector]),
+        contexts=contexts,
+        connection_refresher=lambda connection_id, tenant_id: current,
+    )
 
-    result = await orchestrator.run_connection(connection("conn-b"), "reports.list")
+    result = await orchestrator.run_connection(current, "reports.list")
 
     assert result == SyncResult.ok("conn-b", "reports.list", {"stored": 1})
     assert contexts.connections == [connection("conn-b")]
@@ -101,15 +107,60 @@ async def test_sync_orchestrator_scopes_context_and_resource_to_connection():
 
 
 @pytest.mark.asyncio
+async def test_sync_refreshes_inside_lock_and_stops_when_connection_was_disabled():
+    connector = SyncingConnector()
+    contexts = Contexts()
+    stale = connection()
+    disabled = connection(status="disabled")
+    orchestrator = SyncOrchestrator(
+        ConnectorRegistry([connector]),
+        contexts=contexts,
+        connection_refresher=lambda connection_id, tenant_id: disabled,
+    )
+
+    result = await orchestrator.run_connection(stale)
+
+    assert result is None
+    assert connector.calls == []
+    assert contexts.connections == []
+
+
+@pytest.mark.asyncio
+async def test_sync_executes_only_the_revision_refreshed_inside_the_lock():
+    connector = SyncingConnector()
+    contexts = Contexts()
+    stale = connection()
+    object.__setattr__(stale, "public_config", {"revision": 1})
+    current = replace(stale, public_config={"revision": 2}, config_version=2)
+    orchestrator = SyncOrchestrator(
+        ConnectorRegistry([connector]),
+        contexts=contexts,
+        connection_refresher=lambda connection_id, tenant_id: current,
+    )
+
+    result = await orchestrator.run_connection(stale)
+
+    assert result is not None
+    assert contexts.connections == [current]
+    assert connector.calls[0][0].public_config == {"revision": 2}
+    assert connector.calls[0][0].connection.config_version == 2
+
+
+@pytest.mark.asyncio
 async def test_sync_orchestrator_uses_registry_snapshot_without_reexecuting_spec():
     connector = SyncingConnector()
     registry = ConnectorRegistry([connector])
-    orchestrator = SyncOrchestrator(registry, contexts=Contexts())
+    current = connection()
+    orchestrator = SyncOrchestrator(
+        registry,
+        contexts=Contexts(),
+        connection_refresher=lambda connection_id, tenant_id: current,
+    )
     connector.spec = lambda: (_ for _ in ()).throw(
         AssertionError("sync re-executed connector.spec")
     )
 
-    result = await orchestrator.run_connection(connection(), "reports.list")
+    result = await orchestrator.run_connection(current, "reports.list")
 
     assert result == SyncResult.ok("conn-a", "reports.list", {"stored": 1})
 
@@ -253,18 +304,26 @@ def test_wecom_connection_sync_busy_log_does_not_echo_connection_id(
 async def test_scheduler_runs_only_active_stored_and_eligible_hybrid_connections():
     connector = SyncingConnector()
     contexts = Contexts()
-    orchestrator = SyncOrchestrator(ConnectorRegistry([connector]), contexts=contexts)
     disabled_hybrid = connection("conn-disabled", data_mode="hybrid")
     object.__setattr__(disabled_hybrid, "public_config", {"sync_enabled": False})
+    scheduled = (
+        connection("conn-stored", data_mode="stored"),
+        connection("conn-hybrid", data_mode="hybrid"),
+        disabled_hybrid,
+        connection("conn-direct", data_mode="direct"),
+        connection("conn-inactive", status="disabled", data_mode="stored"),
+    )
+    current = {record.connection_id: record for record in scheduled}
+    orchestrator = SyncOrchestrator(
+        ConnectorRegistry([connector]),
+        contexts=contexts,
+        connection_refresher=lambda connection_id, tenant_id: current.get(
+            connection_id
+        ),
+    )
 
     results = await orchestrator.run_scheduled(
-        connections=(
-            connection("conn-stored", data_mode="stored"),
-            connection("conn-hybrid", data_mode="hybrid"),
-            disabled_hybrid,
-            connection("conn-direct", data_mode="direct"),
-            connection("conn-inactive", status="disabled", data_mode="stored"),
-        )
+        connections=scheduled
     )
 
     assert [result.connection_id for result in results] == [
@@ -470,13 +529,15 @@ async def test_sync_failures_return_a_fixed_safe_summary(caplog):
             raise RuntimeError("token=top-secret raw response body")
 
     contexts = Contexts()
+    current = connection()
     orchestrator = SyncOrchestrator(
         ConnectorRegistry([FailingConnector()]),
         contexts=contexts,
+        connection_refresher=lambda connection_id, tenant_id: current,
     )
 
     with caplog.at_level(logging.WARNING, logger="app.connections.sync"):
-        result = await orchestrator.run_connection(connection(), "reports.list")
+        result = await orchestrator.run_connection(current, "reports.list")
 
     assert result == SyncResult(
         connection_id="conn-a",

@@ -242,6 +242,9 @@ class SyncOrchestrator:
         connection_lister: Callable[
             [], Iterable[ConnectionRecord]
         ] = list_syncable_connections,
+        connection_refresher: Callable[
+            [str, str], ConnectionRecord | None
+        ] | None = None,
         event_writer: Callable[[McpLogEvent], Any] | None = None,
         connector_resolver: ConnectionConnectorResolver | None = None,
     ) -> None:
@@ -252,6 +255,7 @@ class SyncOrchestrator:
         self._registry = registry
         self._contexts = contexts
         self._connection_lister = connection_lister
+        self._connection_refresher = connection_refresher or _refresh_connection
         self._event_writer = event_writer or _default_event_writer
         self._connector_resolver = connector_resolver or ConnectionConnectorResolver(
             registry
@@ -272,6 +276,19 @@ class SyncOrchestrator:
             return None
         resource = _safe_resource_key(resource_key)
         async with self._locks.acquire(connection.connection_id):
+            refreshed = self._connection_refresher(
+                connection.connection_id, connection.tenant_id
+            )
+            if inspect.isawaitable(refreshed):
+                refreshed = await refreshed
+            if (
+                not isinstance(refreshed, ConnectionRecord)
+                or refreshed.connection_id != connection.connection_id
+                or refreshed.tenant_id != connection.tenant_id
+                or not _eligible(refreshed)
+            ):
+                return None
+            connection = refreshed
             try:
                 spec = self._connector_resolver.spec_for(
                     ConnectionContext(connection=connection)
@@ -377,6 +394,14 @@ def _default_event_writer(event: McpLogEvent) -> Any:
     from ..mcp_audit import write_event
 
     return write_event(event)
+
+
+def _refresh_connection(
+    connection_id: str, tenant_id: str
+) -> ConnectionRecord | None:
+    from . import store
+
+    return store.get_connection(connection_id, tenant_id)
 
 
 __all__ = [

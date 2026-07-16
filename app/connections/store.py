@@ -25,6 +25,12 @@ _LEGACY_WATERMARK_STATUS = "completed"
 # credentials or bearer tokens.
 ConnectionCacheInvalidator = Callable[[str, int], None]
 _connection_cache_invalidators: list[ConnectionCacheInvalidator] = []
+
+
+class ConnectionVersionConflictError(RuntimeError):
+    """A validated management write targeted an obsolete connection version."""
+
+
 _connection_cache_invalidator_lock = threading.Lock()
 
 
@@ -439,7 +445,9 @@ def list_connections(tenant_id: str) -> list[ConnectionRecord]:
     return [_connection_from_row(row) for row in rows]
 
 
-def save_declarative_revision(revision: Any) -> None:
+def save_declarative_revision(
+    revision: Any, *, expected_config_version: int | None = None
+) -> None:
     """Persist one compiled revision without accepting a raw upstream payload.
 
     A revision is append-only: the primary key intentionally has no upsert
@@ -469,6 +477,30 @@ def save_declarative_revision(revision: Any) -> None:
         raise ValueError("declarative revision exceeds size limit")
 
     with _engine().begin() as conn:
+        if expected_config_version is not None:
+            connection_row = conn.execute(
+                text("""
+                    SELECT connection_id, tenant_id, connector_key, display_name,
+                           status, data_mode, public_config_json, config_version
+                    FROM connection_instance
+                    WHERE connection_id=:connection_id AND tenant_id=:tenant_id
+                    LIMIT 1 FOR UPDATE
+                """),
+                {
+                    "connection_id": revision.connection_id,
+                    "tenant_id": revision.tenant_id,
+                },
+            ).fetchone()
+            if connection_row is None:
+                raise ValueError("declarative connection is unavailable")
+            current = _connection_from_row(connection_row)
+            if current.config_version != expected_config_version:
+                raise ConnectionVersionConflictError
+            if (
+                current.connector_key != "http_declarative"
+                or current.status not in {"draft", "disabled"}
+            ):
+                raise ValueError("declarative connection cannot be changed")
         conn.execute(
             text("""
                 INSERT INTO declarative_spec_revision
@@ -636,7 +668,12 @@ def get_declarative_revision(
 
 
 def publish_declarative_revision(
-    spec_id: str, revision: int, tenant_id: str, connection_id: str
+    spec_id: str,
+    revision: int,
+    tenant_id: str,
+    connection_id: str,
+    *,
+    expected_config_version: int,
 ) -> Any | None:
     """Validate and publish an immutable tenant-owned draft in one transaction."""
     retired_version: int | None = None
@@ -655,8 +692,12 @@ def publish_declarative_revision(
         if connection_row is None:
             return None
         current = _connection_from_row(connection_row)
+        if current.config_version != expected_config_version:
+            raise ConnectionVersionConflictError
         if current.connector_key != "http_declarative":
             raise ValueError("invalid declarative connection")
+        if current.status not in {"draft", "disabled"}:
+            raise ValueError("active declarative revision cannot be changed")
         row = conn.execute(
             text("""
                 SELECT spec_id, revision, tenant_id, connection_id, status, spec_json
@@ -708,7 +749,12 @@ def publish_declarative_revision(
 
 
 def activate_declarative_revision(
-    spec_id: str, revision: int, tenant_id: str, connection_id: str
+    spec_id: str,
+    revision: int,
+    tenant_id: str,
+    connection_id: str,
+    *,
+    expected_config_version: int,
 ) -> ConnectionRecord | None:
     """Activate only a published revision on its exact tenant connection."""
     retired_version: int | None = None
@@ -726,8 +772,19 @@ def activate_declarative_revision(
         if row is None:
             return None
         current = _connection_from_row(row)
+        if current.config_version != expected_config_version:
+            raise ConnectionVersionConflictError
         if current.connector_key != "http_declarative":
             raise ValueError("invalid declarative connection")
+        if current.status not in {"draft", "disabled"}:
+            raise ValueError("pending declarative revision is unavailable")
+        staged_spec_id = current.public_config.get("pending_spec_id")
+        staged_revision = current.public_config.get("pending_revision")
+        if not isinstance(staged_spec_id, str) or not staged_spec_id:
+            staged_spec_id = current.public_config.get("spec_id")
+            staged_revision = current.public_config.get("revision")
+        if (staged_spec_id, staged_revision) != (spec_id, revision):
+            raise ValueError("pending declarative revision is unavailable")
         revision_row = conn.execute(
             text("""
                 SELECT spec_id, revision, tenant_id, connection_id, status, spec_json
@@ -924,6 +981,7 @@ def update_connection(
     data_mode: str,
     public_config: Mapping[str, Any],
     status: str | None = None,
+    expected_config_version: int,
 ) -> ConnectionRecord | None:
     """Update a tenant-owned connection and retire only its committed cache key."""
     retired_version: int | None = None
@@ -941,6 +999,8 @@ def update_connection(
         if row is None:
             return None
         current = _connection_from_row(row)
+        if current.config_version != expected_config_version:
+            raise ConnectionVersionConflictError
         retired_version = current.config_version
         next_status = current.status if status is None else status
         _assert_status_transition(current.status, next_status)
@@ -1006,13 +1066,21 @@ def disable_connection(connection_id: str, tenant_id: str) -> ConnectionRecord |
 
 
 def replace_credentials(
-    connection_id: str, tenant_id: str, credentials: Mapping[str, str]
+    connection_id: str,
+    tenant_id: str,
+    credentials: Mapping[str, str],
+    *,
+    expected_config_version: int,
 ) -> bool:
     retired_version: int | None = None
     with _engine().begin() as conn:
         retired_version = _retired_connection_version(
             conn, connection_id, for_update=True
         )
+        if retired_version is None:
+            return False
+        if retired_version != expected_config_version:
+            raise ConnectionVersionConflictError
         owner = conn.execute(
             text("SELECT tenant_id FROM connection_instance WHERE connection_id=:connection_id LIMIT 1"),
             {"connection_id": connection_id},
@@ -1125,13 +1193,21 @@ def list_tool_policies(connection_id: str) -> list[ToolPolicy]:
 
 
 def replace_tool_policies(
-    connection_id: str, tenant_id: str, policies: list[ToolPolicy]
+    connection_id: str,
+    tenant_id: str,
+    policies: list[ToolPolicy],
+    *,
+    expected_config_version: int,
 ) -> bool:
     retired_version: int | None = None
     with _engine().begin() as conn:
         retired_version = _retired_connection_version(
             conn, connection_id, for_update=True
         )
+        if retired_version is None:
+            return False
+        if retired_version != expected_config_version:
+            raise ConnectionVersionConflictError
         owner = conn.execute(text("SELECT tenant_id FROM connection_instance WHERE connection_id=:connection_id LIMIT 1"), {"connection_id": connection_id}).scalar()
         if owner != tenant_id:
             return False

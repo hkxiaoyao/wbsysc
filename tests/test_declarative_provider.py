@@ -8,8 +8,7 @@ from fastapi.testclient import TestClient
 
 from app import admin, admin_connections
 from app.auth import ConnectionCtx
-from app.connections.models import IssuedToken
-from app.connections.models import ConnectionRecord
+from app.connections.models import ConnectionRecord, IssuedToken, ToolPolicy
 from app.connections.sync import SyncOrchestrator
 from app.connectors.contracts import ConnectionContext
 from app.connectors.declarative.http_client import SafeHttpClient
@@ -219,6 +218,7 @@ def test_app_sync_and_gateway_share_exact_connector_resolver():
 def test_admin_lifecycle_then_gateway_lists_and_executes_dynamic_revision(monkeypatch):
     state = {"record": None}
     revisions = {}
+    policy_tools = ["health.get"]
     raw_token = "mcp_lifecycle_token"
 
     def revision_loader(spec_id, revision, tenant_id, connection_id):
@@ -291,7 +291,7 @@ def test_admin_lifecycle_then_gateway_lists_and_executes_dynamic_revision(monkey
     monkeypatch.setattr(
         admin_connections.store,
         "save_declarative_revision",
-        lambda revision: revisions.__setitem__(
+        lambda revision, **kwargs: revisions.__setitem__(
             (
                 revision.spec_id,
                 revision.revision,
@@ -307,25 +307,56 @@ def test_admin_lifecycle_then_gateway_lists_and_executes_dynamic_revision(monkey
         revision_loader,
     )
 
-    def publish(spec_id, revision, tenant_id, connection_id):
+    def publish(spec_id, revision, tenant_id, connection_id, **kwargs):
         key = (spec_id, revision, tenant_id, connection_id)
         published = replace(revisions[key], status="published")
         revisions[key] = published
+        config = dict(state["record"].public_config)
+        if state["record"].status == "draft":
+            config.update({"spec_id": spec_id, "revision": revision})
+        else:
+            config.update(
+                {"pending_spec_id": spec_id, "pending_revision": revision}
+            )
         state["record"] = replace(
             state["record"],
-            public_config={"spec_id": spec_id, "revision": revision},
-            config_version=2,
+            public_config=config,
+            config_version=state["record"].config_version + 1,
         )
         return published
 
-    def activate(spec_id, revision, tenant_id, connection_id):
+    def activate(spec_id, revision, tenant_id, connection_id, **kwargs):
+        config = dict(state["record"].public_config)
+        config.update({"spec_id": spec_id, "revision": revision})
+        config.pop("pending_spec_id", None)
+        config.pop("pending_revision", None)
         state["record"] = replace(
-            state["record"], status="active", config_version=3
+            state["record"],
+            status="active",
+            public_config=config,
+            config_version=state["record"].config_version + 1,
+        )
+        return state["record"]
+
+    def disable(connection_id, tenant_id):
+        state["record"] = replace(
+            state["record"],
+            status="disabled",
+            config_version=state["record"].config_version + 1,
         )
         return state["record"]
 
     monkeypatch.setattr(admin_connections.store, "publish_declarative_revision", publish)
     monkeypatch.setattr(admin_connections.store, "activate_declarative_revision", activate)
+    monkeypatch.setattr(admin_connections.store, "disable_connection", disable)
+    monkeypatch.setattr(
+        admin_connections.store,
+        "list_tool_policies",
+        lambda connection_id: [
+            ToolPolicy(connection_id, tool_key, True, {})
+            for tool_key in policy_tools
+        ],
+    )
 
     with TestClient(app) as client:
         created = client.post(
@@ -351,6 +382,20 @@ def test_admin_lifecycle_then_gateway_lists_and_executes_dynamic_revision(monkey
         activated = client.post(
             f"/admin/connections/{connection_id}/specs/spec-a/revisions/1/activate"
         )
+        disabled = client.post(f"/admin/connections/{connection_id}/disable")
+        v2_document = _document()
+        v2_document["paths"]["/health"]["get"]["operationId"] = "health.v2"
+        imported_v2 = client.post(
+            f"/admin/connections/{connection_id}/specs/import",
+            json={"document": v2_document, "spec_id": "spec-b", "revision": 2},
+        )
+        published_v2 = client.post(
+            f"/admin/connections/{connection_id}/specs/spec-b/revisions/2/publish"
+        )
+        policy_tools[:] = ["health.v2"]
+        activated_v2 = client.post(
+            f"/admin/connections/{connection_id}/specs/spec-b/revisions/2/activate"
+        )
         headers = {
             "Authorization": f"Bearer {raw_token}",
             "Accept": "application/json, text/event-stream",
@@ -368,13 +413,24 @@ def test_admin_lifecycle_then_gateway_lists_and_executes_dynamic_revision(monkey
                 "jsonrpc": "2.0",
                 "id": 2,
                 "method": "tools/call",
-                "params": {"name": "health.get", "arguments": {}},
+                "params": {"name": "health.v2", "arguments": {}},
             },
         )
 
-    assert [created.status_code, imported.status_code, published.status_code, activated.status_code] == [201, 201, 200, 200]
+    assert [
+        created.status_code,
+        imported.status_code,
+        published.status_code,
+        activated.status_code,
+        disabled.status_code,
+        imported_v2.status_code,
+        published_v2.status_code,
+        activated_v2.status_code,
+    ] == [201, 201, 200, 200, 200, 201, 200, 200]
     assert tools.status_code == 200
-    assert tools.json()["result"]["tools"][0]["name"] == "health.get"
+    assert [tool["name"] for tool in tools.json()["result"]["tools"]] == [
+        "health.v2"
+    ]
     assert called.status_code == 200
     assert called.json()["result"]["structuredContent"] == {"ok": True}
 
@@ -409,7 +465,10 @@ async def test_sync_orchestrator_uses_same_connection_scoped_provider():
             return ConnectionContext(connection=connection)
 
     orchestrator = SyncOrchestrator(
-        registry, contexts=Contexts(), connector_resolver=resolver
+        registry,
+        contexts=Contexts(),
+        connector_resolver=resolver,
+        connection_refresher=lambda connection_id, tenant_id: record,
     )
     result = await orchestrator.run_connection(record, "health")
 
