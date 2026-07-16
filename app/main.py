@@ -9,10 +9,12 @@
 3. session_manager 只在调用 streamable_http_app() 后才可访问（惰性创建）
 4. 同步任务用单独线程池执行，不阻塞 asyncio 事件循环
 """
+
 from __future__ import annotations
 
 import asyncio
 import contextlib
+from dataclasses import dataclass
 import logging
 
 import uvicorn
@@ -20,6 +22,7 @@ from apscheduler.schedulers.asyncio import AsyncIOScheduler
 from apscheduler.triggers.cron import CronTrigger
 from apscheduler.triggers.interval import IntervalTrigger
 from fastapi import FastAPI
+from sqlalchemy import text
 from starlette.middleware import Middleware
 from starlette.middleware.cors import CORSMiddleware
 
@@ -27,8 +30,15 @@ from . import db
 from .auth import BearerTokenMiddleware
 from .config import get_settings
 from .connections.sync import ResolverConnectionContextBuilder, SyncOrchestrator
+from .connectors.discovery import (
+    ConnectorDiscoveryFailure,
+    ConnectorDiscoveryResult,
+    ValidatedConnector,
+    discover_connector_packages,
+    register_discovered_connectors,
+    validate_active_connector_dependencies,
+)
 from .connectors.registry import ConnectorRegistry
-from .connectors.wecom import WeComConnector
 from .mcp_audit import (
     McpProtocolAuditMiddleware,
     acquire_audit_writer,
@@ -47,13 +57,83 @@ logger = logging.getLogger("wecom-gateway")
 # 全局调度器，lifespan 启动/关闭
 _scheduler: AsyncIOScheduler | None = None
 mcp_gateway = ConnectionMcpGateway()
+connector_registry = mcp_gateway._runtime._registry
+
+
+@dataclass(frozen=True)
+class _ConnectorDependency:
+    connector_key: str
+    status: str
+
+
+def list_active_connector_dependencies() -> tuple[_ConnectorDependency, ...]:
+    """Read only connector identity/status metadata after startup migrations."""
+    statement = text("""
+        SELECT connector_key, status
+        FROM connection_instance
+        WHERE status='active'
+    """)
+    with db.get_engine().connect() as connection:
+        rows = connection.execute(statement).fetchall()
+    dependencies = []
+    for row in rows:
+        values = dict(row._mapping) if hasattr(row, "_mapping") else dict(row)
+        connector_key = values.get("connector_key")
+        status = values.get("status")
+        if isinstance(connector_key, str) and isinstance(status, str):
+            dependencies.append(_ConnectorDependency(connector_key, status))
+    return tuple(dependencies)
+
+
+def _registerable_discovery_result(
+    registry: ConnectorRegistry,
+    result: ConnectorDiscoveryResult,
+) -> ConnectorDiscoveryResult:
+    """Preflight built-in/package collisions without executing connector code."""
+    registerable: list[ValidatedConnector] = []
+    failures = list(result.failures)
+    for item in result.connectors:
+        existing = registry.validated_spec(item.spec.connector_key)
+        if existing == item.spec:
+            registerable.append(item)
+            continue
+        try:
+            registry.validate_registration(item.spec)
+        except ValueError:
+            failures.append(
+                ConnectorDiscoveryFailure(item.spec.connector_key, "registration")
+            )
+            continue
+        registerable.append(item)
+    return ConnectorDiscoveryResult(tuple(registerable), tuple(failures))
+
+
+def configure_trusted_connectors(
+    *, registry: ConnectorRegistry | None = None
+) -> ConnectorDiscoveryResult:
+    """Discover, validate active dependencies, and idempotently register packages."""
+    target = connector_registry if registry is None else registry
+    dependencies = list_active_connector_dependencies()
+    target.clear_discovered_connectors()
+    result = _registerable_discovery_result(target, discover_connector_packages())
+    validate_active_connector_dependencies(
+        dependencies,
+        result,
+        allowlist=get_settings().connector_allowlist,
+    )
+    register_discovered_connectors(target, result)
+    for item in result.connectors:
+        logger.info(
+            "trusted connector available connector_key=%s version=%s",
+            item.spec.connector_key,
+            item.spec.version,
+        )
+    return result
 
 
 def _build_connection_sync_orchestrator() -> SyncOrchestrator:
     return SyncOrchestrator(
-        ConnectorRegistry(
-            [WeComConnector(mock_enabled=lambda: get_settings().wecom_use_mock)]
-        ),
+        connector_registry,
         contexts=ResolverConnectionContextBuilder(),
     )
 
@@ -74,7 +154,9 @@ def create_app(*, gateway: ConnectionMcpGateway | None = None) -> FastAPI:
         path = request.scope.get("path")
         if path == "/mcp":
             request.scope["path"] = "/mcp/"
-        elif isinstance(path, str) and path.startswith("/mcp/") and path.count("/") == 2:
+        elif (
+            isinstance(path, str) and path.startswith("/mcp/") and path.count("/") == 2
+        ):
             # A parameterized Mount needs its terminal slash to win over the
             # legacy `/mcp` catch-all mount for `/mcp/{connection_id}`.
             request.scope["path"] = f"{path}/"
@@ -111,10 +193,12 @@ def create_app(*, gateway: ConnectionMcpGateway | None = None) -> FastAPI:
         # 仅放行安全文件名；避免吞掉 /health /mcp /admin 等（这些有更具体路由优先匹配）
         if not is_safe_verify_filename(verify_filename):
             from fastapi import HTTPException
+
             raise HTTPException(404, "Not Found")
         item = get_verify_file(verify_filename)
         if not item:
             from fastapi import HTTPException
+
             raise HTTPException(404, "Not Found")
         return Response(
             content=item["content"],
@@ -125,9 +209,12 @@ def create_app(*, gateway: ConnectionMcpGateway | None = None) -> FastAPI:
     # 管理后台前端静态文件（构建产物 app/static/dist）—— 必须在 mcp_glyph 之前注册
     import os
     from fastapi.staticfiles import StaticFiles
+
     dist_dir = os.path.join(os.path.dirname(__file__), "static", "dist")
     if os.path.isdir(dist_dir):
-        app.mount("/admin/ui", StaticFiles(directory=dist_dir, html=True), name="admin-ui")
+        app.mount(
+            "/admin/ui", StaticFiles(directory=dist_dir, html=True), name="admin-ui"
+        )
 
     # Each route reaches the same connection-aware gateway, but authentication
     # happens before it can create or dispatch a protocol session.
@@ -138,7 +225,9 @@ def create_app(*, gateway: ConnectionMcpGateway | None = None) -> FastAPI:
         return Starlette(
             routes=[Mount("/", app=gateway)],
             middleware=[
-                Middleware(BearerTokenMiddleware, resolver=gateway.resolver, legacy=legacy),
+                Middleware(
+                    BearerTokenMiddleware, resolver=gateway.resolver, legacy=legacy
+                ),
                 Middleware(McpProtocolAuditMiddleware),
                 Middleware(
                     CORSMiddleware,
@@ -197,6 +286,13 @@ async def lifespan(app):
 
     # 1. 启动迁移必须先于 MCP 会话、租户加载和调度器；失败直接阻止启动。
     db.run_startup_migrations()
+    app_state = getattr(app, "state", None)
+    gateway = getattr(app_state, "mcp_gateway", mcp_gateway)
+    if app_state is not None:
+        gateway_registry = getattr(
+            getattr(gateway, "_runtime", None), "_registry", connector_registry
+        )
+        configure_trusted_connectors(registry=gateway_registry)
     acquire_audit_writer()
     audit_acquired = True
     audit_released = False
@@ -219,7 +315,6 @@ async def lifespan(app):
                 )
 
     # 2. Connection-scoped MCP session manager cache
-    gateway = getattr(getattr(app, "state", None), "mcp_gateway", mcp_gateway)
     # The gateway owns a cache of low-level Streamable HTTP session managers;
     # retain this lifecycle name for the established startup ordering contract.
     session_manager = gateway
@@ -231,10 +326,13 @@ async def lifespan(app):
                 scheduler = AsyncIOScheduler(timezone="Asia/Shanghai")
                 _scheduler = scheduler
                 # 间隔（分钟）；汇报、审批分别用各自配置，这里合并为同步轮次
-                min_interval = max(1, min(
-                    settings.sync_interval_report_min,
-                    settings.sync_interval_approval_min,
-                ))
+                min_interval = max(
+                    1,
+                    min(
+                        settings.sync_interval_report_min,
+                        settings.sync_interval_approval_min,
+                    ),
+                )
                 # 注意：不设 next_run_time=None（会让任务不自动调度），
                 # 让 APScheduler 按 trigger 自动计算 next_run_time（启动后 min_interval 分钟触发首次）
                 scheduler.add_job(
@@ -252,7 +350,9 @@ async def lifespan(app):
                     coalesce=True,
                 )
                 scheduler.start()
-                logger.info("同步调度已启动，间隔=%s 分钟（一期 tenant1）", min_interval)
+                logger.info(
+                    "同步调度已启动，间隔=%s 分钟（一期 tenant1）", min_interval
+                )
 
                 # 额外：启动后立即跑一次首次同步（独立后台任务，不依赖调度器）
                 # 这样既快响应（立即拉一次），又不干扰调度器的周期触发

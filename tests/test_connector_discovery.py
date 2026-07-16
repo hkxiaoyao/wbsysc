@@ -1,3 +1,5 @@
+import asyncio
+import contextlib
 from types import SimpleNamespace
 
 import pytest
@@ -10,10 +12,16 @@ from app.connectors.contracts import (
     ToolSpec,
 )
 from app.connectors.discovery import (
+    ConnectorDiscoveryFailure,
     ConnectorDiscoveryError,
+    ConnectorDiscoveryResult,
+    ValidatedConnector,
+    discover_connector_packages,
     discover_trusted_connectors,
+    register_discovered_connectors,
     validate_active_connector_dependencies,
 )
+from app.connectors.registry import ConnectorRegistry, validate_connector_manifest
 
 
 TOOL = ToolSpec(
@@ -229,3 +237,390 @@ def test_discovery_rejects_duplicate_entry_point_names_before_loading(monkeypatc
 
     assert first.loads == 0
     assert second.loads == 0
+
+
+def test_registry_rejects_builtin_package_cross_namespace_collision_before_mutation():
+    builtin = FakeConnector(
+        "wecom",
+        tools=(
+            ToolSpec(
+                **{
+                    **TOOL.__dict__,
+                    "tool_key": "reports.list",
+                    "mcp_name": "wecom_list_reports",
+                }
+            ),
+        ),
+    )
+    package = FakeConnector(
+        "feishu",
+        tools=(
+            ToolSpec(
+                **{
+                    **TOOL.__dict__,
+                    "tool_key": "feishu.reports",
+                    "mcp_name": "wecom_list_reports",
+                }
+            ),
+        ),
+    )
+    registry = ConnectorRegistry([builtin])
+
+    with pytest.raises(ValueError, match="duplicate tool identifier"):
+        registry.register(package)
+
+    assert tuple(registry.registered) == ("wecom",)
+
+
+def test_separate_discovery_registration_rejects_package_collision():
+    first = FakeConnector("feishu")
+    colliding = FakeConnector(
+        "lark",
+        tools=(ToolSpec(**{**TOOL.__dict__, "tool_key": "lark.messages"}),),
+    )
+    registry = ConnectorRegistry()
+
+    registry.register(first)
+    with pytest.raises(ValueError, match="duplicate tool identifier"):
+        registry.register(colliding)
+
+    assert tuple(registry.registered) == ("feishu",)
+
+
+def test_active_dependency_filter_does_not_call_spec_for_irrelevant_rows():
+    class ExplosiveConnector:
+        def spec(self):
+            raise AssertionError("irrelevant connector spec executed")
+
+    validate_active_connector_dependencies(
+        [
+            ConnectionRecord(
+                connection_id="inactive",
+                tenant_id="tenant-a",
+                connector_key="feishu",
+                display_name="inactive",
+                status="disabled",
+                data_mode="direct",
+                public_config={"secret": "must-not-be-read"},
+                config_version=1,
+            )
+        ],
+        [ExplosiveConnector()],
+        allowlist="feishu",
+    )
+
+
+def test_active_dependency_spec_failure_is_sanitized():
+    marker = "credential=dependency-secret"
+
+    class ExplosiveConnector:
+        def spec(self):
+            raise RuntimeError(marker)
+
+    with pytest.raises(ConnectorDiscoveryError) as raised:
+        validate_active_connector_dependencies(
+            [
+                ConnectionRecord(
+                    connection_id="active",
+                    tenant_id="tenant-a",
+                    connector_key="feishu",
+                    display_name="active",
+                    status="active",
+                    data_mode="direct",
+                    public_config={},
+                    config_version=1,
+                )
+            ],
+            [ExplosiveConnector()],
+            allowlist="feishu",
+        )
+
+    assert marker not in str(raised.value)
+
+
+@pytest.mark.parametrize(
+    "tool",
+    [
+        SimpleNamespace(tool_key="messages.list", mcp_name="feishu_list_messages"),
+        ToolSpec(**{**TOOL.__dict__, "tool_key": 7}),
+        ToolSpec(**{**TOOL.__dict__, "tool_key": "messages.\nlist"}),
+        ToolSpec(**{**TOOL.__dict__, "operation_kind": "admin"}),
+        ToolSpec(**{**TOOL.__dict__, "default_timeout_ms": 0}),
+        ToolSpec(**{**TOOL.__dict__, "input_schema": []}),
+    ],
+)
+def test_manifest_rejects_malformed_nested_tools_at_tool_boundary(tool):
+    spec = ConnectorSpec(
+        connector_key="feishu",
+        version="1.0.0",
+        tools=(tool,),
+    )
+
+    with pytest.raises(ValueError, match="tool"):
+        validate_connector_manifest(spec)
+
+
+def test_manifest_rejects_noncanonical_version_whitespace():
+    spec = ConnectorSpec(connector_key="feishu", version=" 1.0.0 ", tools=())
+
+    with pytest.raises(ValueError, match="version"):
+        validate_connector_manifest(spec)
+
+
+def test_registry_rejects_connector_key_colliding_with_its_own_tool_namespace():
+    connector = FakeConnector(
+        "feishu",
+        tools=(
+            ToolSpec(
+                **{
+                    **TOOL.__dict__,
+                    "tool_key": "feishu",
+                    "mcp_name": "feishu_messages",
+                }
+            ),
+        ),
+    )
+    registry = ConnectorRegistry()
+
+    with pytest.raises(ValueError, match="cross-namespace"):
+        registry.register(connector)
+
+    assert tuple(registry.registered) == ()
+
+
+def test_tolerant_discovery_retains_safe_failure_metadata(monkeypatch):
+    marker = "credential=optional-secret"
+    configure(
+        monkeypatch,
+        "feishu,lark",
+        [
+            FakeEntryPoint("feishu", error=RuntimeError(marker)),
+            FakeEntryPoint("lark"),
+        ],
+    )
+
+    result = discover_connector_packages()
+
+    assert [item.spec.connector_key for item in result.connectors] == ["lark"]
+    assert result.failures == (
+        ConnectorDiscoveryFailure(connector_key="feishu", reason="load"),
+    )
+    assert marker not in repr(result)
+
+
+def test_registration_is_idempotent_for_equivalent_validated_packages():
+    registry = ConnectorRegistry()
+    first = FakeConnector()
+    replacement = FakeConnector()
+    first_item = ValidatedConnector(first, first.spec())
+    replacement_item = ValidatedConnector(replacement, replacement.spec())
+
+    register_discovered_connectors(
+        registry, ConnectorDiscoveryResult((first_item,), ())
+    )
+    register_discovered_connectors(
+        registry, ConnectorDiscoveryResult((replacement_item,), ())
+    )
+
+    assert registry.get("feishu") is replacement
+    assert tuple(registry.registered) == ("feishu",)
+
+
+def test_startup_registers_valid_packages_into_gateway_and_sync_registry(monkeypatch):
+    from app import main
+
+    connector = FakeConnector()
+    result = ConnectorDiscoveryResult(
+        (ValidatedConnector(connector, connector.spec()),), ()
+    )
+    registry = ConnectorRegistry([FakeConnector("wecom", tools=())])
+    monkeypatch.setattr(main, "connector_registry", registry)
+    monkeypatch.setattr(main.connection_sync_orchestrator, "_registry", registry)
+    monkeypatch.setattr(main, "discover_connector_packages", lambda: result)
+    monkeypatch.setattr(main, "list_active_connector_dependencies", lambda: ())
+    monkeypatch.setattr(
+        main,
+        "get_settings",
+        lambda: SimpleNamespace(connector_allowlist="feishu"),
+    )
+
+    main.configure_trusted_connectors()
+
+    assert registry.get("feishu") is connector
+    assert main.connection_sync_orchestrator._registry is registry
+
+
+def test_default_gateway_and_sync_orchestrator_share_the_connector_registry():
+    from app import main
+
+    assert main.connector_registry is main.mcp_gateway._runtime._registry
+    assert main.connector_registry is main.connection_sync_orchestrator._registry
+
+
+def test_repeated_startup_configuration_is_idempotent(monkeypatch):
+    from app import main
+
+    registry = ConnectorRegistry()
+    calls = 0
+
+    def discover():
+        nonlocal calls
+        calls += 1
+        connector = FakeConnector()
+        return ConnectorDiscoveryResult(
+            (ValidatedConnector(connector, connector.spec()),), ()
+        )
+
+    monkeypatch.setattr(main, "discover_connector_packages", discover)
+    monkeypatch.setattr(main, "list_active_connector_dependencies", lambda: ())
+    monkeypatch.setattr(main, "connector_registry", registry)
+    monkeypatch.setattr(
+        main,
+        "get_settings",
+        lambda: SimpleNamespace(connector_allowlist="feishu"),
+    )
+
+    main.configure_trusted_connectors()
+    main.configure_trusted_connectors()
+
+    assert calls == 2
+    assert tuple(registry.registered) == ("feishu",)
+
+
+def test_next_startup_removes_stale_discovered_connector_but_keeps_builtin(
+    monkeypatch,
+):
+    from app import main
+
+    registry = ConnectorRegistry([FakeConnector("wecom", tools=())])
+    connector = FakeConnector()
+    results = iter(
+        (
+            ConnectorDiscoveryResult(
+                (ValidatedConnector(connector, connector.spec()),), ()
+            ),
+            ConnectorDiscoveryResult(
+                (), (ConnectorDiscoveryFailure("feishu", "load"),)
+            ),
+        )
+    )
+    monkeypatch.setattr(main, "discover_connector_packages", lambda: next(results))
+    monkeypatch.setattr(main, "list_active_connector_dependencies", lambda: ())
+    monkeypatch.setattr(main, "connector_registry", registry)
+    monkeypatch.setattr(
+        main,
+        "get_settings",
+        lambda: SimpleNamespace(connector_allowlist="feishu"),
+    )
+
+    main.configure_trusted_connectors()
+    main.configure_trusted_connectors()
+
+    assert tuple(registry.registered) == ("wecom",)
+
+
+def test_startup_tolerates_optional_broken_package_without_active_dependency(
+    monkeypatch,
+):
+    from app import main
+
+    result = ConnectorDiscoveryResult(
+        (), (ConnectorDiscoveryFailure("feishu", "load"),)
+    )
+    monkeypatch.setattr(main, "discover_connector_packages", lambda: result)
+    monkeypatch.setattr(main, "list_active_connector_dependencies", lambda: ())
+    monkeypatch.setattr(main, "connector_registry", ConnectorRegistry())
+    monkeypatch.setattr(
+        main,
+        "get_settings",
+        lambda: SimpleNamespace(connector_allowlist="feishu"),
+    )
+
+    main.configure_trusted_connectors()
+
+
+def test_startup_active_broken_package_fails_without_secret_text(monkeypatch):
+    from app import main
+
+    result = ConnectorDiscoveryResult(
+        (), (ConnectorDiscoveryFailure("feishu", "load"),)
+    )
+    monkeypatch.setattr(main, "discover_connector_packages", lambda: result)
+    monkeypatch.setattr(
+        main,
+        "list_active_connector_dependencies",
+        lambda: (SimpleNamespace(connector_key="feishu", status="active"),),
+    )
+    monkeypatch.setattr(main, "connector_registry", ConnectorRegistry())
+    monkeypatch.setattr(
+        main,
+        "get_settings",
+        lambda: SimpleNamespace(connector_allowlist="feishu"),
+    )
+
+    with pytest.raises(ConnectorDiscoveryError) as raised:
+        main.configure_trusted_connectors()
+
+    assert "credential" not in str(raised.value)
+
+
+def test_lifespan_configures_connectors_after_migrations_before_gateway(monkeypatch):
+    from app import main
+
+    events = []
+    registry = ConnectorRegistry()
+
+    class Gateway:
+        _runtime = SimpleNamespace(_registry=registry)
+
+        @contextlib.asynccontextmanager
+        async def run(self):
+            events.append("gateway")
+            yield
+
+    class Scheduler:
+        def __init__(self, **kwargs):
+            self.running = False
+
+        def add_job(self, *args, **kwargs):
+            pass
+
+        def start(self):
+            self.running = True
+
+        def shutdown(self, *, wait):
+            self.running = False
+
+    def create_task(coroutine):
+        coroutine.close()
+        return object()
+
+    monkeypatch.setattr(
+        main.db, "run_startup_migrations", lambda: events.append("migrations")
+    )
+    monkeypatch.setattr(
+        main,
+        "configure_trusted_connectors",
+        lambda *, registry: events.append(("discovery", registry)),
+    )
+    monkeypatch.setattr(main, "acquire_audit_writer", lambda: None)
+    monkeypatch.setattr(main, "release_audit_writer", lambda timeout: True)
+    monkeypatch.setattr(main, "AsyncIOScheduler", Scheduler)
+    monkeypatch.setattr(main.asyncio, "create_task", create_task)
+    monkeypatch.setattr(
+        main,
+        "get_settings",
+        lambda: SimpleNamespace(
+            sync_interval_report_min=15,
+            sync_interval_approval_min=30,
+        ),
+    )
+    app = SimpleNamespace(state=SimpleNamespace(mcp_gateway=Gateway()))
+
+    async def exercise():
+        async with main.lifespan(app):
+            events.append("running")
+
+    asyncio.run(exercise())
+
+    assert events[:3] == ["migrations", ("discovery", registry), "gateway"]
