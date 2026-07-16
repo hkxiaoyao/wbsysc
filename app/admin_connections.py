@@ -336,6 +336,20 @@ def _safe_config(value: Any, schema: Mapping[str, Any]) -> Any:
     return {} if projected is _OMIT else projected
 
 
+def _plain_schema_metadata(value: Any) -> Any:
+    """Detach validated schema metadata for JSON responses without values/secrets."""
+    if isinstance(value, Mapping):
+        return {
+            str(key): _plain_schema_metadata(item)
+            for key, item in value.items()
+        }
+    if isinstance(value, (list, tuple)):
+        return [_plain_schema_metadata(item) for item in value]
+    if value is None or isinstance(value, (str, bool, int, float)):
+        return value
+    raise HTTPException(409, "connector schema is unavailable")
+
+
 _OMIT = object()
 
 
@@ -615,13 +629,25 @@ def list_connection_tools(tenant_id: str, connection_id: str, request: Request):
     record = _owned(tenant_id, connection_id)
     spec = _management_spec_for_record(request, record)
     configured = {item.tool_name: item for item in store.list_tool_policies(connection_id)}
-    return {"items": [{
+    return {
+        "connector_key": spec.connector_key,
+        "version": spec.version,
+        "credential_schema": _plain_schema_metadata(spec.credential_schema),
+        "items": [{
         "tool_key": tool.tool_key,
         "mcp_name": tool.mcp_name,
+        "description": tool.description,
+        "input_schema": _plain_schema_metadata(tool.input_schema),
+        "output_schema": (
+            None
+            if tool.output_schema is None
+            else _plain_schema_metadata(tool.output_schema)
+        ),
         "operation_kind": tool.operation_kind,
         "enabled": configured.get(tool.tool_key, ToolPolicy(connection_id, tool.tool_key, True, {})).enabled,
         "policy": configured.get(tool.tool_key, ToolPolicy(connection_id, tool.tool_key, True, {})).policy,
-    } for tool in spec.tools]}
+        } for tool in spec.tools],
+    }
 
 
 @router.get("/connections/{connection_id}/tools")

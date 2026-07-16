@@ -693,9 +693,17 @@ def test_disabled_pending_revision_drives_credentials_tools_and_real_test(monkey
     pending_tool = ToolSpec(
         tool_key="new.health",
         mcp_name="new.health",
-        description="New health",
-        input_schema={"type": "object", "additionalProperties": False},
-        output_schema=None,
+        description="pending health",
+        input_schema={
+            "type": "object",
+            "properties": {},
+            "additionalProperties": False,
+        },
+        output_schema={
+            "type": "object",
+            "properties": {"ok": {"type": "boolean"}},
+            "additionalProperties": False,
+        },
         operation_kind="read",
         default_timeout_ms=1000,
         cache_ttl_seconds=None,
@@ -778,6 +786,24 @@ def test_disabled_pending_revision_drives_credentials_tools_and_real_test(monkey
 
     assert [credentials.status_code, listed.status_code, policies.status_code, tested.status_code] == [200, 200, 200, 200]
     assert listed.json()["items"][0]["tool_key"] == "new.health"
+    assert listed.json()["connector_key"] == "http_declarative"
+    assert listed.json()["credential_schema"] == {
+        "type": "object",
+        "properties": {"new_key": {"type": "string"}},
+        "required": ["new_key"],
+        "additionalProperties": False,
+    }
+    assert listed.json()["items"][0]["description"] == "pending health"
+    assert listed.json()["items"][0]["input_schema"] == {
+        "type": "object",
+        "properties": {},
+        "additionalProperties": False,
+    }
+    assert listed.json()["items"][0]["output_schema"] == {
+        "type": "object",
+        "properties": {"ok": {"type": "boolean"}},
+        "additionalProperties": False,
+    }
     assert mutations == [("credentials", 7), ("policies", 7)]
     assert selected and all(item == ("spec-b", 2) for item in selected)
     assert executed == [
