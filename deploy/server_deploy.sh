@@ -32,7 +32,7 @@ read_env_value() {
 
 is_example_password() {
   case "$1" in
-    ""|"CHANGE_ME"|"<强密码，与开发库不同>"|"<强密码，登录管理后台用>") return 0 ;;
+    ""|"CHANGE_ME"|"database_password_here"|"migration_password_here"|"admin_password_here"|"<强密码，与开发库不同>"|"<强密码，登录管理后台用>") return 0 ;;
     *) return 1 ;;
   esac
 }
@@ -164,6 +164,16 @@ if [ "$CREDENTIAL_KEY" = "<强随机串>" ] || [ "$(byte_length "$CREDENTIAL_KEY
   echo "❌ CREDENTIAL_KEY 必须为非示例值且至少 32 UTF-8 字节"
   CONFIG_INVALID=1
 fi
+DB_MIGRATION_USER="${DB_MIGRATION_USER:-}"
+DB_MIGRATION_PASSWORD="${DB_MIGRATION_PASSWORD:-}"
+if [ -z "$DB_MIGRATION_USER" ] || is_example_password "$DB_MIGRATION_PASSWORD"; then
+  echo "❌ DB_MIGRATION_USER/DB_MIGRATION_PASSWORD 必须使用独立迁移账户的真实值"
+  CONFIG_INVALID=1
+fi
+if [ "$DB_MIGRATION_USER" = "$(read_env_value DB_USER)" ]; then
+  echo "❌ DB_MIGRATION_USER 必须与运行时 DB_USER 不同"
+  CONFIG_INVALID=1
+fi
 if is_example_mcp_token_hmac_key "$MCP_TOKEN_HMAC_KEY" || [ "$(byte_length "$MCP_TOKEN_HMAC_KEY")" -lt 32 ]; then
   echo "❌ MCP_TOKEN_HMAC_KEY 必须为非示例值且至少 32 UTF-8 字节"
   CONFIG_INVALID=1
@@ -195,11 +205,12 @@ echo "  ① MySQL bind-address = 0.0.0.0（非仅 [IP]）"
 echo "  ② 授权配置的数据库账户可从容器网段登录："
 echo "     mysql -uroot -p 执行:"
 echo "       ALTER USER '$DB_USER'@'%' IDENTIFIED BY '你的强密码';"
-echo "       GRANT SELECT, INSERT, UPDATE, DELETE, CREATE, ALTER, INDEX, CREATE ROUTINE, ALTER ROUTINE, EXECUTE ON \`$DB_NAME\`.* TO '$DB_USER'@'%';"
+echo "       GRANT SELECT, INSERT, UPDATE, DELETE, CREATE, ALTER, INDEX ON \`$DB_NAME\`.* TO '$DB_USER'@'%';"
 echo "     中心 schema: \`$DB_NAME\`"
 echo "     既有租户 schema: 从 $DB_NAME.tenant_config.schema_name 读取后，逐个执行:"
 echo "       GRANT SELECT, INSERT, UPDATE, DELETE, CREATE, ALTER, INDEX ON \`wbd_<tenant>\`.* TO '$DB_USER'@'%';"
 echo "     新租户 schema 需由 DBA 预先创建并单独授权；不要授予全库权限或转授权限"
+echo "     发布迁移使用独立账户 '$DB_MIGRATION_USER'；其 ROUTINE/DDL 权限不得授予运行时账户"
 echo "       FLUSH PRIVILEGES;"
 echo "  ③ /etc/mysql/my.cnf 或 mariadb.conf 的 bind-address 改 [IP] 后重启 mysql"
 echo ""
@@ -224,14 +235,14 @@ done
 echo "使用宿主 mysql CLI 按 004 → 005 → 006 执行迁移（迁移主机默认 127.0.0.1，可用 DB_MIGRATION_HOST 覆盖）"
 for migration in "${MIGRATIONS[@]}"; do
   echo "执行 $migration"
-  if ! MYSQL_PWD="$DB_PASSWORD" mysql --protocol=TCP \
-    --host="$MIGRATION_HOST" --port="$DB_PORT" --user="$DB_USER" "$DB_NAME" \
+  if ! MYSQL_PWD="$DB_MIGRATION_PASSWORD" mysql --protocol=TCP \
+    --host="$MIGRATION_HOST" --port="$DB_PORT" --user="$DB_MIGRATION_USER" "$DB_NAME" \
     < "$APP_DIR/$migration"; then
     echo "❌ 数据库迁移失败（$migration），尚未拉取镜像或启动新应用"
     exit 1
   fi
 done
-unset DB_PASSWORD
+unset DB_PASSWORD DB_MIGRATION_USER DB_MIGRATION_PASSWORD
 echo "✓ 004、005、006 数据库迁移完成"
 
 echo ""

@@ -76,10 +76,12 @@ docker compose exec wbsysc python -m app.tenant_init \
 
 ### 生产升级（先迁移再切换）
 
-推荐执行 `bash deploy/server_deploy.sh`：脚本会先校验生产配置，再用宿主 `mysql` CLI 严格按顺序执行 `sql/004_gateway_hardening.sql`、`sql/005_mcp_call_log.sql` 和 `sql/006_connection_platform.sql`；任一迁移失败都会在拉取镜像和启动新应用前终止。迁移默认连接 `127.0.0.1`，远程 MySQL 可用 `DB_MIGRATION_HOST` 环境变量或 `.env` 同名项覆盖。
+推荐执行 `bash deploy/server_deploy.sh`：脚本会先校验生产配置，再用独立的 `DB_MIGRATION_USER` 和宿主 `mysql` CLI 严格按顺序执行 `sql/004_gateway_hardening.sql`、`sql/005_mcp_call_log.sql` 和 `sql/006_connection_platform.sql`；任一迁移失败都会在拉取镜像和启动新应用前终止。迁移默认连接 `127.0.0.1`，远程 MySQL 可用 `DB_MIGRATION_HOST` 环境变量覆盖。迁移账户必须与运行时 `DB_USER` 不同，ROUTINE 权限不得授予运行时账户。`DB_MIGRATION_USER` 和 `DB_MIGRATION_PASSWORD` 只通过发布终端环境传入，不写入会注入应用容器的 `.env`。
 
 ```bash
 git pull
+read -rp "DB_MIGRATION_USER: " DB_MIGRATION_USER && export DB_MIGRATION_USER
+read -rsp "DB_MIGRATION_PASSWORD: " DB_MIGRATION_PASSWORD && export DB_MIGRATION_PASSWORD && echo
 bash deploy/server_deploy.sh
 ```
 
@@ -88,15 +90,15 @@ bash deploy/server_deploy.sh
 ```bash
 DB_MIGRATION_HOST=127.0.0.1
 DB_PORT=3306
-DB_USER=wbsysc_app
+DB_MIGRATION_USER=wbsysc_migrator
 DB_NAME=websysc
-read -rsp "DB_PASSWORD: " MYSQL_PWD && export MYSQL_PWD && echo
+read -rsp "DB_MIGRATION_PASSWORD: " MYSQL_PWD && export MYSQL_PWD && echo
 mysql --protocol=TCP --host="$DB_MIGRATION_HOST" --port="$DB_PORT" \
-  --user="$DB_USER" "$DB_NAME" < sql/004_gateway_hardening.sql
+  --user="$DB_MIGRATION_USER" "$DB_NAME" < sql/004_gateway_hardening.sql
 mysql --protocol=TCP --host="$DB_MIGRATION_HOST" --port="$DB_PORT" \
-  --user="$DB_USER" "$DB_NAME" < sql/005_mcp_call_log.sql
+  --user="$DB_MIGRATION_USER" "$DB_NAME" < sql/005_mcp_call_log.sql
 mysql --protocol=TCP --host="$DB_MIGRATION_HOST" --port="$DB_PORT" \
-  --user="$DB_USER" "$DB_NAME" < sql/006_connection_platform.sql
+  --user="$DB_MIGRATION_USER" "$DB_NAME" < sql/006_connection_platform.sql
 unset MYSQL_PWD
 docker pull ghcr.io/hkxiaoyao/wbsysc:latest
 docker compose up -d

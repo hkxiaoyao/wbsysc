@@ -23,6 +23,9 @@ TL;DR：先备份 MySQL，再部署连接平台表和应用。保留旧模型上
 | `DB_USER` | 最小权限账户 |
 | `DB_PASSWORD` | 非示例强密码 |
 | `DB_POOL_SIZE` | SQLAlchemy 连接池大小 |
+| `DB_MIGRATION_HOST` | 发布主机访问 MySQL 的地址，可由发布终端环境覆盖 `.env` |
+| `DB_MIGRATION_USER` | 独立迁移账户，只从发布终端环境读取，必须与运行时 `DB_USER` 不同 |
+| `DB_MIGRATION_PASSWORD` | 独立迁移账户密码，只从发布终端环境读取，不写入应用 `.env` |
 | `ADMIN_PASSWORD` | 管理后台强密码 |
 | `ADMIN_SESSION_TTL_MIN` | 管理会话有效分钟数 |
 | `CREDENTIAL_KEY` | 凭证加密密钥，生产至少 32 个 UTF-8 字节 |
@@ -62,12 +65,13 @@ CONNECTOR_ALLOWLIST=reviewed-connector-name
 2. 对中心库和所有 `wbd_*` 租户 schema 做一致性备份
 3. 验证备份可列出 `tenant_config`、业务表和 `audit_log`
 4. 将备份时间与二进制日志位置登记为恢复点
-5. 使用 MySQL 5.7 客户端执行 `sql/005_mcp_call_log.sql`
-6. 使用同一客户端执行 `sql/006_connection_platform.sql`
-7. 启动新应用，让启动迁移创建缺失对象并执行旧企微回填
-8. 核对每个旧租户只有一个确定性默认 `wecom` 连接
-9. 并行调用旧 `/mcp` 和新 `/mcp/{connection_id}`，比较工具和结果
-10. 通过兼容门禁后，逐批把客户端切到新地址
+5. 使用独立迁移账户和 MySQL 5.7 客户端执行 `sql/004_gateway_hardening.sql`
+6. 使用同一账户执行 `sql/005_mcp_call_log.sql`
+7. 使用同一账户执行 `sql/006_connection_platform.sql`
+8. 启动新应用，让启动迁移创建缺失对象并执行旧企微回填
+9. 核对每个旧租户只有一个确定性默认 `wecom` 连接
+10. 并行调用旧 `/mcp` 和新 `/mcp/{connection_id}`，比较工具和结果
+11. 通过兼容门禁后，逐批把客户端切到新地址
 
 旧企微回填使用完成水位 `legacy_wecom_backfill_v1`。迁移只在事务成功提交后写水位，重启会重试未完成租户，重复执行不会创建第二个默认连接，也不会删除旧企微数据。
 

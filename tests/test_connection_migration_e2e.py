@@ -9,7 +9,6 @@ from app import main
 from app.auth import ConnectionCtx
 from app.connections.models import ConnectionRecord
 from app.connectors import (
-    ConnectionContext,
     ConnectorRegistry,
     ConnectorRuntime,
     ConnectorSpec,
