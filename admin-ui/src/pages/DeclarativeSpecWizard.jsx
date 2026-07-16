@@ -1,29 +1,76 @@
-import { useEffect, useMemo, useState } from 'react'
+import { useEffect, useMemo, useRef, useState } from 'react'
 import { Alert, Button, Checkbox, Form, Input, InputNumber, Space, Steps, Tag, Typography, Upload, message } from 'antd'
 import { InboxOutlined, SafetyCertificateOutlined } from '@ant-design/icons'
 import api from '../api.js'
-import { canEnableWriteTool, createWizardState, hasExplicitPolicies, safeServerError } from './connectionView.js'
+import {
+  canEnableWriteTool,
+  createWizardState,
+  hasExplicitPolicies,
+  invalidateWizardState,
+  requiredCredentialKeys,
+  safeServerError,
+  schemaMetadataSummary,
+  setExplicitToolPolicy,
+  wizardRevisionIdentity,
+} from './connectionView.js'
 
 const { Paragraph, Text } = Typography
 
-export default function DeclarativeSpecWizard({ connection, onChanged = () => {} }) {
+function jsonObject(text) {
+  try {
+    const value = JSON.parse(text || '{}')
+    if (!value || Array.isArray(value) || typeof value !== 'object') throw new Error()
+    return value
+  } catch { throw new Error('凭据必须是 JSON 对象') }
+}
+
+function schemaSummary(value) {
+  if (!value || typeof value !== 'object') return '后端暂未提供此映射元数据'
+  return JSON.stringify(value, null, 2)
+}
+
+export default function DeclarativeSpecWizard({ connection, active = true, onChanged = () => {} }) {
   const [state, setState] = useState(() => createWizardState(connection))
   const [tools, setTools] = useState([])
   const [policies, setPolicies] = useState([])
+  const [credentialSchema, setCredentialSchema] = useState(null)
+  const [credentialsText, setCredentialsText] = useState('{}')
   const [busy, setBusy] = useState('')
   const [error, setError] = useState('')
   const [messageApi, contextHolder] = message.useMessage()
+  const stateRef = useRef(state)
+  const identityVersion = useRef(0)
 
+  useEffect(() => { stateRef.current = state }, [state])
   useEffect(() => {
-    setState(createWizardState(connection))
+    identityVersion.current += 1
+    const next = createWizardState(connection)
+    stateRef.current = next
+    setState(next)
     setTools([])
     setPolicies([])
+    setCredentialSchema(null)
+    setCredentialsText('{}')
     setError('')
   }, [connection?.connection_id, connection?.status])
+  useEffect(() => {
+    if (!active) setCredentialsText('{}')
+  }, [active])
 
   const base = `/admin/connections/${encodeURIComponent(connection.connection_id)}`
   const policyComplete = useMemo(() => hasExplicitPolicies(tools, policies), [tools, policies])
+  const requiredCredentials = useMemo(() => requiredCredentialKeys(credentialSchema), [credentialSchema])
   const patchState = (patch) => setState((current) => ({ ...current, ...patch }))
+  const identityIsCurrent = (identity) => {
+    const current = wizardRevisionIdentity(stateRef.current)
+    return identity.version === identityVersion.current
+      && current.specId === identity.specId
+      && current.revision === identity.revision
+  }
+  const captureIdentity = () => ({
+    ...wizardRevisionIdentity(stateRef.current),
+    version: identityVersion.current,
+  })
 
   const run = async (key, operation, successText) => {
     setBusy(key)
@@ -38,8 +85,18 @@ export default function DeclarativeSpecWizard({ connection, onChanged = () => {}
     } finally { setBusy('') }
   }
 
+  const invalidateSource = (patch) => {
+    identityVersion.current += 1
+    setState((current) => ({ ...invalidateWizardState(current, 'source'), ...patch, step: 1 }))
+    setTools([])
+    setPolicies([])
+    setCredentialSchema(null)
+    setCredentialsText('{}')
+    setError('')
+  }
+
   const disableActive = async () => {
-    const result = await run('disable', () => api.post(`${base}/disable`), '连接已停用，可以安全准备待发布修订')
+    const result = await run('disable', () => api.post(`${base}/disable`), '连接已停用，可以安全准备待激活修订')
     if (result) {
       patchState({ mustDisable: false })
       onChanged(result.data?.connection)
@@ -47,29 +104,69 @@ export default function DeclarativeSpecWizard({ connection, onChanged = () => {}
   }
 
   const importSpec = async () => {
-    if (!state.sourceText.trim() || !state.specId.trim()) {
+    identityVersion.current += 1
+    const identity = { ...wizardRevisionIdentity(state), version: identityVersion.current }
+    if (!state.sourceText.trim() || !identity.specId) {
       setError('请填写 Spec ID 并粘贴或导入 JSON/YAML 文档')
       return
     }
+    const sourceText = state.sourceText
+    setState((current) => invalidateWizardState(current, 'source'))
+    setTools([])
+    setPolicies([])
+    setCredentialSchema(null)
+    setCredentialsText('{}')
     const result = await run('import', () => api.post(`${base}/specs/import`, {
-      document: state.sourceText,
-      spec_id: state.specId.trim(),
-      revision: Number(state.revision),
-    }), '规范已导入，等待后端验证')
-    if (result) patchState({ imported: true, step: 2 })
+      document: sourceText,
+      spec_id: identity.specId,
+      revision: identity.revision,
+    }), '规范已导入')
+    if (result && identityIsCurrent(identity)) patchState({ imported: true, step: 2 })
   }
 
   const validate = async () => {
+    const identity = captureIdentity()
     const result = await run('validate', () => api.post(
-      `${base}/specs/${encodeURIComponent(state.specId.trim())}/revisions/${state.revision}/validate`,
+      `${base}/specs/${encodeURIComponent(identity.specId)}/revisions/${identity.revision}/validate`,
     ), '后端验证通过')
-    if (!result) return
+    if (result && identityIsCurrent(identity)) patchState({ validated: true, step: 3 })
+  }
+
+  const publish = async () => {
+    const identity = captureIdentity()
+    const result = await run('publish', () => api.post(
+      `${base}/specs/${encodeURIComponent(identity.specId)}/revisions/${identity.revision}/publish`,
+    ), '待激活修订已发布')
+    if (!result || !identityIsCurrent(identity)) return
     const toolResponse = await run('tools', () => api.get(`${base}/tools`))
-    if (!toolResponse) return
-    const nextTools = toolResponse.data?.items || []
-    setTools(nextTools)
+    if (!toolResponse || !identityIsCurrent(identity)) return
+    setTools(toolResponse.data?.items || [])
+    setCredentialSchema(toolResponse.data?.credential_schema || null)
     setPolicies([])
-    patchState({ validated: true, step: 3 })
+    patchState({ published: true, step: 4 })
+  }
+
+  const reviewMappings = (checked) => {
+    setState((current) => ({
+      ...invalidateWizardState(current, 'mapping'),
+      mappingReviewed: checked,
+    }))
+  }
+
+  const changeCredentials = (value) => {
+    setCredentialsText(value)
+    setState((current) => invalidateWizardState(current, 'credentials'))
+  }
+
+  const saveCredentials = async () => {
+    const identity = captureIdentity()
+    let credentials
+    try { credentials = jsonObject(credentialsText) } catch (parseError) { setError(parseError.message); return }
+    const result = await run('credentials', () => api.put(`${base}/credentials`, { credentials }), '待激活修订凭据已替换')
+    if (result && identityIsCurrent(identity)) {
+      setCredentialsText('{}')
+      patchState({ credentialsSaved: true, step: 5 })
+    }
   }
 
   const setPolicy = (tool, values) => {
@@ -77,35 +174,39 @@ export default function DeclarativeSpecWizard({ connection, onChanged = () => {}
       const next = current.filter((item) => item.tool_key !== tool.tool_key)
       return [...next, { tool_key: tool.tool_key, ...values }]
     })
+    setState((current) => invalidateWizardState(current, 'policy'))
+  }
+
+  const togglePolicy = (tool, enabled) => {
+    const current = policies.find((item) => item.tool_key === tool.tool_key)
+    setPolicy(tool, setExplicitToolPolicy(tool, current, enabled))
   }
 
   const savePolicies = async () => {
-    if (!policyComplete) {
-      setError('必须为每个待发布工具明确选择启用或停用策略')
+    if (!policyComplete || !state.mappingReviewed || !state.credentialsSaved) {
+      setError('先审核批准映射、替换待激活凭据，并为每个工具选择完整策略')
       return
     }
-    const result = await run('policies', () => api.put(`${base}/tools`, { policies }), '工具策略已保存')
-    if (result) patchState({ step: 4 })
+    const identity = captureIdentity()
+    const submittedPolicies = policies.map((policy) => ({ ...policy }))
+    const result = await run('policies', () => api.put(`${base}/tools`, { policies: submittedPolicies }), '工具策略已保存')
+    if (result && identityIsCurrent(identity)) patchState({ policiesSaved: true, step: 6 })
   }
 
   const testConnection = async () => {
-    const result = await run('test', () => api.post(`${base}/test`), '安全只读连接测试通过')
-    if (result) patchState({ tested: true, step: 5 })
-  }
-
-  const publish = async () => {
-    const result = await run('publish', () => api.post(
-      `${base}/specs/${encodeURIComponent(state.specId.trim())}/revisions/${state.revision}/publish`,
-    ), '修订已发布')
-    if (result) patchState({ published: true, step: 6 })
+    if (!state.published || !state.mappingReviewed || !state.credentialsSaved || !state.policiesSaved) return
+    const identity = captureIdentity()
+    const result = await run('test', () => api.post(`${base}/test`), '真实安全只读连接测试通过')
+    if (result && identityIsCurrent(identity)) patchState({ tested: true, step: 7 })
   }
 
   const activate = async () => {
+    const identity = captureIdentity()
     const result = await run('activate', () => api.post(
-      `${base}/specs/${encodeURIComponent(state.specId.trim())}/revisions/${state.revision}/activate`,
+      `${base}/specs/${encodeURIComponent(identity.specId)}/revisions/${identity.revision}/activate`,
     ), '连接已激活')
-    if (result) {
-      patchState({ activated: true, step: 7 })
+    if (result && identityIsCurrent(identity)) {
+      patchState({ activated: true, step: 8 })
       onChanged(result.data?.connection)
     }
   }
@@ -116,37 +217,27 @@ export default function DeclarativeSpecWizard({ connection, onChanged = () => {}
     <section className="declarative-wizard" aria-label="声明式连接向导">
       {contextHolder}
       <Steps
-        current={Math.min(state.step, 6)}
+        current={Math.min(state.step, 7)}
         size="small"
         responsive
         items={[
-          { title: '选择类型' }, { title: '导入规范' }, { title: '后端验证' },
-          { title: '工具策略' }, { title: '安全测试' }, { title: '发布' }, { title: '激活' },
+          { title: '选择类型' }, { title: '导入规范' }, { title: '后端验证' }, { title: '发布待激活修订' },
+          { title: '映射与凭据' }, { title: '工具策略' }, { title: '真实测试' }, { title: '激活' },
         ]}
       />
 
       {error && <Alert showIcon type="error" message="无法继续" description={error} />}
       {state.mustDisable && (
-        <Alert
-          showIcon
-          type="warning"
-          message="先停用当前连接"
-          description="活动连接不能导入或发布待定修订。停用不会展示或还原任何凭据。"
-          action={<Button danger loading={busy === 'disable'} onClick={disableActive}>停用后继续</Button>}
-        />
+        <Alert showIcon type="warning" message="先停用当前连接" description="活动连接不能导入或发布待激活修订。停用不会展示或还原任何凭据。" action={<Button danger loading={busy === 'disable'} onClick={disableActive}>停用后继续</Button>} />
       )}
 
       <div className="declarative-stage">
         <header><Text strong>HTTP 声明式连接</Text><Tag color="cyan">http_declarative</Tag></header>
-        <Paragraph type="secondary">只接受 JSON/YAML OpenAPI 子集。解析、校验和出站安全检查全部由后端完成；不支持脚本、模板或自定义代码。</Paragraph>
+        <Paragraph type="secondary">只接受 JSON/YAML OpenAPI 子集。解析、校验和出站安全检查由后端完成；不支持脚本、模板或自定义代码。</Paragraph>
         <Form layout="vertical">
           <div className="declarative-id-grid">
-            <Form.Item label="Spec ID" required>
-              <Input value={state.specId} maxLength={64} placeholder="例如 crm-api" onChange={(event) => patchState({ specId: event.target.value })} />
-            </Form.Item>
-            <Form.Item label="修订号" required>
-              <InputNumber min={1} precision={0} value={state.revision} onChange={(revision) => patchState({ revision: revision || 1 })} />
-            </Form.Item>
+            <Form.Item label="Spec ID" required><Input aria-label="声明式规范 ID" value={state.specId} maxLength={64} placeholder="例如 crm-api" onChange={(event) => invalidateSource({ specId: event.target.value })} /></Form.Item>
+            <Form.Item label="修订号" required><InputNumber aria-label="声明式规范修订号" min={1} precision={0} value={state.revision} onChange={(revision) => invalidateSource({ revision: revision || 1 })} /></Form.Item>
           </div>
           <Form.Item label="规范文档" required>
             <Upload.Dragger
@@ -154,79 +245,63 @@ export default function DeclarativeSpecWizard({ connection, onChanged = () => {}
               maxCount={1}
               beforeUpload={(file) => {
                 const reader = new FileReader()
-                reader.onload = () => patchState({
-                  sourceText: String(reader.result || ''),
-                  sourceFormat: /\.ya?ml$/i.test(file.name) ? 'yaml' : 'json',
-                  imported: false,
-                })
+                reader.onload = () => invalidateSource({ sourceText: String(reader.result || ''), sourceFormat: /\.ya?ml$/i.test(file.name) ? 'yaml' : 'json' })
                 reader.readAsText(file)
                 return false
               }}
-              onRemove={() => { patchState({ sourceText: '', imported: false }); return true }}
-            >
-              <p className="ant-upload-drag-icon"><InboxOutlined /></p>
-              <p>拖入 JSON/YAML，或点击选择文件</p>
-            </Upload.Dragger>
-            <Input.TextArea
-              className="declarative-source"
-              rows={8}
-              maxLength={1_000_000}
-              value={state.sourceText}
-              placeholder="也可以在这里粘贴 OpenAPI JSON 或 YAML"
-              onChange={(event) => patchState({ sourceText: event.target.value, imported: false })}
-            />
+              onRemove={() => { invalidateSource({ sourceText: '' }); return true }}
+            ><p className="ant-upload-drag-icon"><InboxOutlined /></p><p>拖入 JSON/YAML，或点击选择文件</p></Upload.Dragger>
+            <Input.TextArea aria-label="声明式 JSON 或 YAML 规范" className="declarative-source" rows={8} maxLength={1_000_000} value={state.sourceText} placeholder="也可以在这里粘贴 OpenAPI JSON 或 YAML" onChange={(event) => invalidateSource({ sourceText: event.target.value })} />
           </Form.Item>
         </Form>
         <Space wrap>
-          <Button type="primary" disabled={state.mustDisable} loading={busy === 'import'} onClick={importSpec}>导入规范</Button>
-          <Button disabled={!state.imported} loading={busy === 'validate' || busy === 'tools'} onClick={validate}>后端验证</Button>
+          <Button type="primary" disabled={state.mustDisable || state.published} loading={busy === 'import'} onClick={importSpec}>导入规范</Button>
+          <Button disabled={!state.imported || state.published} loading={busy === 'validate'} onClick={validate}>后端验证</Button>
+          <Button disabled={!state.validated} loading={busy === 'publish' || busy === 'tools'} onClick={publish}>发布待激活修订</Button>
         </Space>
       </div>
 
-      {state.validated && (
+      {state.published && (
         <div className="declarative-stage">
-          <header><Text strong>操作与批准映射</Text><Tag color="green">验证通过</Tag></header>
-          <Paragraph type="secondary">操作和输入/输出映射来自后端批准的规范。你只能明确启用或停用，并为写操作另行授权。</Paragraph>
+          <header><Text strong>批准映射与待激活凭据</Text><Tag color="gold">尚未激活</Tag></header>
+          <Paragraph type="secondary">以下元数据来自后端批准的不可变修订。只能审核操作和映射，不可输入脚本、模板或表达式。</Paragraph>
           <div className="declarative-tool-list">
-            {tools.map((tool) => {
-              const current = policyFor(tool)
-              return (
-                <div key={tool.tool_key} className="declarative-tool">
-                  <div><Text code>{tool.mcp_name || tool.tool_key}</Text><Tag color={tool.operation_kind === 'write' ? 'orange' : 'blue'}>{tool.operation_kind === 'write' ? '写操作' : '只读'}</Tag></div>
-                  <Space wrap>
-                    <Checkbox
-                      checked={current?.enabled === true}
-                      onChange={(event) => setPolicy(tool, {
-                        enabled: event.target.checked,
-                        allow_write: tool.operation_kind === 'write' ? Boolean(current?.allow_write) : false,
-                      })}
-                    >明确启用</Checkbox>
-                    {tool.operation_kind === 'write' && (
-                      <Checkbox
-                        checked={current?.allow_write === true}
-                        disabled={!current?.enabled}
-                        onChange={(event) => setPolicy(tool, {
-                          enabled: Boolean(current?.enabled),
-                          allow_write: event.target.checked,
-                        })}
-                      >我同意写入上游系统</Checkbox>
-                    )}
-                    <Button size="small" onClick={() => setPolicy(tool, { enabled: false, allow_write: false })}>明确停用</Button>
-                  </Space>
-                  {current?.enabled && !canEnableWriteTool(tool, { explicitEnable: true, explicitWrite: current.allow_write }) && <Text type="danger">写操作还需要明确同意</Text>}
-                </div>
-              )
-            })}
+            {tools.map((tool) => (
+              <div key={tool.tool_key} className="declarative-tool">
+                <div><Text code>{tool.mcp_name || tool.tool_key}</Text><Tag color={tool.operation_kind === 'write' ? 'orange' : 'blue'}>{tool.operation_kind === 'write' ? '写操作' : '只读'}</Tag></div>
+                {tool.description && <Text type="secondary">{tool.description}</Text>}
+                <details><summary>后端批准的输入 properties / mapping</summary><pre>{schemaSummary(tool.input_mapping || schemaMetadataSummary(tool.input_schema))}</pre></details>
+                <details><summary>后端批准的输出 properties / mapping</summary><pre>{schemaSummary(tool.output_mapping || schemaMetadataSummary(tool.output_schema))}</pre></details>
+              </div>
+            ))}
           </div>
-          <Button type="primary" disabled={!policyComplete} loading={busy === 'policies'} onClick={savePolicies}>保存全部工具策略</Button>
+          <Checkbox checked={state.mappingReviewed} onChange={(event) => reviewMappings(event.target.checked)}>我已审核每个选定操作的后端批准输入/输出映射</Checkbox>
+          <Alert type="warning" showIcon message="现有凭据永不读取" description="仅提交一组完整的新凭据。保存成功、修订变化或向导关闭后输入立即清除。" />
+          <div><Text type="secondary">必填凭据 Key（仅名称）：</Text><Space size={4} wrap>{requiredCredentials.length ? requiredCredentials.map((key) => <Tag key={key}>{key}</Tag>) : <Tag>后端未声明必填 Key</Tag>}</Space></div>
+          <details><summary>后端凭据 schema</summary><pre>{schemaSummary(schemaMetadataSummary(credentialSchema))}</pre></details>
+          <Input.TextArea aria-label="待激活修订新凭据 JSON" rows={6} value={credentialsText} onChange={(event) => changeCredentials(event.target.value)} placeholder='{"api_key":"new value"}' />
+          <Button type="primary" disabled={!state.mappingReviewed} loading={busy === 'credentials'} onClick={saveCredentials}>替换待激活凭据并清除输入</Button>
         </div>
       )}
 
-      {state.step >= 4 && (
+      {state.published && (
+        <div className="declarative-stage">
+          <header><Text strong>操作选择与明确策略</Text><Tag color={policyComplete ? 'green' : 'default'}>{policyComplete ? '策略完整' : '等待逐项选择'}</Tag></header>
+          <Paragraph type="secondary">每个操作必须明确启用或停用。写操作每次重新启用都必须重新同意写入。</Paragraph>
+          <div className="declarative-tool-list">
+            {tools.map((tool) => {
+              const current = policyFor(tool)
+              return <div key={tool.tool_key} className="declarative-tool"><div><Text code>{tool.mcp_name || tool.tool_key}</Text><Tag color={tool.operation_kind === 'write' ? 'orange' : 'blue'}>{tool.operation_kind}</Tag></div><Space wrap><Checkbox checked={current?.enabled === true} onChange={(event) => togglePolicy(tool, event.target.checked)}>明确启用</Checkbox>{tool.operation_kind === 'write' && <Checkbox checked={current?.allow_write === true} disabled={!current?.enabled} onChange={(event) => setPolicy(tool, { ...current, enabled: true, allow_write: event.target.checked })}>我同意写入上游系统</Checkbox>}<Button size="small" onClick={() => togglePolicy(tool, false)}>明确停用</Button></Space>{current?.enabled && !canEnableWriteTool(tool, { explicitEnable: Boolean(current.enabled), explicitWrite: current.allow_write }) && <Text type="danger">重新启用写操作后，需要新的明确同意</Text>}</div>
+            })}
+          </div>
+          <Button type="primary" disabled={!policyComplete || !state.mappingReviewed || !state.credentialsSaved} loading={busy === 'policies'} onClick={savePolicies}>保存全部工具策略</Button>
+        </div>
+      )}
+
+      {state.policiesSaved && (
         <div className="declarative-stage declarative-stage--actions">
-          <Button icon={<SafetyCertificateOutlined />} loading={busy === 'test'} onClick={testConnection}>运行安全只读测试</Button>
-          <Button disabled={!state.tested} loading={busy === 'publish'} onClick={publish}>发布修订</Button>
-          <Button type="primary" disabled={!state.published || !policyComplete} loading={busy === 'activate'} onClick={activate}>激活连接</Button>
+          <Button icon={<SafetyCertificateOutlined />} loading={busy === 'test'} onClick={testConnection}>运行真实安全只读测试</Button>
+          <Button type="primary" disabled={!state.tested} loading={busy === 'activate'} onClick={activate}>激活已测试修订</Button>
           {state.activated && <Tag color="success">已激活</Tag>}
         </div>
       )}

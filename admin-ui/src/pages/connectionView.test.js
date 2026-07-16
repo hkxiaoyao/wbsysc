@@ -4,11 +4,19 @@ import {
   buildConnectionMcpConfig,
   canEnableWriteTool,
   closeTokenModal,
+  createRequestSequence,
   createWizardState,
   hasExplicitPolicies,
+  invalidateWizardState,
+  isActiveDeclarativeConfigReadOnly,
   parseConnectionLocation,
+  requiredCredentialKeys,
+  schemaMetadataSummary,
+  selectActiveTokenHint,
   safeServerError,
   serializeConnectionLocation,
+  setExplicitToolPolicy,
+  wizardRevisionIdentity,
 } from './connectionView.js'
 
 test('buildConnectionMcpConfig uses the encoded instance-specific endpoint', () => {
@@ -71,6 +79,9 @@ test('declarative wizard starts with a bounded import-only state and blocks acti
     tested: false,
     published: false,
     activated: false,
+    mappingReviewed: false,
+    credentialsSaved: false,
+    policiesSaved: false,
     mustDisable: false,
   })
   assert.equal(createWizardState({ status: 'active' }).mustDisable, true)
@@ -88,4 +99,124 @@ test('every pending tool needs an explicit policy before activation', () => {
     { tool_key: 'orders.create', enabled: false },
     { tool_key: 'stale', enabled: false },
   ]), false)
+})
+
+test('active declarative connections block the generic config editor', () => {
+  assert.equal(isActiveDeclarativeConfigReadOnly({ connector_key: 'http_declarative', status: 'active' }), true)
+  assert.equal(isActiveDeclarativeConfigReadOnly({ connector_key: 'http_declarative', status: 'disabled' }), false)
+  assert.equal(isActiveDeclarativeConfigReadOnly({ connector_key: 'wecom', status: 'active' }), false)
+})
+
+test('source identity changes invalidate every downstream wizard result', () => {
+  const state = {
+    ...createWizardState({ status: 'disabled' }),
+    imported: true,
+    validated: true,
+    published: true,
+    mappingReviewed: true,
+    credentialsSaved: true,
+    policiesSaved: true,
+    tested: true,
+    activated: true,
+  }
+  assert.deepEqual(invalidateWizardState(state, 'source'), {
+    ...state,
+    imported: false,
+    validated: false,
+    published: false,
+    mappingReviewed: false,
+    credentialsSaved: false,
+    policiesSaved: false,
+    tested: false,
+    activated: false,
+  })
+})
+
+test('credential, mapping, and policy edits invalidate test and activation only', () => {
+  const state = {
+    ...createWizardState({ status: 'disabled' }),
+    imported: true,
+    validated: true,
+    published: true,
+    mappingReviewed: true,
+    credentialsSaved: true,
+    policiesSaved: true,
+    tested: true,
+    activated: true,
+  }
+  for (const scope of ['credentials', 'mapping', 'policy']) {
+    const next = invalidateWizardState(state, scope)
+    assert.equal(next.published, true)
+    assert.equal(next.tested, false)
+    assert.equal(next.activated, false)
+  }
+})
+
+test('write policy toggles always require fresh consent', () => {
+  const writeTool = { tool_key: 'orders.create', operation_kind: 'write' }
+  const enabled = setExplicitToolPolicy(writeTool, undefined, true)
+  assert.deepEqual(enabled, { tool_key: 'orders.create', enabled: true, allow_write: false })
+  const consented = { ...enabled, allow_write: true }
+  assert.deepEqual(setExplicitToolPolicy(writeTool, consented, false), {
+    tool_key: 'orders.create', enabled: false, allow_write: false,
+  })
+  assert.deepEqual(setExplicitToolPolicy(writeTool, consented, true), {
+    tool_key: 'orders.create', enabled: true, allow_write: false,
+  })
+})
+
+test('explicit policies reject an enabled write tool without fresh consent', () => {
+  const tools = [{ tool_key: 'orders.create', operation_kind: 'write' }]
+  assert.equal(hasExplicitPolicies(tools, [{ tool_key: 'orders.create', enabled: true, allow_write: false }]), false)
+  assert.equal(hasExplicitPolicies(tools, [{ tool_key: 'orders.create', enabled: true, allow_write: true }]), true)
+  assert.equal(hasExplicitPolicies(tools, [{ tool_key: 'orders.create', enabled: false, allow_write: false }]), true)
+  assert.equal(hasExplicitPolicies(tools, [
+    { tool_key: 'orders.create', enabled: false, allow_write: false },
+    { tool_key: 'orders.create', enabled: true, allow_write: true },
+  ]), false)
+})
+
+test('token summary selects only a non-revoked token', () => {
+  assert.equal(selectActiveTokenHint([
+    { prefix: 'old', revoked_at: '2026-07-01T00:00:00Z' },
+    { prefix: 'expired', expires_at: '2020-01-01T00:00:00Z' },
+    { prefix: 'current', revoked_at: null },
+  ]), 'current')
+  assert.equal(selectActiveTokenHint([{ prefix: 'old', revoked_at: '2026-07-01T00:00:00Z' }]), '')
+})
+
+test('wizard revision identity is captured as a normalized immutable value', () => {
+  const state = { specId: ' spec-a ', revision: 2 }
+  const identity = wizardRevisionIdentity(state)
+  state.specId = 'spec-b'
+  state.revision = 3
+  assert.deepEqual(identity, { specId: 'spec-a', revision: 2 })
+})
+
+test('request sequence rejects stale and invalidated responses', () => {
+  const sequence = createRequestSequence()
+  const first = sequence.begin()
+  const second = sequence.begin()
+  assert.equal(sequence.isCurrent(first), false)
+  assert.equal(sequence.isCurrent(second), true)
+  sequence.invalidate()
+  assert.equal(sequence.isCurrent(second), false)
+})
+
+test('schema metadata summary exposes approved properties without values', () => {
+  assert.deepEqual(schemaMetadataSummary({
+    type: 'object',
+    required: ['query'],
+    properties: { query: { type: 'string' } },
+  }), {
+    required: ['query'],
+    properties: { query: { type: 'string' } },
+  })
+  assert.equal(schemaMetadataSummary(null), null)
+})
+
+test('required credential keys returns names only', () => {
+  assert.deepEqual(requiredCredentialKeys({ required: ['api_key', 'tenant'] }), ['api_key', 'tenant'])
+  assert.deepEqual(requiredCredentialKeys({ required: ['api_key', 7, ''] }), ['api_key'])
+  assert.deepEqual(requiredCredentialKeys(null), [])
 })

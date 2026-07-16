@@ -73,6 +73,9 @@
 .declarative-source { margin-top: 10px; font: 12px/1.6 ui-monospace, SFMono-Regular, Consolas, monospace; }
 .declarative-tool-list { display: grid; gap: 8px; }
 .declarative-tool { align-items: flex-start; flex-direction: column; }
+.declarative-tool details, .declarative-stage > details { width: 100%; color: #52656e; font-size: 12px; }
+.declarative-tool summary, .declarative-stage > details summary { cursor: pointer; font-weight: 700; }
+.declarative-tool pre, .declarative-stage > details pre { overflow: auto; max-height: 220px; margin: 8px 0 0; padding: 10px; border-radius: 6px; color: #334a54; background: #edf3f5; font: 11px/1.55 ui-monospace, SFMono-Regular, Consolas, monospace; white-space: pre-wrap; }
 .declarative-stage--actions { flex-direction: row; align-items: center; max-width: none; }
 
 .connection-workbench .ant-btn:focus-visible,
