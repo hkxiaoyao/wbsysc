@@ -6,6 +6,7 @@ import secrets
 import threading
 import uuid
 from collections.abc import Callable
+from dataclasses import replace
 from typing import Any, Mapping
 
 from sqlalchemy import text
@@ -576,6 +577,124 @@ def get_published_declarative_revision(
         raise ValueError("stored declarative revision is invalid") from None
 
 
+def _declarative_revision_from_row(row: Any) -> Any:
+    from app.connectors.declarative.models import DeclarativeRevision, MAX_DOCUMENT_BYTES
+    from app.connectors.declarative.validator import validate_revision
+
+    values = _row_values(row)
+    raw = values.get("spec_json")
+    encoded = raw.encode("utf-8") if isinstance(raw, str) else raw
+    if not isinstance(encoded, bytes) or len(encoded) > MAX_DOCUMENT_BYTES:
+        raise ValueError("stored declarative revision is invalid")
+    try:
+        loaded = DeclarativeRevision.from_storage_document(
+            spec_id=values["spec_id"],
+            revision=int(values["revision"]),
+            tenant_id=values["tenant_id"],
+            connection_id=values["connection_id"],
+            status=values["status"],
+            document=json.loads(encoded),
+        )
+        return validate_revision(loaded)
+    except Exception:
+        raise ValueError("stored declarative revision is invalid") from None
+
+
+def get_declarative_revision(
+    spec_id: str, revision: int, tenant_id: str, connection_id: str
+) -> Any | None:
+    with _engine().connect() as conn:
+        row = conn.execute(
+            text("""
+                SELECT spec_id, revision, tenant_id, connection_id, status, spec_json
+                FROM declarative_spec_revision
+                WHERE spec_id=:spec_id AND revision=:revision
+                  AND tenant_id=:tenant_id AND connection_id=:connection_id
+                LIMIT 1
+            """),
+            {"spec_id": spec_id, "revision": revision, "tenant_id": tenant_id, "connection_id": connection_id},
+        ).fetchone()
+    return None if row is None else _declarative_revision_from_row(row)
+
+
+def publish_declarative_revision(
+    spec_id: str, revision: int, tenant_id: str, connection_id: str
+) -> Any | None:
+    """Validate and publish an immutable tenant-owned draft in one transaction."""
+    with _engine().begin() as conn:
+        row = conn.execute(
+            text("""
+                SELECT spec_id, revision, tenant_id, connection_id, status, spec_json
+                FROM declarative_spec_revision
+                WHERE spec_id=:spec_id AND revision=:revision
+                  AND tenant_id=:tenant_id AND connection_id=:connection_id
+                LIMIT 1
+            """),
+            {"spec_id": spec_id, "revision": revision, "tenant_id": tenant_id, "connection_id": connection_id},
+        ).fetchone()
+        if row is None:
+            return None
+        draft = _declarative_revision_from_row(row)
+        if draft.status not in {"draft", "published"}:
+            raise ValueError("stored declarative revision is invalid")
+        conn.execute(
+            text("""
+                UPDATE declarative_spec_revision SET status='published'
+                WHERE spec_id=:spec_id AND revision=:revision
+                  AND tenant_id=:tenant_id AND connection_id=:connection_id
+            """),
+            {"spec_id": spec_id, "revision": revision, "tenant_id": tenant_id, "connection_id": connection_id},
+        )
+    return replace(draft, status="published")
+
+
+def activate_declarative_revision(
+    spec_id: str, revision: int, tenant_id: str, connection_id: str
+) -> ConnectionRecord | None:
+    """Activate only a published revision on its exact tenant connection."""
+    retired_version: int | None = None
+    with _engine().begin() as conn:
+        revision_row = conn.execute(
+            text("""
+                SELECT spec_id, revision, tenant_id, connection_id, status, spec_json
+                FROM declarative_spec_revision
+                WHERE spec_id=:spec_id AND revision=:revision
+                  AND tenant_id=:tenant_id AND connection_id=:connection_id
+                  AND status='published' LIMIT 1
+            """),
+            {"spec_id": spec_id, "revision": revision, "tenant_id": tenant_id, "connection_id": connection_id},
+        ).fetchone()
+        if revision_row is None:
+            return None
+        _declarative_revision_from_row(revision_row)
+        row = conn.execute(
+            text("""
+                SELECT connection_id, tenant_id, connector_key, display_name, status,
+                       data_mode, public_config_json, config_version
+                FROM connection_instance
+                WHERE connection_id=:connection_id AND tenant_id=:tenant_id LIMIT 1
+            """),
+            {"connection_id": connection_id, "tenant_id": tenant_id},
+        ).fetchone()
+        if row is None:
+            return None
+        current = _connection_from_row(row)
+        retired_version = current.config_version
+        public_config = dict(current.public_config)
+        public_config.update({"spec_id": spec_id, "revision": revision})
+        conn.execute(
+            text("""
+                UPDATE connection_instance SET public_config_json=:public_config_json,
+                    status='active', config_version=config_version+1
+                WHERE connection_id=:connection_id AND tenant_id=:tenant_id
+            """),
+            {"public_config_json": json.dumps(public_config, ensure_ascii=False, separators=(",", ":")), "connection_id": connection_id, "tenant_id": tenant_id},
+        )
+    updated = replace(current, public_config=public_config, status="active", config_version=current.config_version + 1)
+    _notify_connection_cache_invalidator(connection_id, retired_version)
+    return updated
+
+
 def set_tool_policy(
     connection_id: str,
     tool_name: str,
@@ -619,11 +738,16 @@ def set_tool_policy(
     return record
 
 
-def issue_token(connection_id: str, raw_value: str | None = None) -> IssuedToken:
+def issue_token(
+    connection_id: str,
+    raw_value: str | None = None,
+    *,
+    label: str = "",
+) -> IssuedToken:
     if not connection_id:
         raise ValueError("connection_id is required")
     if raw_value is None:
-        token_value = secrets.token_urlsafe(32)
+        token_value = f"mcp_{secrets.token_urlsafe(32)}"
     elif not isinstance(raw_value, str) or not raw_value:
         raise ValueError("raw_value is required")
     else:
@@ -640,20 +764,287 @@ def issue_token(connection_id: str, raw_value: str | None = None) -> IssuedToken
         conn.execute(
             text("""
                 INSERT INTO connection_token
-                    (token_id, connection_id, token_hmac, token_prefix)
-                VALUES (:token_id, :connection_id, :token_hmac, :token_prefix)
+                    (token_id, connection_id, token_hmac, token_prefix, token_label)
+                VALUES (:token_id, :connection_id, :token_hmac, :token_prefix, :token_label)
                 ON DUPLICATE KEY UPDATE
-                    token_prefix=VALUES(token_prefix)
+                    token_prefix=VALUES(token_prefix), token_label=VALUES(token_label)
             """),
             {
                 "token_id": issued.token_id,
                 "connection_id": connection_id,
                 "token_hmac": digest,
                 "token_prefix": issued.prefix,
+                "token_label": label,
             },
         )
     _notify_connection_cache_invalidator(connection_id, retired_version)
     return issued
+
+
+def create_connection_with_token(
+    record: ConnectionRecord,
+    credentials: Mapping[str, str] | None = None,
+) -> tuple[ConnectionRecord, IssuedToken]:
+    """Atomically create one connection, its credentials, and initial token."""
+    if not isinstance(record, ConnectionRecord):
+        raise TypeError("record must be a ConnectionRecord")
+    raw_value = f"mcp_{secrets.token_urlsafe(32)}"
+    digest = token_hmac(raw_value)
+    issued = IssuedToken(str(uuid.uuid4()), raw_value, digest[:12])
+    with _engine().begin() as conn:
+        conn.execute(
+            text("""
+                INSERT INTO connection_instance
+                    (connection_id, tenant_id, connector_key, display_name, status,
+                     data_mode, public_config_json, config_version)
+                VALUES (:connection_id, :tenant_id, :connector_key, :display_name,
+                        :status, :data_mode, :public_config_json, :config_version)
+            """),
+            {
+                "connection_id": record.connection_id,
+                "tenant_id": record.tenant_id,
+                "connector_key": record.connector_key,
+                "display_name": record.display_name,
+                "status": record.status,
+                "data_mode": record.data_mode,
+                "public_config_json": json.dumps(record.public_config, ensure_ascii=False, separators=(",", ":")),
+                "config_version": record.config_version,
+            },
+        )
+        for credential_key, plaintext in (credentials or {}).items():
+            if not credential_key or not isinstance(plaintext, str):
+                raise ValueError("invalid credential")
+            conn.execute(
+                text("""
+                    INSERT INTO connection_credential
+                        (connection_id, credential_key, encrypted_value, metadata_json)
+                    VALUES (:connection_id, :credential_key, :encrypted_value, :metadata_json)
+                """),
+                {
+                    "connection_id": record.connection_id,
+                    "credential_key": credential_key,
+                    "encrypted_value": encrypt_credential(plaintext),
+                    "metadata_json": '{"source":"admin"}',
+                },
+            )
+        conn.execute(
+            text("""
+                INSERT INTO connection_token
+                    (token_id, connection_id, token_hmac, token_prefix)
+                VALUES (:token_id, :connection_id, :token_hmac, :token_prefix)
+            """),
+            {
+                "token_id": issued.token_id,
+                "connection_id": record.connection_id,
+                "token_hmac": digest,
+                "token_prefix": issued.prefix,
+            },
+        )
+    _notify_connection_cache_invalidator(record.connection_id, record.config_version)
+    return record, issued
+
+
+def update_connection(
+    connection_id: str,
+    tenant_id: str,
+    *,
+    display_name: str,
+    data_mode: str,
+    public_config: Mapping[str, Any],
+    status: str | None = None,
+) -> ConnectionRecord | None:
+    """Update a tenant-owned connection and retire only its committed cache key."""
+    retired_version: int | None = None
+    with _engine().begin() as conn:
+        row = conn.execute(
+            text("""
+                SELECT connection_id, tenant_id, connector_key, display_name, status,
+                       data_mode, public_config_json, config_version
+                FROM connection_instance
+                WHERE connection_id=:connection_id AND tenant_id=:tenant_id LIMIT 1
+            """),
+            {"connection_id": connection_id, "tenant_id": tenant_id},
+        ).fetchone()
+        if row is None:
+            return None
+        current = _connection_from_row(row)
+        retired_version = current.config_version
+        next_status = current.status if status is None else status
+        conn.execute(
+            text("""
+                UPDATE connection_instance SET display_name=:display_name,
+                    data_mode=:data_mode, public_config_json=:public_config_json,
+                    status=:status, config_version=config_version+1
+                WHERE connection_id=:connection_id AND tenant_id=:tenant_id
+            """),
+            {
+                "connection_id": connection_id,
+                "tenant_id": tenant_id,
+                "display_name": display_name,
+                "data_mode": data_mode,
+                "public_config_json": json.dumps(dict(public_config), ensure_ascii=False, separators=(",", ":")),
+                "status": next_status,
+            },
+        )
+    updated = ConnectionRecord(
+        connection_id=connection_id,
+        tenant_id=tenant_id,
+        connector_key=current.connector_key,
+        display_name=display_name,
+        status=next_status,
+        data_mode=data_mode,  # type: ignore[arg-type]
+        public_config=dict(public_config),
+        config_version=current.config_version + 1,
+    )
+    _notify_connection_cache_invalidator(connection_id, retired_version)
+    return updated
+
+
+def disable_connection(connection_id: str, tenant_id: str) -> ConnectionRecord | None:
+    current = get_connection(connection_id, tenant_id)
+    if current is None:
+        return None
+    return update_connection(
+        connection_id,
+        tenant_id,
+        display_name=current.display_name,
+        data_mode=current.data_mode,
+        public_config=current.public_config,
+        status="disabled",
+    )
+
+
+def replace_credentials(
+    connection_id: str, tenant_id: str, credentials: Mapping[str, str]
+) -> bool:
+    retired_version: int | None = None
+    with _engine().begin() as conn:
+        retired_version = _retired_connection_version(conn, connection_id)
+        owner = conn.execute(
+            text("SELECT tenant_id FROM connection_instance WHERE connection_id=:connection_id LIMIT 1"),
+            {"connection_id": connection_id},
+        ).scalar()
+        if owner != tenant_id:
+            return False
+        conn.execute(text("DELETE FROM connection_credential WHERE connection_id=:connection_id"), {"connection_id": connection_id})
+        for key, value in credentials.items():
+            conn.execute(
+                text("""
+                    INSERT INTO connection_credential
+                        (connection_id, credential_key, encrypted_value, metadata_json)
+                    VALUES (:connection_id, :credential_key, :encrypted_value, :metadata_json)
+                """),
+                {"connection_id": connection_id, "credential_key": key, "encrypted_value": encrypt_credential(value), "metadata_json": '{"source":"admin"}'},
+            )
+        conn.execute(text("UPDATE connection_instance SET config_version=config_version+1 WHERE connection_id=:connection_id"), {"connection_id": connection_id})
+    _notify_connection_cache_invalidator(connection_id, retired_version)
+    return True
+
+
+def list_connection_tokens(connection_id: str) -> list[dict[str, Any]]:
+    """Return non-sensitive token metadata; the digest is intentionally not selected."""
+    with _engine().connect() as conn:
+        rows = conn.execute(
+            text("""
+                SELECT token_id, token_prefix, token_label, expires_at, revoked_at, created_at
+                FROM connection_token WHERE connection_id=:connection_id
+                ORDER BY created_at DESC, token_id
+            """),
+            {"connection_id": connection_id},
+        ).fetchall()
+    result = []
+    for row in rows:
+        values = _row_values(row)
+        result.append({
+            "token_id": values["token_id"],
+            "prefix": values.get("token_prefix", ""),
+            "label": values.get("token_label", "") or "",
+            "expires_at": str(values["expires_at"]) if values.get("expires_at") else None,
+            "revoked": values.get("revoked_at") is not None,
+            "created_at": str(values["created_at"]) if values.get("created_at") else None,
+        })
+    return result
+
+
+def revoke_token(connection_id: str, tenant_id: str, token_id: str) -> bool:
+    retired_version: int | None = None
+    with _engine().begin() as conn:
+        retired_version = _retired_connection_version(conn, connection_id)
+        result = conn.execute(
+            text("""
+                UPDATE connection_token t JOIN connection_instance c
+                  ON c.connection_id=t.connection_id
+                SET t.revoked_at=UTC_TIMESTAMP()
+                WHERE t.connection_id=:connection_id AND t.token_id=:token_id
+                  AND c.tenant_id=:tenant_id AND t.revoked_at IS NULL
+            """),
+            {"connection_id": connection_id, "token_id": token_id, "tenant_id": tenant_id},
+        )
+    if result.rowcount:
+        _notify_connection_cache_invalidator(connection_id, retired_version)
+        return True
+    return False
+
+
+def rotate_token(
+    connection_id: str, tenant_id: str, *, label: str = ""
+) -> IssuedToken | None:
+    """Atomically revoke current tokens and issue one replacement."""
+    raw_value = f"mcp_{secrets.token_urlsafe(32)}"
+    digest = token_hmac(raw_value)
+    issued = IssuedToken(str(uuid.uuid4()), raw_value, digest[:12])
+    retired_version: int | None = None
+    with _engine().begin() as conn:
+        retired_version = _retired_connection_version(conn, connection_id)
+        owner = conn.execute(
+            text("SELECT tenant_id FROM connection_instance WHERE connection_id=:connection_id LIMIT 1"),
+            {"connection_id": connection_id},
+        ).scalar()
+        if owner != tenant_id:
+            return None
+        conn.execute(
+            text("UPDATE connection_token SET revoked_at=UTC_TIMESTAMP() WHERE connection_id=:connection_id AND revoked_at IS NULL"),
+            {"connection_id": connection_id},
+        )
+        conn.execute(
+            text("""
+                INSERT INTO connection_token
+                    (token_id, connection_id, token_hmac, token_prefix, token_label)
+                VALUES (:token_id, :connection_id, :token_hmac, :token_prefix, :token_label)
+            """),
+            {"token_id": issued.token_id, "connection_id": connection_id, "token_hmac": digest, "token_prefix": issued.prefix, "token_label": label},
+        )
+    _notify_connection_cache_invalidator(connection_id, retired_version)
+    return issued
+
+
+def list_tool_policies(connection_id: str) -> list[ToolPolicy]:
+    with _engine().connect() as conn:
+        rows = conn.execute(
+            text("SELECT connection_id, tool_name, enabled, policy_json FROM connection_tool_policy WHERE connection_id=:connection_id"),
+            {"connection_id": connection_id},
+        ).fetchall()
+    return [ToolPolicy(connection_id, _row_values(row)["tool_name"], bool(_row_values(row)["enabled"]), json.loads(_row_values(row)["policy_json"] or "{}")) for row in rows]
+
+
+def replace_tool_policies(
+    connection_id: str, tenant_id: str, policies: list[ToolPolicy]
+) -> bool:
+    retired_version: int | None = None
+    with _engine().begin() as conn:
+        retired_version = _retired_connection_version(conn, connection_id)
+        owner = conn.execute(text("SELECT tenant_id FROM connection_instance WHERE connection_id=:connection_id LIMIT 1"), {"connection_id": connection_id}).scalar()
+        if owner != tenant_id:
+            return False
+        conn.execute(text("DELETE FROM connection_tool_policy WHERE connection_id=:connection_id"), {"connection_id": connection_id})
+        for policy in policies:
+            conn.execute(
+                text("INSERT INTO connection_tool_policy (connection_id, tool_name, enabled, policy_json) VALUES (:connection_id,:tool_name,:enabled,:policy_json)"),
+                {"connection_id": connection_id, "tool_name": policy.tool_name, "enabled": 1 if policy.enabled else 0, "policy_json": json.dumps(policy.policy, ensure_ascii=False, separators=(",", ":"))},
+            )
+        conn.execute(text("UPDATE connection_instance SET config_version=config_version+1 WHERE connection_id=:connection_id"), {"connection_id": connection_id})
+    _notify_connection_cache_invalidator(connection_id, retired_version)
+    return True
 
 
 def resolve_connection_token(

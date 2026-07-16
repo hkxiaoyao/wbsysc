@@ -690,3 +690,51 @@ def test_direct_tenant_cannot_run_sync_diagnosis(monkeypatch):
         admin.sync_diagnose("tenant-a", request)
 
     assert exc.value.status_code == 409
+
+
+def test_connection_credential_error_does_not_leak_secret(monkeypatch, caplog):
+    from app import admin_connections
+    from app.connections.models import ConnectionRecord
+    from app.connectors.contracts import ConnectorSpec
+
+    leaked = "credential-secret-in-database-error"
+    record = ConnectionRecord(
+        connection_id="conn-a",
+        tenant_id="tenant-a",
+        connector_key="sample",
+        display_name="Sample",
+        status="active",
+        data_mode="direct",
+        public_config={},
+        config_version=1,
+    )
+    monkeypatch.setattr(admin_connections.store, "get_connection", lambda *args: record)
+    monkeypatch.setattr(
+        admin_connections.store,
+        "replace_credentials",
+        lambda *args: (_ for _ in ()).throw(RuntimeError(leaked)),
+    )
+    monkeypatch.setattr(
+        admin_connections,
+        "_spec",
+        lambda request, key: ConnectorSpec(
+            connector_key="sample",
+            tools=(),
+            credential_schema={"type": "object"},
+            config_schema={"type": "object"},
+        ),
+    )
+    monkeypatch.setattr(admin, "_require_auth", lambda request: None)
+    test_app = FastAPI()
+    test_app.include_router(admin_connections.router)
+
+    with caplog.at_level("WARNING", logger="app.admin_connections"):
+        response = TestClient(test_app, raise_server_exceptions=False).put(
+            "/admin/tenants/tenant-a/connections/conn-a/credentials",
+            json={"credentials": {"api_key": "request-secret"}},
+        )
+
+    assert response.status_code == 400
+    assert response.json() == {"detail": "connection mutation failed"}
+    assert leaked not in caplog.text
+    assert "request-secret" not in caplog.text

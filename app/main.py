@@ -48,6 +48,7 @@ from .mcp_audit import (
 )
 from .mcp_gateway import ConnectionMcpGateway
 from .admin import router as admin_router
+from .admin_connections import router as admin_connections_router
 from .mcp_logs_admin import router as mcp_logs_admin_router
 
 logging.basicConfig(
@@ -176,6 +177,7 @@ def create_app(*, gateway: ConnectionMcpGateway | None = None) -> FastAPI:
     app.state.connection_sync_orchestrator = _build_connection_sync_orchestrator(
         gateway_registry
     )
+    app.state.connector_registry = gateway_registry
 
     # WorkBuddy 等客户端 POST /mcp（无尾斜杠）。Starlette Mount("/mcp") 时
     # 子应用拿到 path=""，匹配不到 FastMCP 的 "/"，会 405。进入路由前补上斜杠。
@@ -194,6 +196,7 @@ def create_app(*, gateway: ConnectionMcpGateway | None = None) -> FastAPI:
 
     # 管理后台 API（独立路由，不经 MCP 鉴权，自带 session 校验）
     app.include_router(admin_router)
+    app.include_router(admin_connections_router)
     app.include_router(mcp_logs_admin_router)
 
     # 健康检查（鉴权白名单）
