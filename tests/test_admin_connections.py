@@ -593,6 +593,60 @@ def test_active_declarative_connection_rejects_import_and_publish(monkeypatch):
     assert calls == []
 
 
+def test_generic_update_cannot_activate_a_disabled_declarative_connection(monkeypatch):
+    client = _client(monkeypatch)
+    record = _record(
+        connector_key="http_declarative",
+        status="disabled",
+        public_config={
+            "spec_id": "spec-a",
+            "revision": 1,
+            "pending_spec_id": "spec-b",
+            "pending_revision": 2,
+        },
+        config_version=7,
+    )
+    calls = []
+    monkeypatch.setattr(admin_connections.store, "get_connection", lambda *args: record)
+    monkeypatch.setattr(
+        admin_connections,
+        "_spec_for_record",
+        lambda *args: ConnectorSpec(
+            connector_key="http_declarative",
+            tools=(),
+            config_schema={
+                "type": "object",
+                "properties": {
+                    "spec_id": {"type": "string"},
+                    "revision": {"type": "integer"},
+                    "pending_spec_id": {"type": "string"},
+                    "pending_revision": {"type": "integer"},
+                },
+                "additionalProperties": False,
+            },
+            supports_data_modes=("direct",),
+        ),
+    )
+    monkeypatch.setattr(
+        admin_connections.store,
+        "update_connection",
+        lambda *args, **kwargs: calls.append("update"),
+    )
+
+    response = client.put(
+        "/admin/connections/conn-a",
+        json={
+            "display_name": "API",
+            "data_mode": "direct",
+            "public_config": record.public_config,
+            "status": "active",
+        },
+    )
+
+    assert response.status_code == 409
+    assert calls == []
+
+
 def test_declarative_import_passes_owned_version_to_atomic_save(monkeypatch):
     client = _client(monkeypatch)
     record = _record(

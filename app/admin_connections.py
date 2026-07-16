@@ -493,6 +493,8 @@ def _global_owner(connection_id: str) -> ConnectionRecord:
 def update_connection(tenant_id: str, connection_id: str, body: ConnectionUpdateRequest, request: Request):
     current = _owned(tenant_id, connection_id)
     if current.connector_key == DECLARATIVE_CONNECTOR_KEY:
+        if body.status == "active":
+            raise HTTPException(409, "use declarative revision activation")
         if dict(body.public_config) != current.public_config:
             _schema_error()
         candidate = replace(current, data_mode=body.data_mode)

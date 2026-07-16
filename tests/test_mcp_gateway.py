@@ -375,7 +375,10 @@ def test_store_policy_mutation_invalidates_only_its_cached_gateway_entry(monkeyp
             await gateway._manager_for(other_connection)
 
             connection_store.set_tool_policy(
-                "conn-a", "reports.list", enabled=False
+                "conn-a",
+                "reports.list",
+                enabled=False,
+                expected_config_version=1,
             )
             for _ in range(3):
                 if set(gateway.cached_session_keys) == {("conn-b", 1)}:

@@ -643,6 +643,23 @@ def test_persistence_revalidates_programmatic_revision(monkeypatch) -> None:
     )
 
     with pytest.raises(SpecValidationError, match="expressions are not supported"):
+        store.save_declarative_revision(revision, expected_config_version=1)
+
+
+def test_persistence_requires_an_expected_connection_version(monkeypatch) -> None:
+    revision = import_openapi_revision(
+        _document(),
+        spec_id="spec-users",
+        tenant_id="tenant-a",
+        connection_id="conn-declarative",
+    )
+    monkeypatch.setattr(
+        db,
+        "get_engine",
+        lambda: pytest.fail("versionless persistence must not reach the database"),
+    )
+
+    with pytest.raises(TypeError, match="expected_config_version"):
         store.save_declarative_revision(revision)
 
 
@@ -894,7 +911,22 @@ class _RevisionStoreConnection:
         return False
 
     def execute(self, statement, params=None):
-        self.statements.append((str(statement), dict(params or {})))
+        sql = str(statement)
+        bound = dict(params or {})
+        self.statements.append((sql, bound))
+        if "FROM connection_instance" in sql:
+            return _RevisionReadResult(
+                {
+                    "connection_id": bound["connection_id"],
+                    "tenant_id": bound["tenant_id"],
+                    "connector_key": "http_declarative",
+                    "display_name": "API",
+                    "status": "draft",
+                    "data_mode": "direct",
+                    "public_config_json": "{}",
+                    "config_version": 1,
+                }
+            )
 
 
 class _RevisionStoreEngine:
@@ -969,7 +1001,7 @@ def test_declarative_revision_persistence_uses_bound_parameters(monkeypatch) -> 
     connection = _RevisionStoreConnection()
     monkeypatch.setattr(db, "get_engine", lambda: _RevisionStoreEngine(connection))
 
-    store.save_declarative_revision(revision)
+    store.save_declarative_revision(revision, expected_config_version=1)
 
     revision_sql, revision_params = next(
         (sql, params)
@@ -996,7 +1028,7 @@ def test_two_tenants_can_persist_the_same_spec_revision_identity(monkeypatch) ->
     ]
 
     for revision in revisions:
-        store.save_declarative_revision(revision)
+        store.save_declarative_revision(revision, expected_config_version=1)
 
     operation_params = [
         params

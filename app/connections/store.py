@@ -446,7 +446,7 @@ def list_connections(tenant_id: str) -> list[ConnectionRecord]:
 
 
 def save_declarative_revision(
-    revision: Any, *, expected_config_version: int | None = None
+    revision: Any, *, expected_config_version: int
 ) -> None:
     """Persist one compiled revision without accepting a raw upstream payload.
 
@@ -477,30 +477,29 @@ def save_declarative_revision(
         raise ValueError("declarative revision exceeds size limit")
 
     with _engine().begin() as conn:
-        if expected_config_version is not None:
-            connection_row = conn.execute(
-                text("""
-                    SELECT connection_id, tenant_id, connector_key, display_name,
-                           status, data_mode, public_config_json, config_version
-                    FROM connection_instance
-                    WHERE connection_id=:connection_id AND tenant_id=:tenant_id
-                    LIMIT 1 FOR UPDATE
-                """),
-                {
-                    "connection_id": revision.connection_id,
-                    "tenant_id": revision.tenant_id,
-                },
-            ).fetchone()
-            if connection_row is None:
-                raise ValueError("declarative connection is unavailable")
-            current = _connection_from_row(connection_row)
-            if current.config_version != expected_config_version:
-                raise ConnectionVersionConflictError
-            if (
-                current.connector_key != "http_declarative"
-                or current.status not in {"draft", "disabled"}
-            ):
-                raise ValueError("declarative connection cannot be changed")
+        connection_row = conn.execute(
+            text("""
+                SELECT connection_id, tenant_id, connector_key, display_name,
+                       status, data_mode, public_config_json, config_version
+                FROM connection_instance
+                WHERE connection_id=:connection_id AND tenant_id=:tenant_id
+                LIMIT 1 FOR UPDATE
+            """),
+            {
+                "connection_id": revision.connection_id,
+                "tenant_id": revision.tenant_id,
+            },
+        ).fetchone()
+        if connection_row is None:
+            raise ValueError("declarative connection is unavailable")
+        current = _connection_from_row(connection_row)
+        if current.config_version != expected_config_version:
+            raise ConnectionVersionConflictError
+        if (
+            current.connector_key != "http_declarative"
+            or current.status not in {"draft", "disabled"}
+        ):
+            raise ValueError("declarative connection cannot be changed")
         conn.execute(
             text("""
                 INSERT INTO declarative_spec_revision
@@ -825,6 +824,8 @@ def set_tool_policy(
     tool_name: str,
     enabled: bool,
     policy: Mapping[str, Any] | None = None,
+    *,
+    expected_config_version: int,
 ) -> ToolPolicy:
     if not connection_id or not tool_name:
         raise ValueError("connection_id and tool_name are required")
@@ -843,6 +844,10 @@ def set_tool_policy(
         retired_version = _retired_connection_version(
             conn, connection_id, for_update=True
         )
+        if retired_version is None:
+            raise ValueError("connection is unavailable")
+        if retired_version != expected_config_version:
+            raise ConnectionVersionConflictError
         conn.execute(
             text("""
                 INSERT INTO connection_tool_policy
@@ -860,6 +865,13 @@ def set_tool_policy(
                     record.policy, ensure_ascii=False, separators=(",", ":")
                 ),
             },
+        )
+        conn.execute(
+            text("""
+                UPDATE connection_instance SET config_version=config_version+1
+                WHERE connection_id=:connection_id
+            """),
+            {"connection_id": connection_id},
         )
     _notify_connection_cache_invalidator(connection_id, retired_version)
     return record
@@ -1003,6 +1015,12 @@ def update_connection(
             raise ConnectionVersionConflictError
         retired_version = current.config_version
         next_status = current.status if status is None else status
+        if (
+            current.connector_key == "http_declarative"
+            and current.status != "active"
+            and next_status == "active"
+        ):
+            raise ValueError("declarative activation requires a published revision")
         _assert_status_transition(current.status, next_status)
         conn.execute(
             text("""
