@@ -172,9 +172,9 @@ def migrate_legacy_logs(days: int = 90) -> None:
                error_summary, cost_ms, request_id, client_ip, http_method,
                http_status, legacy_schema, legacy_id, created_at)
             SELECT :tenant_id,
-                   connection_map.connection_id,
-                   CASE WHEN connection_map.connection_id IS NULL THEN NULL ELSE 'wecom' END,
-                   CASE WHEN connection_map.connection_id IS NULL THEN NULL
+                   connection_map.mapped_connection_id,
+                   CASE WHEN connection_map.mapped_connection_id IS NULL THEN NULL ELSE 'wecom' END,
+                   CASE WHEN connection_map.mapped_connection_id IS NULL THEN NULL
                         ELSE CASE legacy.tool_name
                           WHEN 'wecom_list_reports' THEN 'reports.list'
                           WHEN 'wecom_get_report' THEN 'reports.get'
@@ -195,7 +195,7 @@ def migrate_legacy_logs(days: int = 90) -> None:
                     :legacy_schema, legacy.id, legacy.created_at
              FROM `{schema_name}`.`audit_log` AS legacy
              LEFT JOIN (
-               SELECT connection_id
+               SELECT connection_id AS mapped_connection_id
                FROM connection_instance
                WHERE connection_id=:default_connection_id
                  AND tenant_id=:tenant_id
