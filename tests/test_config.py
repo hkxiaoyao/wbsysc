@@ -89,7 +89,7 @@ def test_production_template_and_deployer_manage_a_distinct_hmac_key():
     template = (root / ".env.prod.example").read_text(encoding="utf-8")
     deployer = (root / "deploy" / "server_deploy.sh").read_text(encoding="utf-8")
 
-    assert "MCP_TOKEN_HMAC_KEY=<独立强随机串>" in template
+    assert "MCP_TOKEN_HMAC_KEY=replace_with_hmac_key" in template
     assert 'MCP_TOKEN_HMAC_KEY="$(read_env_value MCP_TOKEN_HMAC_KEY)"' in deployer
     assert "已自动生成 MCP_TOKEN_HMAC_KEY" in deployer
     assert "MCP_TOKEN_HMAC_KEY 必须为非示例值且至少 32 UTF-8 字节" in deployer

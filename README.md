@@ -1,12 +1,14 @@
-# 企微数据中转 MCP Gateway
+# 多连接 MCP Gateway
 
-将企业微信**审批 / 汇报 / 打卡**数据**读取**能力，通过 MCP 协议暴露给 WorkBuddy/CodeBuddy。
+将企业微信和受控第三方连接器的数据能力通过模型上下文协议（MCP）暴露给 WorkBuddy/CodeBuddy。每个连接使用独立的 `/mcp/{connection_id}`、Token、工具策略、凭证、缓存和审计边界。
 
 > 解决痛点：WorkBuddy 的企业微信连接器**只支持 MCP**，且只能"新建/写入"，**不支持读取**历史业务数据。本服务作为数据中转层，主动从企微 OpenAPI 拉取落库，再以 MCP Server 形态暴露给 WorkBuddy 读取。
 
 ## ✨ 功能特性
 
 - **MCP Gateway**（Streamable HTTP + Bearer Token，远程多客户连接）
+- **连接级隔离**：一个租户可创建多个连接，每个连接独立鉴权、策略、缓存和日志
+- **兼容迁移**：旧 `/mcp` 在兼容期映射到默认企微连接，新客户端使用 `/mcp/{connection_id}`
 - **三类数据读取**：审批、汇报、打卡（智能表格一期搁置：见下方说明）
 - **多租户物理隔离**：每客户独立 MySQL schema（`wbd_{corpid_hash}`），凭证 AES 加密
 - **租户级功能开关**：每客户可选 `report`/`approval`/`checkin` 模块组合
@@ -67,8 +69,8 @@ curl http://localhost:8001/health        # 期望 {"status":"ok"}
 
 # 接入第一个租户
 docker compose exec wbsysc python -m app.tenant_init \
-  --tenant-id tenant1 --corpid wwXXX --secret XXX \
-  --token $(openssl rand -hex 24) --contact-secret XXXX \
+  --tenant-id tenant_id_here --corpid corpid_here --secret app_secret_here \
+  --token $(openssl rand -hex 24) --contact-secret contact_secret_here \
   --modules report,approval,checkin --display "测试客户1"
 ```
 
@@ -118,12 +120,16 @@ python tests/test_smoke_client.py
 | `DB_PASSWORD` | MySQL `websysc` 账户密码 | ✓ |
 | `ADMIN_PASSWORD` | 管理后台登录密码 | ✓ |
 | `CREDENTIAL_KEY` | 凭证加密主密钥（开发可留空；生产必配强随机） | 生产必填 |
+| `MCP_TOKEN_HMAC_KEY` | MCP Token HMAC 密钥，至少 32 个 UTF-8 字节且与 `CREDENTIAL_KEY` 独立 | 生产必填 |
+| `CONNECTOR_ALLOWLIST` | 已审核 `wbsysc.connectors` 入口名的归一化精确列表 | - |
 | `WECOM_USE_MOCK` | `true`=脱敏 mock；生产必须为 `false` 并配置租户凭证 | 生产必填 |
 | `SYNC_INTERVAL_*_MIN` | 同步间隔（report/approval/smarttable） | - |
 
 > 租户企微凭证（corpid/secret）**不进 .env**，通过管理后台或 `tenant_init` 写入 `tenant_config`（AES 加密）。
 >
-> 生产启动必须同时设置 `WECOM_USE_MOCK=false`、`CREDENTIAL_KEY`、`ADMIN_PASSWORD` 和 `DB_PASSWORD`；缺失或使用示例值时应用会拒绝启动。
+> 生产启动必须同时设置 `WECOM_USE_MOCK=false`、`CREDENTIAL_KEY`、`MCP_TOKEN_HMAC_KEY`、`ADMIN_PASSWORD` 和 `DB_PASSWORD`；缺失、密钥少于 32 个 UTF-8 字节或使用示例值时应用会拒绝启动。
+
+轮换 `MCP_TOKEN_HMAC_KEY` 会使现有连接 Token 全部失效。先为每个连接签发新 Token，再切换 HMAC 密钥。部署、回滚、连接器发布和清理步骤见 [`docs/connection-platform-operations.md`](docs/connection-platform-operations.md)。
 
 ## 🔧 MCP 工具（6 个）
 
@@ -142,7 +148,7 @@ python tests/test_smoke_client.py
   "mcpServers": {
     "wecom-gateway": {
       "type": "http",
-      "url": "https://<your-server>/mcp",
+      "url": "https://mcp_host_name/mcp/connection_id_here",
       "headers": { "Authorization": "Bearer ${WORKBUDDY_MCP_TOKEN}" }
     }
   }
@@ -153,7 +159,7 @@ python tests/test_smoke_client.py
 
 ## 🎛 管理后台
 
-访问 `http://<server>:8001/admin/ui/`，单密码登录（`.env` 的 `ADMIN_PASSWORD`）。
+访问 `http://server_host_name:8001/admin/ui/`，单密码登录（`.env` 的 `ADMIN_PASSWORD`）。
 
 | API | 说明 |
 |-----|------|
@@ -173,11 +179,11 @@ python tests/test_smoke_client.py
 ```bash
 # 接入新租户（自动建schema+5张表+刷缓存）
 python -m app.tenant_init \
-  --tenant-id customerA --corpid wwXXX --secret XXXX \
+  --tenant-id tenant_id_here --corpid corpid_here --secret app_secret_here \
   --token $(openssl rand -hex 24) \
   --modules report,approval,checkin \
-  --contact-secret XXXX      # 可选：通讯录同步secret，自动拉userid喂打卡
-  --checkin-userids "userA"  # 可选：无通讯录secret时手动兜底
+  --contact-secret contact_secret_here # 可选：通讯录同步 secret
+  --checkin-userids "userid_here"      # 可选：手动配置 userid
 ```
 
 **模块开关** `--modules`：可选 `report`/`approval`/`checkin` 任意组合。
@@ -248,6 +254,7 @@ tests/test_smoke_client.py                       # MCP 客户端冒烟测试
 
 ## 📚 文档
 
+- 多连接平台运维：[`docs/connection-platform-operations.md`](docs/connection-platform-operations.md)
 - 完整架构计划：[`docs/PLAN-wecom-mcp-gateway.md`](docs/PLAN-wecom-mcp-gateway.md)
 - 企微接入配置清单：[`docs/企微接入配置清单.md`](docs/企微接入配置清单.md)
 - 部署指南：[`docs/部署指南.md`](docs/部署指南.md)
