@@ -312,6 +312,30 @@ def test_cache_invalidation_retires_only_the_exact_connection_version():
     asyncio.run(exercise())
 
 
+def test_new_config_version_replaces_old_cached_server_for_same_connection():
+    first = _connection("conn-a")
+    second = ConnectionCtx(
+        tenant_id=first.tenant_id,
+        connection_id=first.connection_id,
+        connector_key=first.connector_key,
+        data_mode=first.data_mode,
+        public_config={"schema_name": "revision-two"},
+        config_version=2,
+    )
+    gateway = ConnectionMcpGateway(
+        resolver=_FakeResolver(by_connection={}, legacy_tokens={}),
+        runtime=ConnectorRuntime(ConnectorRegistry([_FakeConnector()])),
+    )
+
+    async def exercise():
+        async with gateway.run():
+            await gateway._manager_for(first)
+            await gateway._manager_for(second)
+            assert gateway.cached_session_keys == (("conn-a", 2),)
+
+    asyncio.run(exercise())
+
+
 def test_store_policy_mutation_invalidates_only_its_cached_gateway_entry(monkeypatch):
     active_connection = _connection("conn-a")
     other_connection = _connection("conn-b", tenant_id="tenant-b")

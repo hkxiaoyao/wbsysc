@@ -39,6 +39,7 @@ MAX_TIMEOUT_MS = 30_000
 DEFAULT_TIMEOUT_MS = 10_000
 
 _IDENTIFIER_RE = re.compile(r"^[A-Za-z][A-Za-z0-9_.-]{0,127}$")
+_SCOPE_IDENTIFIER_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.-]{0,127}$")
 _HEADER_RE = re.compile(r"^[A-Za-z0-9-]{1,64}$")
 _BODY_TARGET_RE = re.compile(r"^[A-Za-z][A-Za-z0-9_-]{0,63}$")
 _PROTECTED_DYNAMIC_HEADERS = frozenset(
@@ -103,6 +104,12 @@ class OutputSelectionError(ValueError):
 
 def _identifier(label: str, value: str) -> str:
     if not isinstance(value, str) or not _IDENTIFIER_RE.fullmatch(value):
+        raise SpecValidationError(f"invalid {label}")
+    return value
+
+
+def _scope_identifier(label: str, value: str) -> str:
+    if not isinstance(value, str) or not _SCOPE_IDENTIFIER_RE.fullmatch(value):
         raise SpecValidationError(f"invalid {label}")
     return value
 
@@ -779,9 +786,9 @@ class DeclarativeRevision:
         if self.spec_id:
             _identifier("spec ID", self.spec_id)
         if self.tenant_id:
-            _identifier("tenant ID", self.tenant_id)
+            _scope_identifier("tenant ID", self.tenant_id)
         if self.connection_id:
-            _identifier("connection ID", self.connection_id)
+            _scope_identifier("connection ID", self.connection_id)
         if not isinstance(self.revision, int) or isinstance(self.revision, bool) or self.revision < 1:
             raise SpecValidationError("invalid revision number")
         if self.status not in {"draft", "published"}:

@@ -8,7 +8,12 @@ from fastapi.testclient import TestClient
 
 from app import admin, admin_connections
 from app.connections.models import ConnectionRecord, IssuedToken
-from app.connectors.contracts import ConnectorSpec, ToolSpec
+from app.connectors.contracts import (
+    ConnectionContext,
+    ConnectorSpec,
+    SyncResult,
+    ToolSpec,
+)
 from app.connectors.registry import ConnectorRegistry
 from app.connectors.runtime import PolicyGuard
 
@@ -202,7 +207,7 @@ def test_global_connection_detail_uses_resolved_tenant_and_redacts_config(monkey
 
 def test_declarative_revision_validate_publish_activate_lifecycle(monkeypatch):
     client = _client(monkeypatch)
-    record = _record()
+    record = _record(connector_key="http_declarative", status="draft")
     revision = SimpleNamespace(spec_id="spec-a", revision=2, status="draft")
     published = SimpleNamespace(spec_id="spec-a", revision=2, status="published")
     calls = []
@@ -214,6 +219,14 @@ def test_declarative_revision_validate_publish_activate_lifecycle(monkeypatch):
         raising=False,
     )
     monkeypatch.setattr(admin_connections, "validate_revision", lambda item, data_mode=None: item)
+    monkeypatch.setattr(
+        admin_connections,
+        "_declarative_candidate_spec",
+        lambda *args: ConnectorSpec(connector_key="http_declarative", tools=()),
+    )
+    monkeypatch.setattr(
+        admin_connections, "_load_connection_credentials", lambda *args: {}
+    )
     monkeypatch.setattr(
         admin_connections.store,
         "publish_declarative_revision",
@@ -325,3 +338,199 @@ def test_explicit_token_rotation_returns_new_raw_token_once(monkeypatch):
 
     assert response.status_code == 201
     assert response.json()["token"] == "mcp_rotated_once"
+
+
+def test_safe_config_projects_only_declared_nested_and_array_fields():
+    schema = {
+        "type": "object",
+        "properties": {
+            "name": {"type": "string"},
+            "nested": {
+                "type": "object",
+                "properties": {"safe": {"type": "string"}},
+                "additionalProperties": False,
+            },
+            "items": {
+                "type": "array",
+                "items": {
+                    "type": "object",
+                    "properties": {"safe": {"type": "string"}},
+                    "additionalProperties": False,
+                },
+            },
+            "metadata": {
+                "type": "object",
+                "additionalProperties": {"type": "string"},
+            },
+        },
+        "additionalProperties": False,
+    }
+    value = {
+        "name": "visible",
+        "unknown": "must-not-leak",
+        "nested": {"safe": "visible", "extra": "must-not-leak"},
+        "items": [{"safe": "visible", "secret": "must-not-leak"}],
+        "metadata": {"region": "cn", "token": "must-not-leak"},
+    }
+
+    projected = admin_connections._safe_config(value, schema)
+
+    assert projected == {
+        "name": "visible",
+        "nested": {"safe": "visible"},
+        "items": [{"safe": "visible"}],
+        "metadata": {"region": "cn"},
+    }
+    assert "must-not-leak" not in repr(projected)
+
+
+def test_declarative_create_is_draft_and_does_not_require_static_registry(monkeypatch):
+    client = _client(monkeypatch)
+    captured = []
+    monkeypatch.setattr(
+        admin_connections.store,
+        "create_connection_with_token",
+        lambda record, credentials: (
+            captured.append((record, credentials)) or record,
+            IssuedToken("token-id", "mcp_once", "prefix"),
+        ),
+    )
+    monkeypatch.setattr(admin_connections, "write_event", lambda event: True)
+
+    response = client.post(
+        "/admin/tenants/tenant-a/connections",
+        json={
+            "connector_key": "http_declarative",
+            "display_name": "Declared API",
+            "data_mode": "direct",
+            "status": "draft",
+            "public_config": {},
+            "credentials": {},
+        },
+    )
+
+    assert response.status_code == 201
+    assert captured[0][0].status == "draft"
+    assert captured[0][0].public_config == {}
+
+
+def test_declarative_create_rejects_prebound_config_or_credentials(monkeypatch):
+    client = _client(monkeypatch)
+    for payload in (
+        {"public_config": {"spec_id": "forged"}, "credentials": {}},
+        {"public_config": {}, "credentials": {"api_key": "forged-secret"}},
+    ):
+        response = client.post(
+            "/admin/tenants/tenant-a/connections",
+            json={
+                "connector_key": "http_declarative",
+                "display_name": "Declared API",
+                "data_mode": "direct",
+                "status": "draft",
+                **payload,
+            },
+        )
+        assert response.status_code == 422
+
+
+def test_spec_lifecycle_rejects_non_declarative_connection(monkeypatch):
+    client = _client(monkeypatch)
+    monkeypatch.setattr(admin_connections.store, "get_connection", lambda *args: _record())
+    response = client.post(
+        "/admin/connections/conn-a/specs/spec-a/revisions/1/publish"
+    )
+    assert response.status_code == 422
+
+
+def test_connection_test_executes_real_safe_read_operation(monkeypatch):
+    client = _client(monkeypatch)
+    record = _record()
+    calls = []
+
+    class Resolver:
+        def execution_context(self, ctx):
+            return ConnectionContext(connection=record, credentials={"api_key": "secret"})
+
+    class Runtime:
+        def list_enabled_tools(self, context):
+            return client.app.state.connector_registry.validated_spec("sample").tools
+
+        async def execute(self, context, tool_key, args):
+            calls.append((context.connection_id, tool_key, args))
+            return SimpleNamespace(status="ok", data={"ok": True})
+
+    client.app.state.mcp_gateway = SimpleNamespace(
+        resolver=Resolver(), _runtime=Runtime()
+    )
+    monkeypatch.setattr(admin_connections.store, "get_connection", lambda *args: record)
+    monkeypatch.setattr(admin_connections, "write_event", lambda event: True)
+
+    response = client.post("/admin/connections/conn-a/test")
+
+    assert response.status_code == 200
+    assert response.json() == {"ok": True, "status": "ok"}
+    assert calls == [("conn-a", "items.list", {})]
+
+
+def test_activation_rejects_missing_revision_credentials_before_store(monkeypatch):
+    client = _client(monkeypatch)
+    record = _record(
+        connector_key="http_declarative",
+        status="draft",
+        public_config={"spec_id": "spec-a", "revision": 1},
+    )
+    calls = []
+    monkeypatch.setattr(admin_connections.store, "get_connection", lambda *args: record)
+    monkeypatch.setattr(
+        admin_connections,
+        "_declarative_candidate_spec",
+        lambda request, record, spec_id, revision: ConnectorSpec(
+            connector_key="http_declarative",
+            tools=(),
+            credential_schema={
+                "type": "object",
+                "required": ["api_key"],
+                "properties": {"api_key": {"type": "string"}},
+                "additionalProperties": False,
+            },
+        ),
+        raising=False,
+    )
+    monkeypatch.setattr(
+        admin_connections,
+        "_load_connection_credentials",
+        lambda request, record: {},
+        raising=False,
+    )
+    monkeypatch.setattr(
+        admin_connections.store,
+        "activate_declarative_revision",
+        lambda *args: calls.append("activate"),
+    )
+
+    response = client.post(
+        "/admin/connections/conn-a/specs/spec-a/revisions/1/activate"
+    )
+
+    assert response.status_code == 422
+    assert calls == []
+
+
+def test_manual_sync_writes_safe_management_audit(monkeypatch):
+    client = _client(monkeypatch)
+    record = _record(data_mode="stored")
+    events = []
+
+    class Orchestrator:
+        async def run_connection(self, connection):
+            return SyncResult.ok(connection.connection_id, "health", {"stored": 1})
+
+    client.app.state.connection_sync_orchestrator = Orchestrator()
+    monkeypatch.setattr(admin_connections.store, "get_connection", lambda *args: record)
+    monkeypatch.setattr(admin_connections, "write_event", events.append)
+
+    response = client.post("/admin/connections/conn-a/sync")
+
+    assert response.status_code == 200
+    assert any(event.event_name == "connection_sync_triggered" for event in events)
+    assert "secret" not in repr(events)

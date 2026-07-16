@@ -156,10 +156,16 @@ def configure_trusted_connectors(
 
 def _build_connection_sync_orchestrator(
     registry: ConnectorRegistry | None = None,
+    connector_resolver=None,
 ) -> SyncOrchestrator:
     return SyncOrchestrator(
         connector_registry if registry is None else registry,
         contexts=ResolverConnectionContextBuilder(),
+        connector_resolver=(
+            connector_resolver
+            if connector_resolver is not None
+            else mcp_gateway._runtime._connector_resolver
+        ),
     )
 
 
@@ -175,7 +181,8 @@ def create_app(*, gateway: ConnectionMcpGateway | None = None) -> FastAPI:
         getattr(gateway, "_runtime", None), "_registry", connector_registry
     )
     app.state.connection_sync_orchestrator = _build_connection_sync_orchestrator(
-        gateway_registry
+        gateway_registry,
+        getattr(getattr(gateway, "_runtime", None), "_connector_resolver", None),
     )
     app.state.connector_registry = gateway_registry
 

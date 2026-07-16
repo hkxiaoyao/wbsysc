@@ -7,7 +7,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass, field
 from types import MappingProxyType
-from typing import Any, Literal, Mapping, Protocol, runtime_checkable
+from typing import Any, AsyncContextManager, Literal, Mapping, Protocol, runtime_checkable
 
 from app.connections.models import ConnectionRecord
 
@@ -160,3 +160,16 @@ class Connector(Protocol):
         context: ConnectionContext,
         resource_key: str,
     ) -> SyncResult: ...
+
+
+@runtime_checkable
+class ConnectionConnectorProvider(Protocol):
+    """Resolve one immutable connector definition for an exact connection."""
+
+    connector_key: str
+
+    def spec_for(self, context: ConnectionContext) -> ConnectorSpec: ...
+
+    def connect(
+        self, context: ConnectionContext
+    ) -> AsyncContextManager[Connector]: ...

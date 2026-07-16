@@ -160,19 +160,35 @@ def unregister_connection_cache_invalidator(
         ]
 
 
-def _retired_connection_version(conn: Any, connection_id: str) -> int | None:
+def _retired_connection_version(
+    conn: Any, connection_id: str, *, for_update: bool = False
+) -> int | None:
     """Return the cached revision that was live before a mutation, if any."""
+    lock_clause = " FOR UPDATE" if for_update else ""
     value = conn.execute(
-        text("""
+        text(f"""
             SELECT config_version FROM connection_instance
             WHERE connection_id=:connection_id
-            LIMIT 1
+            LIMIT 1{lock_clause}
         """),
         {"connection_id": connection_id},
     ).scalar()
     if isinstance(value, bool) or not isinstance(value, int):
         return None
     return value
+
+
+_LEGAL_STATUS_TRANSITIONS = {
+    "draft": frozenset({"draft", "active", "disabled"}),
+    "active": frozenset({"active", "disabled", "error"}),
+    "disabled": frozenset({"disabled", "draft", "active"}),
+    "error": frozenset({"error", "draft", "active", "disabled"}),
+}
+
+
+def _assert_status_transition(current: str, target: str) -> None:
+    if target not in _LEGAL_STATUS_TRANSITIONS.get(current, frozenset()):
+        raise ValueError("illegal connection status transition")
 
 
 def _notify_connection_cache_invalidator(
@@ -326,7 +342,9 @@ def create_connection(
 
     retired_version: int | None
     with _engine().begin() as conn:
-        retired_version = _retired_connection_version(conn, record.connection_id)
+        retired_version = _retired_connection_version(
+            conn, record.connection_id, for_update=True
+        )
         conn.execute(
             text("""
                 INSERT INTO connection_instance
@@ -621,14 +639,31 @@ def publish_declarative_revision(
     spec_id: str, revision: int, tenant_id: str, connection_id: str
 ) -> Any | None:
     """Validate and publish an immutable tenant-owned draft in one transaction."""
+    retired_version: int | None = None
+    staged_config: dict[str, Any] | None = None
     with _engine().begin() as conn:
+        connection_row = conn.execute(
+            text("""
+                SELECT connection_id, tenant_id, connector_key, display_name, status,
+                       data_mode, public_config_json, config_version
+                FROM connection_instance
+                WHERE connection_id=:connection_id AND tenant_id=:tenant_id
+                LIMIT 1 FOR UPDATE
+            """),
+            {"connection_id": connection_id, "tenant_id": tenant_id},
+        ).fetchone()
+        if connection_row is None:
+            return None
+        current = _connection_from_row(connection_row)
+        if current.connector_key != "http_declarative":
+            raise ValueError("invalid declarative connection")
         row = conn.execute(
             text("""
                 SELECT spec_id, revision, tenant_id, connection_id, status, spec_json
                 FROM declarative_spec_revision
                 WHERE spec_id=:spec_id AND revision=:revision
                   AND tenant_id=:tenant_id AND connection_id=:connection_id
-                LIMIT 1
+                LIMIT 1 FOR UPDATE
             """),
             {"spec_id": spec_id, "revision": revision, "tenant_id": tenant_id, "connection_id": connection_id},
         ).fetchone()
@@ -637,6 +672,9 @@ def publish_declarative_revision(
         draft = _declarative_revision_from_row(row)
         if draft.status not in {"draft", "published"}:
             raise ValueError("stored declarative revision is invalid")
+        from app.connectors.declarative.validator import validate_revision
+
+        draft = validate_revision(draft, data_mode=current.data_mode)
         conn.execute(
             text("""
                 UPDATE declarative_spec_revision SET status='published'
@@ -645,6 +683,27 @@ def publish_declarative_revision(
             """),
             {"spec_id": spec_id, "revision": revision, "tenant_id": tenant_id, "connection_id": connection_id},
         )
+        staged_config = dict(current.public_config)
+        if current.status == "draft":
+            staged_config.update({"spec_id": spec_id, "revision": revision})
+        else:
+            staged_config.update(
+                {"pending_spec_id": spec_id, "pending_revision": revision}
+            )
+        retired_version = current.config_version
+        conn.execute(
+            text("""
+                UPDATE connection_instance SET public_config_json=:public_config_json,
+                    config_version=config_version+1
+                WHERE connection_id=:connection_id AND tenant_id=:tenant_id
+            """),
+            {
+                "public_config_json": json.dumps(staged_config, ensure_ascii=False, separators=(",", ":")),
+                "connection_id": connection_id,
+                "tenant_id": tenant_id,
+            },
+        )
+    _notify_connection_cache_invalidator(connection_id, retired_version)
     return replace(draft, status="published")
 
 
@@ -654,34 +713,43 @@ def activate_declarative_revision(
     """Activate only a published revision on its exact tenant connection."""
     retired_version: int | None = None
     with _engine().begin() as conn:
-        revision_row = conn.execute(
-            text("""
-                SELECT spec_id, revision, tenant_id, connection_id, status, spec_json
-                FROM declarative_spec_revision
-                WHERE spec_id=:spec_id AND revision=:revision
-                  AND tenant_id=:tenant_id AND connection_id=:connection_id
-                  AND status='published' LIMIT 1
-            """),
-            {"spec_id": spec_id, "revision": revision, "tenant_id": tenant_id, "connection_id": connection_id},
-        ).fetchone()
-        if revision_row is None:
-            return None
-        _declarative_revision_from_row(revision_row)
         row = conn.execute(
             text("""
                 SELECT connection_id, tenant_id, connector_key, display_name, status,
                        data_mode, public_config_json, config_version
                 FROM connection_instance
-                WHERE connection_id=:connection_id AND tenant_id=:tenant_id LIMIT 1
+                WHERE connection_id=:connection_id AND tenant_id=:tenant_id
+                LIMIT 1 FOR UPDATE
             """),
             {"connection_id": connection_id, "tenant_id": tenant_id},
         ).fetchone()
         if row is None:
             return None
         current = _connection_from_row(row)
+        if current.connector_key != "http_declarative":
+            raise ValueError("invalid declarative connection")
+        revision_row = conn.execute(
+            text("""
+                SELECT spec_id, revision, tenant_id, connection_id, status, spec_json
+                FROM declarative_spec_revision
+                WHERE spec_id=:spec_id AND revision=:revision
+                  AND tenant_id=:tenant_id AND connection_id=:connection_id
+                  AND status='published' LIMIT 1 FOR UPDATE
+            """),
+            {"spec_id": spec_id, "revision": revision, "tenant_id": tenant_id, "connection_id": connection_id},
+        ).fetchone()
+        if revision_row is None:
+            return None
+        revision_record = _declarative_revision_from_row(revision_row)
+        from app.connectors.declarative.validator import validate_revision
+
+        validate_revision(revision_record, data_mode=current.data_mode)
+        _assert_status_transition(current.status, "active")
         retired_version = current.config_version
         public_config = dict(current.public_config)
         public_config.update({"spec_id": spec_id, "revision": revision})
+        public_config.pop("pending_spec_id", None)
+        public_config.pop("pending_revision", None)
         conn.execute(
             text("""
                 UPDATE connection_instance SET public_config_json=:public_config_json,
@@ -715,7 +783,9 @@ def set_tool_policy(
     )
     retired_version: int | None
     with _engine().begin() as conn:
-        retired_version = _retired_connection_version(conn, connection_id)
+        retired_version = _retired_connection_version(
+            conn, connection_id, for_update=True
+        )
         conn.execute(
             text("""
                 INSERT INTO connection_tool_policy
@@ -760,7 +830,9 @@ def issue_token(
     )
     retired_version: int | None
     with _engine().begin() as conn:
-        retired_version = _retired_connection_version(conn, connection_id)
+        retired_version = _retired_connection_version(
+            conn, connection_id, for_update=True
+        )
         conn.execute(
             text("""
                 INSERT INTO connection_token
@@ -861,7 +933,8 @@ def update_connection(
                 SELECT connection_id, tenant_id, connector_key, display_name, status,
                        data_mode, public_config_json, config_version
                 FROM connection_instance
-                WHERE connection_id=:connection_id AND tenant_id=:tenant_id LIMIT 1
+                WHERE connection_id=:connection_id AND tenant_id=:tenant_id
+                LIMIT 1 FOR UPDATE
             """),
             {"connection_id": connection_id, "tenant_id": tenant_id},
         ).fetchone()
@@ -870,6 +943,7 @@ def update_connection(
         current = _connection_from_row(row)
         retired_version = current.config_version
         next_status = current.status if status is None else status
+        _assert_status_transition(current.status, next_status)
         conn.execute(
             text("""
                 UPDATE connection_instance SET display_name=:display_name,
@@ -901,17 +975,34 @@ def update_connection(
 
 
 def disable_connection(connection_id: str, tenant_id: str) -> ConnectionRecord | None:
-    current = get_connection(connection_id, tenant_id)
-    if current is None:
-        return None
-    return update_connection(
-        connection_id,
-        tenant_id,
-        display_name=current.display_name,
-        data_mode=current.data_mode,
-        public_config=current.public_config,
-        status="disabled",
-    )
+    retired_version: int | None = None
+    with _engine().begin() as conn:
+        row = conn.execute(
+            text("""
+                SELECT connection_id, tenant_id, connector_key, display_name, status,
+                       data_mode, public_config_json, config_version
+                FROM connection_instance
+                WHERE connection_id=:connection_id AND tenant_id=:tenant_id
+                LIMIT 1 FOR UPDATE
+            """),
+            {"connection_id": connection_id, "tenant_id": tenant_id},
+        ).fetchone()
+        if row is None:
+            return None
+        current = _connection_from_row(row)
+        _assert_status_transition(current.status, "disabled")
+        retired_version = current.config_version
+        conn.execute(
+            text("""
+                UPDATE connection_instance SET status='disabled',
+                    config_version=config_version+1
+                WHERE connection_id=:connection_id AND tenant_id=:tenant_id
+            """),
+            {"connection_id": connection_id, "tenant_id": tenant_id},
+        )
+    updated = replace(current, status="disabled", config_version=current.config_version + 1)
+    _notify_connection_cache_invalidator(connection_id, retired_version)
+    return updated
 
 
 def replace_credentials(
@@ -919,7 +1010,9 @@ def replace_credentials(
 ) -> bool:
     retired_version: int | None = None
     with _engine().begin() as conn:
-        retired_version = _retired_connection_version(conn, connection_id)
+        retired_version = _retired_connection_version(
+            conn, connection_id, for_update=True
+        )
         owner = conn.execute(
             text("SELECT tenant_id FROM connection_instance WHERE connection_id=:connection_id LIMIT 1"),
             {"connection_id": connection_id},
@@ -969,7 +1062,9 @@ def list_connection_tokens(connection_id: str) -> list[dict[str, Any]]:
 def revoke_token(connection_id: str, tenant_id: str, token_id: str) -> bool:
     retired_version: int | None = None
     with _engine().begin() as conn:
-        retired_version = _retired_connection_version(conn, connection_id)
+        retired_version = _retired_connection_version(
+            conn, connection_id, for_update=True
+        )
         result = conn.execute(
             text("""
                 UPDATE connection_token t JOIN connection_instance c
@@ -995,7 +1090,9 @@ def rotate_token(
     issued = IssuedToken(str(uuid.uuid4()), raw_value, digest[:12])
     retired_version: int | None = None
     with _engine().begin() as conn:
-        retired_version = _retired_connection_version(conn, connection_id)
+        retired_version = _retired_connection_version(
+            conn, connection_id, for_update=True
+        )
         owner = conn.execute(
             text("SELECT tenant_id FROM connection_instance WHERE connection_id=:connection_id LIMIT 1"),
             {"connection_id": connection_id},
@@ -1032,7 +1129,9 @@ def replace_tool_policies(
 ) -> bool:
     retired_version: int | None = None
     with _engine().begin() as conn:
-        retired_version = _retired_connection_version(conn, connection_id)
+        retired_version = _retired_connection_version(
+            conn, connection_id, for_update=True
+        )
         owner = conn.execute(text("SELECT tenant_id FROM connection_instance WHERE connection_id=:connection_id LIMIT 1"), {"connection_id": connection_id}).scalar()
         if owner != tenant_id:
             return False

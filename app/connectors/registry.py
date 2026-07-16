@@ -12,6 +12,7 @@ from .contracts import Connector, ConnectorSpec, ToolSpec
 
 
 _CONNECTOR_KEY_PATTERN = re.compile(r"^[a-z][a-z0-9_-]{0,63}$")
+_RESERVED_CONNECTOR_KEYS = frozenset({"http_declarative"})
 _MANIFEST_VERSION_PATTERN = re.compile(
     r"^[0-9]+(?:\.[0-9]+){0,2}(?:[-+][A-Za-z0-9][A-Za-z0-9.-]*)?$"
 )
@@ -258,6 +259,8 @@ class ConnectorRegistry:
         tool_identities: Mapping[str, str],
     ) -> set[str]:
         connector_key = spec.connector_key
+        if connector_key in _RESERVED_CONNECTOR_KEYS:
+            raise ValueError(f"reserved connector_key: {connector_key}")
         if connector_key in connectors:
             raise ValueError(f"duplicate connector_key: {connector_key}")
         candidate_identities = {

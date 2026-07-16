@@ -111,6 +111,17 @@ def test_import_compiles_only_declared_operations_and_output_fields() -> None:
         operation.build_request({"user_id": "u1", "url": "https://metadata.example"})
 
 
+def test_import_accepts_numeric_leading_connection_scope_ids() -> None:
+    revision = import_openapi_revision(
+        _document(),
+        tenant_id="1-tenant",
+        connection_id="300c3c6d-0b50-48cc-9f36-62734528c8f9",
+    )
+
+    assert revision.tenant_id == "1-tenant"
+    assert revision.connection_id == "300c3c6d-0b50-48cc-9f36-62734528c8f9"
+
+
 def test_import_rejects_script_like_mapping() -> None:
     with pytest.raises(SpecValidationError, match="expressions are not supported"):
         validate_revision({"x-template": "${__import__('os').system('id')}"})

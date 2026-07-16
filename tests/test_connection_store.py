@@ -1,9 +1,11 @@
 from dataclasses import FrozenInstanceError
+import json
 
 import pytest
 
 from app import db
 from app.connections import store
+from app.connectors.declarative.validator import import_openapi_revision
 
 
 class Result:
@@ -68,6 +70,176 @@ class FakeEngine:
 
     def connect(self):
         return self.connection
+
+
+class LockedMutationConnection(FakeConnection):
+    def execute(self, statement, params=None):
+        params = params or {}
+        sql = str(statement)
+        self.statements.append((sql, params))
+        if "SELECT connection_id, tenant_id, connector_key" in sql:
+            return Result(
+                {
+                    "connection_id": "conn-a",
+                    "tenant_id": "tenant-a",
+                    "connector_key": "wecom",
+                    "display_name": "WeCom",
+                    "status": "active",
+                    "data_mode": "stored",
+                    "public_config_json": "{}",
+                    "config_version": 7,
+                }
+            )
+        return Result()
+
+
+def test_update_connection_locks_row_and_rejects_illegal_status_transition(monkeypatch):
+    connection = LockedMutationConnection()
+    monkeypatch.setattr(db, "get_engine", lambda: FakeEngine(connection))
+
+    with pytest.raises(ValueError, match="status transition"):
+        store.update_connection(
+            "conn-a",
+            "tenant-a",
+            display_name="WeCom",
+            data_mode="stored",
+            public_config={},
+            status="draft",
+        )
+
+    selects = [sql for sql, _ in connection.statements if sql.lstrip().startswith("SELECT")]
+    assert any("FOR UPDATE" in sql for sql in selects)
+    assert not any(sql.lstrip().startswith("UPDATE") for sql, _ in connection.statements)
+
+
+def test_replacement_mutations_lock_connection_version_before_writes(monkeypatch):
+    from app.connections.models import ToolPolicy
+
+    class VersionLockConnection(FakeConnection):
+        def execute(self, statement, params=None):
+            params = params or {}
+            sql = str(statement)
+            self.statements.append((sql, params))
+            if "SELECT config_version" in sql:
+                return Result(scalar_value=7)
+            if "SELECT tenant_id" in sql:
+                return Result(scalar_value="tenant-a")
+            return Result()
+
+    monkeypatch.setattr(store, "encrypt_credential", lambda _value: b"ciphertext")
+    monkeypatch.setattr(store, "token_hmac", lambda _value: "a" * 64)
+    calls = (
+        lambda: store.replace_credentials(
+            "conn-a", "tenant-a", {"app_secret": "plain-secret"}
+        ),
+        lambda: store.rotate_token("conn-a", "tenant-a"),
+        lambda: store.replace_tool_policies(
+            "conn-a",
+            "tenant-a",
+            [ToolPolicy("conn-a", "reports.list", True, {})],
+        ),
+    )
+
+    for call in calls:
+        connection = VersionLockConnection()
+        monkeypatch.setattr(db, "get_engine", lambda: FakeEngine(connection))
+
+        assert call()
+        first_sql, _ = connection.statements[0]
+        assert "SELECT config_version" in first_sql
+        assert "FOR UPDATE" in first_sql
+        assert "plain-secret" not in repr(connection.statements)
+
+
+def test_publish_locks_scope_revalidates_and_invalidates_committed_version(monkeypatch):
+    revision = import_openapi_revision(
+        {
+            "openapi": "3.0.3",
+            "servers": [{"url": "https://api.example.com"}],
+            "paths": {
+                "/health": {
+                    "get": {
+                        "operationId": "health.get",
+                        "responses": {
+                            "200": {
+                                "description": "ok",
+                                "content": {
+                                    "application/json": {
+                                        "schema": {
+                                            "type": "object",
+                                            "properties": {"ok": {"type": "boolean"}},
+                                        }
+                                    }
+                                },
+                            }
+                        },
+                    }
+                }
+            },
+        },
+        spec_id="spec-a",
+        revision=1,
+        tenant_id="tenant-a",
+        connection_id="conn-a",
+    )
+
+    class PublishConnection(MutationConnection):
+        def execute(self, statement, params=None):
+            params = params or {}
+            sql = str(statement)
+            self.statements.append((sql, params))
+            if "FROM connection_instance" in sql and "SELECT connection_id" in sql:
+                return Result(
+                    {
+                        "connection_id": "conn-a",
+                        "tenant_id": "tenant-a",
+                        "connector_key": "http_declarative",
+                        "display_name": "API",
+                        "status": "draft",
+                        "data_mode": "direct",
+                        "public_config_json": "{}",
+                        "config_version": 4,
+                    }
+                )
+            if "FROM declarative_spec_revision" in sql:
+                return Result(
+                    {
+                        "spec_id": "spec-a",
+                        "revision": 1,
+                        "tenant_id": "tenant-a",
+                        "connection_id": "conn-a",
+                        "status": "draft",
+                        "spec_json": json.dumps(revision.storage_document()),
+                    }
+                )
+            return Result()
+
+    connection = PublishConnection()
+    events = []
+    monkeypatch.setattr(db, "get_engine", lambda: FakeEngine(connection))
+    def invalidator(cid, version):
+        events.append((cid, version, connection.commit_succeeded))
+    store.register_connection_cache_invalidator(invalidator)
+    try:
+        published = store.publish_declarative_revision(
+            "spec-a", 1, "tenant-a", "conn-a"
+        )
+    finally:
+        store.unregister_connection_cache_invalidator(invalidator)
+
+    assert published.status == "published"
+    locked = [sql for sql, _ in connection.statements if sql.lstrip().startswith("SELECT")]
+    assert len(locked) == 2 and all("FOR UPDATE" in sql for sql in locked)
+    config_update = next(
+        params
+        for sql, params in connection.statements
+        if "UPDATE connection_instance SET public_config_json" in sql
+    )
+    assert json.loads(config_update["public_config_json"]) == {
+        "spec_id": "spec-a",
+        "revision": 1,
+    }
+    assert events == [("conn-a", 4, True)]
 
 
 class LegacyBackfillConnection(FakeConnection):

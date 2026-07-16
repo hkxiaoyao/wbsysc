@@ -6,15 +6,18 @@ import logging
 import re
 import uuid
 from collections.abc import Mapping
+from dataclasses import replace
 from typing import Any, Literal
 
 from fastapi import APIRouter, Depends, HTTPException, Request
 from pydantic import BaseModel, ConfigDict, Field
 
 from . import admin
+from .auth import ConnectionCtx
 from .connections import store
 from .connections.models import ConnectionRecord, ToolPolicy
-from .connectors.contracts import ConnectorSpec
+from .connectors.contracts import ConnectionContext, ConnectorSpec
+from .connectors.declarative.provider import DECLARATIVE_CONNECTOR_KEY
 from .connectors.declarative.models import SpecValidationError
 from .connectors.declarative.validator import import_openapi_revision, validate_revision
 from .mcp_audit import write_event
@@ -98,6 +101,67 @@ def _spec(request: Request, connector_key: str) -> ConnectorSpec:
     if not isinstance(spec, ConnectorSpec):
         raise HTTPException(422, "invalid connector configuration")
     return spec
+
+
+def _spec_for_record(request: Request, record: ConnectionRecord) -> ConnectorSpec:
+    if record.connector_key != DECLARATIVE_CONNECTOR_KEY:
+        return _spec(request, record.connector_key)
+    try:
+        runtime = request.app.state.mcp_gateway._runtime
+        spec = runtime._connector_resolver.spec_for(
+            ConnectionContext(connection=record)
+        )
+    except Exception:
+        raise HTTPException(409, "declarative revision is unavailable") from None
+    if not isinstance(spec, ConnectorSpec):
+        raise HTTPException(409, "declarative revision is unavailable")
+    return spec
+
+
+def _declarative_candidate_spec(
+    request: Request,
+    record: ConnectionRecord,
+    spec_id: str,
+    revision: int,
+) -> ConnectorSpec:
+    candidate_config = dict(record.public_config)
+    candidate_config.update({"spec_id": spec_id, "revision": revision})
+    candidate = replace(record, public_config=candidate_config)
+    return _spec_for_record(request, candidate)
+
+
+def _credential_spec_for_record(
+    request: Request, record: ConnectionRecord
+) -> ConnectorSpec:
+    if record.connector_key == DECLARATIVE_CONNECTOR_KEY:
+        spec_id = record.public_config.get("pending_spec_id")
+        revision = record.public_config.get("pending_revision")
+        if isinstance(spec_id, str) and isinstance(revision, int) and not isinstance(
+            revision, bool
+        ):
+            return _declarative_candidate_spec(
+                request, record, spec_id, revision
+            )
+    return _spec_for_record(request, record)
+
+
+def _load_connection_credentials(
+    request: Request, record: ConnectionRecord
+) -> dict[str, Any]:
+    try:
+        context = request.app.state.mcp_gateway.resolver.execution_context(
+            ConnectionCtx(
+                tenant_id=record.tenant_id,
+                connection_id=record.connection_id,
+                connector_key=record.connector_key,
+                data_mode=record.data_mode,
+                public_config=record.public_config,
+                config_version=record.config_version,
+            )
+        )
+        return dict(context.credentials)
+    except Exception:
+        raise HTTPException(409, "connection credentials unavailable") from None
 
 
 def _schema_error() -> None:
@@ -187,24 +251,50 @@ def _is_sensitive(name: str, schema: Mapping[str, Any] | None = None) -> bool:
 
 
 def _safe_config(value: Any, schema: Mapping[str, Any]) -> Any:
-    if not isinstance(value, Mapping):
+    """Project only fields explicitly covered by a non-sensitive schema."""
+    if not isinstance(value, Mapping) or not isinstance(schema, Mapping):
         return None
-    properties = schema.get("properties", {}) if isinstance(schema, Mapping) else {}
-    projected: dict[str, Any] = {}
-    for key, item in value.items():
-        child = properties.get(key, {}) if isinstance(properties, Mapping) else {}
-        if _is_sensitive(str(key), child if isinstance(child, Mapping) else None):
-            continue
-        if isinstance(item, Mapping):
-            projected[key] = _safe_config(item, child if isinstance(child, Mapping) else {})
-        elif isinstance(item, list):
-            projected[key] = [
-                _safe_config(part, {}) if isinstance(part, Mapping) else part
-                for part in item
+
+    def project(item: Any, declaration: Mapping[str, Any], name: str = "") -> Any:
+        if name and _is_sensitive(name, declaration):
+            return _OMIT
+        expected = declaration.get("type")
+        if expected == "object" or isinstance(item, Mapping):
+            if not isinstance(item, Mapping):
+                return _OMIT
+            properties = declaration.get("properties", {})
+            if not isinstance(properties, Mapping):
+                return _OMIT
+            additional = declaration.get("additionalProperties", False)
+            result: dict[str, Any] = {}
+            for key, child_value in item.items():
+                child_schema = properties.get(key)
+                if not isinstance(child_schema, Mapping):
+                    child_schema = additional if isinstance(additional, Mapping) else None
+                if not isinstance(child_schema, Mapping):
+                    continue
+                child = project(child_value, child_schema, str(key))
+                if child is not _OMIT:
+                    result[str(key)] = child
+            return result
+        if expected == "array" or isinstance(item, list):
+            if not isinstance(item, list):
+                return _OMIT
+            child_schema = declaration.get("items")
+            if not isinstance(child_schema, Mapping):
+                return []
+            return [
+                child
+                for value in item
+                if (child := project(value, child_schema)) is not _OMIT
             ]
-        else:
-            projected[key] = item
-    return projected
+        return item
+
+    projected = project(value, schema)
+    return {} if projected is _OMIT else projected
+
+
+_OMIT = object()
 
 
 def _safe_connection(record: ConnectionRecord, spec: ConnectorSpec) -> dict[str, Any]:
@@ -220,11 +310,36 @@ def _safe_connection(record: ConnectionRecord, spec: ConnectorSpec) -> dict[str,
     }
 
 
+def _safe_connection_for_request(request: Request, record: ConnectionRecord) -> dict[str, Any]:
+    if record.connector_key == DECLARATIVE_CONNECTOR_KEY:
+        try:
+            spec = _spec_for_record(request, record)
+        except HTTPException:
+            return {
+                "connection_id": record.connection_id,
+                "tenant_id": record.tenant_id,
+                "connector_key": record.connector_key,
+                "display_name": record.display_name,
+                "status": record.status,
+                "data_mode": record.data_mode,
+                "public_config": {},
+                "config_version": record.config_version,
+            }
+    else:
+        spec = _spec(request, record.connector_key)
+    return _safe_connection(record, spec)
+
+
 def _owned(tenant_id: str, connection_id: str) -> ConnectionRecord:
     record = store.get_connection(connection_id, tenant_id)
     if record is None:
         raise HTTPException(404, "connection not found")
     return record
+
+
+def _require_declarative(record: ConnectionRecord) -> None:
+    if record.connector_key != DECLARATIVE_CONNECTOR_KEY:
+        raise HTTPException(422, "invalid declarative connection")
 
 
 def _audit(record: ConnectionRecord, event_name: str, *, status: str = "ok") -> None:
@@ -260,20 +375,25 @@ def _mutate(operation, *args, **kwargs):
 def list_connections(tenant_id: str, request: Request):
     items = []
     for record in store.list_connections(tenant_id):
-        items.append(_safe_connection(record, _spec(request, record.connector_key)))
+        items.append(_safe_connection_for_request(request, record))
     return {"items": items}
 
 
 @router.post("/tenants/{tenant_id}/connections", status_code=201)
 def create_connection(tenant_id: str, body: ConnectionCreateRequest, request: Request):
-    spec = _spec(request, body.connector_key)
-    if body.data_mode not in spec.supports_data_modes:
-        _schema_error()
     if not isinstance(body.public_config, Mapping):
         _schema_error()
     credentials = _credentials(body.credentials)
-    _validate_schema(body.public_config, spec.config_schema)
-    _validate_schema(credentials, spec.credential_schema)
+    if body.connector_key == DECLARATIVE_CONNECTOR_KEY:
+        if body.status != "draft" or body.public_config or credentials:
+            _schema_error()
+        spec = None
+    else:
+        spec = _spec(request, body.connector_key)
+        if body.data_mode not in spec.supports_data_modes:
+            _schema_error()
+        _validate_schema(body.public_config, spec.config_schema)
+        _validate_schema(credentials, spec.credential_schema)
     record = ConnectionRecord(
         connection_id=str(uuid.uuid4()),
         tenant_id=tenant_id,
@@ -291,7 +411,11 @@ def create_connection(tenant_id: str, body: ConnectionCreateRequest, request: Re
         raise HTTPException(400, "connection mutation failed") from None
     _audit(created, "connection_created")
     return {
-        "connection": _safe_connection(created, spec),
+        "connection": (
+            _safe_connection(created, spec)
+            if spec is not None
+            else _safe_connection_for_request(request, created)
+        ),
         "initial_token": issued.raw_value,
         "token_prefix": issued.prefix,
     }
@@ -301,7 +425,7 @@ def create_connection(tenant_id: str, body: ConnectionCreateRequest, request: Re
 def get_connection(tenant_id: str, connection_id: str, request: Request):
     record = _owned(tenant_id, connection_id)
     return {
-        "connection": _safe_connection(record, _spec(request, record.connector_key)),
+        "connection": _safe_connection_for_request(request, record),
         "tokens": store.list_connection_tokens(connection_id),
     }
 
@@ -324,7 +448,13 @@ def _global_owner(connection_id: str) -> ConnectionRecord:
 @router.put("/tenants/{tenant_id}/connections/{connection_id}")
 def update_connection(tenant_id: str, connection_id: str, body: ConnectionUpdateRequest, request: Request):
     current = _owned(tenant_id, connection_id)
-    spec = _spec(request, current.connector_key)
+    if current.connector_key == DECLARATIVE_CONNECTOR_KEY:
+        if dict(body.public_config) != current.public_config:
+            _schema_error()
+        candidate = replace(current, data_mode=body.data_mode)
+        spec = _spec_for_record(request, candidate)
+    else:
+        spec = _spec(request, current.connector_key)
     if body.data_mode not in spec.supports_data_modes or not isinstance(body.public_config, Mapping):
         _schema_error()
     _validate_schema(body.public_config, spec.config_schema)
@@ -339,7 +469,7 @@ def update_connection(tenant_id: str, connection_id: str, body: ConnectionUpdate
     if updated is None:
         raise HTTPException(404, "connection not found")
     _audit(updated, "connection_updated")
-    return {"connection": _safe_connection(updated, spec)}
+    return {"connection": _safe_connection_for_request(request, updated)}
 
 
 @router.put("/connections/{connection_id}")
@@ -354,7 +484,7 @@ def disable_connection(tenant_id: str, connection_id: str, request: Request):
     if record is None:
         raise HTTPException(404, "connection not found")
     _audit(record, "connection_disabled")
-    return {"connection": _safe_connection(record, _spec(request, record.connector_key))}
+    return {"connection": _safe_connection_for_request(request, record)}
 
 
 @router.post("/connections/{connection_id}/disable")
@@ -370,7 +500,9 @@ def disable_connection_global(connection_id: str, request: Request):
 def replace_connection_credentials(tenant_id: str, connection_id: str, body: CredentialReplaceRequest, request: Request):
     record = _owned(tenant_id, connection_id)
     values = _credentials(body.credentials)
-    _validate_schema(values, _spec(request, record.connector_key).credential_schema)
+    _validate_schema(
+        values, _credential_spec_for_record(request, record).credential_schema
+    )
     if not _mutate(store.replace_credentials, connection_id, tenant_id, values):
         raise HTTPException(404, "connection not found")
     _audit(record, "connection_credentials_replaced")
@@ -428,7 +560,7 @@ def revoke_connection_token_global(connection_id: str, token_id: str, request: R
 @router.get("/tenants/{tenant_id}/connections/{connection_id}/tools")
 def list_connection_tools(tenant_id: str, connection_id: str, request: Request):
     record = _owned(tenant_id, connection_id)
-    spec = _spec(request, record.connector_key)
+    spec = _spec_for_record(request, record)
     configured = {item.tool_name: item for item in store.list_tool_policies(connection_id)}
     return {"items": [{
         "tool_key": tool.tool_key,
@@ -447,7 +579,7 @@ def list_connection_tools_global(connection_id: str, request: Request):
 @router.put("/tenants/{tenant_id}/connections/{connection_id}/tools")
 def update_connection_tools(tenant_id: str, connection_id: str, body: ToolPoliciesRequest, request: Request):
     record = _owned(tenant_id, connection_id)
-    spec = _spec(request, record.connector_key)
+    spec = _spec_for_record(request, record)
     declared = {tool.tool_key: tool for tool in spec.tools}
     policies: list[ToolPolicy] = []
     seen = set()
@@ -476,16 +608,51 @@ def update_connection_tools_global(connection_id: str, body: ToolPoliciesRequest
 
 
 @router.post("/tenants/{tenant_id}/connections/{connection_id}/test")
-def test_connection(tenant_id: str, connection_id: str, request: Request):
+async def test_connection(tenant_id: str, connection_id: str, request: Request):
     record = _owned(tenant_id, connection_id)
-    _spec(request, record.connector_key)
+    if record.status != "active":
+        raise HTTPException(409, "connection test is unsupported")
+    gateway = getattr(request.app.state, "mcp_gateway", None)
+    try:
+        execution_context = gateway.resolver.execution_context(
+            ConnectionCtx(
+                tenant_id=record.tenant_id,
+                connection_id=record.connection_id,
+                connector_key=record.connector_key,
+                data_mode=record.data_mode,
+                public_config=record.public_config,
+                config_version=record.config_version,
+            )
+        )
+        tools = gateway._runtime.list_enabled_tools(execution_context)
+        tool = next(
+            (
+                candidate
+                for candidate in tools
+                if candidate.operation_kind == "read"
+                and not candidate.input_schema.get("required")
+            ),
+            None,
+        )
+        if tool is None:
+            raise HTTPException(409, "connection test is unsupported")
+        result = await gateway._runtime.execute(execution_context, tool.tool_key, {})
+    except HTTPException:
+        raise
+    except Exception as exc:
+        logger.warning("Connection test failed type=%s", type(exc).__name__)
+        _audit(record, "connection_tested", status="error")
+        raise HTTPException(502, "connection test failed") from None
+    if getattr(result, "status", "error") != "ok":
+        _audit(record, "connection_tested", status="error")
+        raise HTTPException(502, "connection test failed")
     _audit(record, "connection_tested")
-    return {"ok": True, "status": "validated"}
+    return {"ok": True, "status": "ok"}
 
 
 @router.post("/connections/{connection_id}/test")
-def test_connection_global(connection_id: str, request: Request):
-    return test_connection(_global_owner(connection_id).tenant_id, connection_id, request)
+async def test_connection_global(connection_id: str, request: Request):
+    return await test_connection(_global_owner(connection_id).tenant_id, connection_id, request)
 
 
 @router.post("/tenants/{tenant_id}/connections/{connection_id}/sync")
@@ -498,6 +665,11 @@ async def sync_connection(tenant_id: str, connection_id: str, request: Request):
         result = await result
     if result is None:
         raise HTTPException(409, "connection is not eligible for sync")
+    _audit(
+        record,
+        "connection_sync_triggered",
+        status="error" if result.status == "error" else "ok",
+    )
     return {"ok": result.status != "error", "status": result.status}
 
 
@@ -509,6 +681,7 @@ async def sync_connection_global(connection_id: str, request: Request):
 @router.post("/tenants/{tenant_id}/connections/{connection_id}/specs/import", status_code=201)
 def import_connection_spec(tenant_id: str, connection_id: str, body: OpenApiImportRequest, request: Request):
     record = _owned(tenant_id, connection_id)
+    _require_declarative(record)
     try:
         revision = import_openapi_revision(
             body.document,
@@ -522,7 +695,8 @@ def import_connection_spec(tenant_id: str, connection_id: str, body: OpenApiImpo
         )
         validate_revision(revision, data_mode=record.data_mode)
         store.save_declarative_revision(revision)
-    except (SpecValidationError, ValueError, TypeError):
+    except (SpecValidationError, ValueError, TypeError) as exc:
+        logger.warning("Declarative import rejected type=%s", type(exc).__name__)
         raise HTTPException(422, "invalid declarative specification") from None
     _audit(record, "declarative_spec_imported")
     return {"spec_id": revision.spec_id, "revision": revision.revision, "status": revision.status}
@@ -542,6 +716,7 @@ def validate_connection_spec(
     request: Request,
 ):
     record = _owned(tenant_id, connection_id)
+    _require_declarative(record)
     stored = store.get_declarative_revision(spec_id, revision, tenant_id, connection_id)
     if stored is None:
         raise HTTPException(404, "revision not found")
@@ -566,6 +741,7 @@ def publish_connection_spec(
     request: Request,
 ):
     record = _owned(tenant_id, connection_id)
+    _require_declarative(record)
     try:
         published = store.publish_declarative_revision(spec_id, revision, tenant_id, connection_id)
     except (SpecValidationError, ValueError, TypeError):
@@ -590,6 +766,14 @@ def activate_connection_spec(
     request: Request,
 ):
     current = _owned(tenant_id, connection_id)
+    _require_declarative(current)
+    spec = _declarative_candidate_spec(
+        request, current, spec_id, revision
+    )
+    _validate_schema(
+        _load_connection_credentials(request, current),
+        spec.credential_schema,
+    )
     try:
         activated = store.activate_declarative_revision(spec_id, revision, tenant_id, connection_id)
     except (SpecValidationError, ValueError, TypeError):
@@ -597,7 +781,7 @@ def activate_connection_spec(
     if activated is None:
         raise HTTPException(404, "revision not found")
     _audit(activated, "declarative_spec_activated")
-    return {"connection": _safe_connection(activated, _spec(request, current.connector_key))}
+    return {"connection": _safe_connection_for_request(request, activated)}
 
 
 @router.post("/connections/{connection_id}/specs/{spec_id}/revisions/{revision}/activate")

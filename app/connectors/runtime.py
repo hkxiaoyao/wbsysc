@@ -8,12 +8,14 @@ import threading
 import time
 from collections import deque
 from collections.abc import Awaitable, Callable, Mapping
+from contextlib import asynccontextmanager
 from dataclasses import dataclass
 from typing import Any, Literal, Protocol
 
 from app.connections.models import ToolPolicy
 
 from .contracts import (
+    ConnectionConnectorProvider,
     ConnectionContext,
     ConnectionUnavailableError,
     Connector,
@@ -268,6 +270,47 @@ class ExecutionPlanner:
 AuditSink = Callable[[ConnectorAuditEvent], Any]
 
 
+class ConnectionConnectorResolver:
+    """Resolve static registry snapshots or the reserved dynamic provider."""
+
+    def __init__(
+        self,
+        registry: ConnectorRegistry,
+        *,
+        declarative_provider: ConnectionConnectorProvider | None = None,
+    ) -> None:
+        self._registry = registry
+        self._declarative_provider = declarative_provider
+
+    def spec_for(self, context: ConnectionContext):
+        provider = self._provider_for(context)
+        if provider is not None:
+            return provider.spec_for(context)
+        spec = self._registry.validated_spec(context.connector_key)
+        if spec is None:
+            raise KeyError(f"unknown connector_key: {context.connector_key}")
+        return spec
+
+    @asynccontextmanager
+    async def connect(self, context: ConnectionContext):
+        provider = self._provider_for(context)
+        if provider is not None:
+            async with provider.connect(context) as connector:
+                yield connector
+            return
+        yield self._registry.get(context.connector_key)
+
+    def _provider_for(
+        self, context: ConnectionContext
+    ) -> ConnectionConnectorProvider | None:
+        if context.connector_key != "http_declarative":
+            return None
+        provider = self._declarative_provider
+        if provider is None or provider.connector_key != context.connector_key:
+            raise KeyError("declarative connector provider unavailable")
+        return provider
+
+
 class ConnectorRuntime:
     def __init__(
         self,
@@ -281,6 +324,7 @@ class ConnectorRuntime:
         rate_limiter: SlidingWindowRateLimiter | None = None,
         audit_sink: AuditSink | None = None,
         clock: Callable[[], float] = time.monotonic,
+        connector_resolver: ConnectionConnectorResolver | None = None,
     ) -> None:
         self._registry = registry
         self._policy_store = policy_store
@@ -289,13 +333,14 @@ class ConnectorRuntime:
         self._rate_limiter = rate_limiter or SlidingWindowRateLimiter(clock)
         self._audit_sink = audit_sink
         self._clock = clock
+        self._connector_resolver = connector_resolver or ConnectionConnectorResolver(
+            registry
+        )
 
     def list_enabled_tools(self, context: ConnectionContext) -> tuple[ToolSpec, ...]:
         if context.connection.status != "active":
             return ()
-        spec = self._registry.validated_spec(context.connection.connector_key)
-        if spec is None:
-            raise KeyError(f"unknown connector_key: {context.connection.connector_key}")
+        spec = self._connector_resolver.spec_for(context)
         enabled_tools = []
         for tool in spec.tools:
             policy = self._policy_for(context, tool)
@@ -317,9 +362,7 @@ class ConnectorRuntime:
         if context.connection.status != "active":
             raise ConnectionUnavailableError("connection is unavailable")
 
-        spec = self._registry.validated_spec(context.connection.connector_key)
-        if spec is None:
-            raise KeyError(f"unknown connector_key: {context.connection.connector_key}")
+        spec = self._connector_resolver.spec_for(context)
         tool = spec.tool(tool_key)
         policy = self._policy_for(context, tool)
         try:
@@ -406,13 +449,11 @@ class ConnectorRuntime:
         tool: ToolSpec,
         args: dict[str, Any],
     ) -> ExecutionResult:
-        connector = self._registry.get(context.connection.connector_key)
-        spec = self._registry.validated_spec(context.connection.connector_key)
-        if spec is None:
-            raise KeyError(f"unknown connector_key: {context.connection.connector_key}")
+        spec = self._connector_resolver.spec_for(context)
         if context.data_mode not in spec.supports_data_modes:
             raise UnsupportedDataModeError("connection data mode is not supported")
-        return await self._planner.execute(context, connector, tool, args)
+        async with self._connector_resolver.connect(context) as connector:
+            return await self._planner.execute(context, connector, tool, args)
 
     def _policy_for(
         self,

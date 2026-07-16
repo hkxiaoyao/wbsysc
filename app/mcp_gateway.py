@@ -33,7 +33,12 @@ from .connectors import (
     ConnectorRegistry,
     ConnectorRuntime,
 )
-from .connectors.runtime import ConnectorAuditEvent, ToolPolicyStore
+from .connectors.declarative.provider import DeclarativeConnectorProvider
+from .connectors.runtime import (
+    ConnectionConnectorResolver,
+    ConnectorAuditEvent,
+    ToolPolicyStore,
+)
 from .connectors.wecom import WeComConnector
 from .mcp_audit import current_request_metadata, safe_summary, write_event
 from .mcp_log_models import McpLogEvent
@@ -309,6 +314,10 @@ class ConnectionMcpGateway:
             registry,
             policy_store=_DatabaseToolPolicyStore(),
             audit_sink=self._write_runtime_audit,
+            connector_resolver=ConnectionConnectorResolver(
+                registry,
+                declarative_provider=DeclarativeConnectorProvider(),
+            ),
         )
 
     @contextlib.asynccontextmanager

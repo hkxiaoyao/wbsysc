@@ -17,6 +17,7 @@ from sqlalchemy import text
 from .models import ConnectionRecord, SyncState as ConnectionSyncState
 from ..connectors.contracts import ConnectionContext, SyncResult
 from ..connectors.registry import ConnectorRegistry
+from ..connectors.runtime import ConnectionConnectorResolver
 from ..mcp_log_models import McpLogEvent
 
 
@@ -242,6 +243,7 @@ class SyncOrchestrator:
             [], Iterable[ConnectionRecord]
         ] = list_syncable_connections,
         event_writer: Callable[[McpLogEvent], Any] | None = None,
+        connector_resolver: ConnectionConnectorResolver | None = None,
     ) -> None:
         if not isinstance(registry, ConnectorRegistry):
             raise TypeError("registry must be a ConnectorRegistry")
@@ -251,6 +253,9 @@ class SyncOrchestrator:
         self._contexts = contexts
         self._connection_lister = connection_lister
         self._event_writer = event_writer or _default_event_writer
+        self._connector_resolver = connector_resolver or ConnectionConnectorResolver(
+            registry
+        )
         self._locks = _ConnectionLocks()
 
     async def run_connection(
@@ -268,9 +273,10 @@ class SyncOrchestrator:
         resource = _safe_resource_key(resource_key)
         async with self._locks.acquire(connection.connection_id):
             try:
-                connector = self._registry.get(connection.connector_key)
-                spec = self._registry.validated_spec(connection.connector_key)
-                if spec is None or spec.supports_sync is not True:
+                spec = self._connector_resolver.spec_for(
+                    ConnectionContext(connection=connection)
+                )
+                if spec.supports_sync is not True:
                     return None
                 context = self._contexts.build(connection)
                 if inspect.isawaitable(context):
@@ -281,12 +287,13 @@ class SyncOrchestrator:
                     )
                 if context.connection.connection_id != connection.connection_id:
                     raise ValueError("connection context scope does not match")
-                result = connector.sync(context, resource)
-                if not inspect.isawaitable(result):
-                    raise TypeError(
-                        "connector sync must return an awaitable SyncResult"
-                    )
-                result = await result
+                async with self._connector_resolver.connect(context) as connector:
+                    result = connector.sync(context, resource)
+                    if not inspect.isawaitable(result):
+                        raise TypeError(
+                            "connector sync must return an awaitable SyncResult"
+                        )
+                    result = await result
                 if not isinstance(result, SyncResult):
                     raise TypeError("connector sync returned an invalid result")
                 if (
