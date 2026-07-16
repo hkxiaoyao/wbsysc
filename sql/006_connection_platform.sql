@@ -66,7 +66,7 @@ CREATE TABLE IF NOT EXISTS `declarative_spec_revision` (
   `tenant_id` VARCHAR(64) NOT NULL,
   `connection_id` VARCHAR(64) NOT NULL,
   `status` VARCHAR(16) NOT NULL DEFAULT 'draft',
-  `spec_json` TEXT NOT NULL,
+  `spec_json` MEDIUMTEXT NOT NULL,
   `created_at` DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
   PRIMARY KEY (`spec_id`, `revision`),
   KEY `idx_declarative_spec_tenant` (`tenant_id`, `connection_id`, `status`)
@@ -78,10 +78,48 @@ CREATE TABLE IF NOT EXISTS `declarative_spec_operation` (
   `revision` INT NOT NULL,
   `connection_id` VARCHAR(64) NOT NULL,
   `operation_key` VARCHAR(128) NOT NULL,
-  `operation_json` TEXT NOT NULL,
+  `operation_json` MEDIUMTEXT NOT NULL,
   `created_at` DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
   `updated_at` DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
   PRIMARY KEY (`operation_id`),
   UNIQUE KEY `uk_declarative_spec_operation` (`spec_id`, `revision`, `operation_key`),
   KEY `idx_declarative_operation_connection` (`connection_id`)
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
+
+-- CREATE TABLE IF NOT EXISTS does not widen columns on an existing install.
+-- MySQL 5.7 has no ALTER ... IF EXISTS/IF NOT EXISTS for column types, so use
+-- information_schema plus prepared DDL to make the TEXT -> MEDIUMTEXT upgrade
+-- repeatable without rebuilding an already-upgraded table on every deploy.
+SET @spec_json_type := (
+  SELECT LOWER(`DATA_TYPE`)
+  FROM information_schema.columns
+  WHERE `TABLE_SCHEMA` = DATABASE()
+    AND `TABLE_NAME` = 'declarative_spec_revision'
+    AND `COLUMN_NAME` = 'spec_json'
+  LIMIT 1
+);
+SET @spec_json_ddl := IF(
+  @spec_json_type = 'mediumtext',
+  'SELECT 1',
+  'ALTER TABLE `declarative_spec_revision` MODIFY COLUMN `spec_json` MEDIUMTEXT NOT NULL'
+);
+PREPARE spec_json_migration FROM @spec_json_ddl;
+EXECUTE spec_json_migration;
+DEALLOCATE PREPARE spec_json_migration;
+
+SET @operation_json_type := (
+  SELECT LOWER(`DATA_TYPE`)
+  FROM information_schema.columns
+  WHERE `TABLE_SCHEMA` = DATABASE()
+    AND `TABLE_NAME` = 'declarative_spec_operation'
+    AND `COLUMN_NAME` = 'operation_json'
+  LIMIT 1
+);
+SET @operation_json_ddl := IF(
+  @operation_json_type = 'mediumtext',
+  'SELECT 1',
+  'ALTER TABLE `declarative_spec_operation` MODIFY COLUMN `operation_json` MEDIUMTEXT NOT NULL'
+);
+PREPARE operation_json_migration FROM @operation_json_ddl;
+EXECUTE operation_json_migration;
+DEALLOCATE PREPARE operation_json_migration;

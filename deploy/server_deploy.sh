@@ -179,28 +179,6 @@ fi
 unset ADMIN_PASSWORD CREDENTIAL_KEY MCP_TOKEN_HMAC_KEY
 echo "✓ .env 生产配置校验通过"
 
-echo ""
-echo "===== 3.1 MySQL 同台访问检查（关键） ====="
-echo "容器访问宿主 MySQL 需要："
-echo "  ① MySQL bind-address = 0.0.0.0（非仅 [IP]）"
-echo "  ② 授权 websysc 账户可从容器网段登录："
-echo "     mysql -uroot -p 执行:"
-echo "       ALTER USER 'websysc'@'%' IDENTIFIED BY '你的强密码';"
-echo "       GRANT ALL PRIVILEGES ON *.* TO 'websysc'@'%' WITH GRANT OPTION;"
-echo "       FLUSH PRIVILEGES;"
-echo "  ③ /etc/mysql/my.cnf 或 mariadb.conf 的 bind-address 改 [IP] 后重启 mysql"
-echo ""
-
-echo "===== 4. 执行数据库升级 ====="
-if ! command -v mysql &>/dev/null; then
-  echo "❌ 未找到宿主 mysql 客户端，请安装后重试（迁移脚本包含 DELIMITER，必须使用 mysql CLI）"
-  exit 1
-fi
-if [ ! -f "$APP_DIR/sql/004_gateway_hardening.sql" ]; then
-  echo "❌ 未找到 sql/004_gateway_hardening.sql"
-  exit 1
-fi
-
 ENV_MIGRATION_HOST="$(read_env_value DB_MIGRATION_HOST)"
 MIGRATION_HOST="${DB_MIGRATION_HOST:-${ENV_MIGRATION_HOST:-127.0.0.1}}"
 DB_PORT="$(read_env_value DB_PORT)"
@@ -210,15 +188,51 @@ DB_NAME="${DB_NAME:-websysc}"
 DB_USER="$(read_env_value DB_USER)"
 DB_USER="${DB_USER:-websysc}"
 
-echo "使用宿主 mysql CLI 执行 004 迁移（迁移主机默认 127.0.0.1，可用 DB_MIGRATION_HOST 覆盖）"
-if ! MYSQL_PWD="$DB_PASSWORD" mysql --protocol=TCP \
-  --host="$MIGRATION_HOST" --port="$DB_PORT" --user="$DB_USER" "$DB_NAME" \
-  < "$APP_DIR/sql/004_gateway_hardening.sql"; then
-  echo "❌ 数据库迁移失败，尚未拉取镜像或启动新应用"
+echo ""
+echo "===== 3.1 MySQL 同台访问检查（关键） ====="
+echo "容器访问宿主 MySQL 需要："
+echo "  ① MySQL bind-address = 0.0.0.0（非仅 [IP]）"
+echo "  ② 授权配置的数据库账户可从容器网段登录："
+echo "     mysql -uroot -p 执行:"
+echo "       ALTER USER '$DB_USER'@'%' IDENTIFIED BY '你的强密码';"
+echo "       GRANT SELECT, INSERT, UPDATE, DELETE, CREATE, ALTER, INDEX, CREATE ROUTINE, ALTER ROUTINE, EXECUTE ON \`$DB_NAME\`.* TO '$DB_USER'@'%';"
+echo "     中心 schema: \`$DB_NAME\`"
+echo "     既有租户 schema: 从 $DB_NAME.tenant_config.schema_name 读取后，逐个执行:"
+echo "       GRANT SELECT, INSERT, UPDATE, DELETE, CREATE, ALTER, INDEX ON \`wbd_<tenant>\`.* TO '$DB_USER'@'%';"
+echo "     新租户 schema 需由 DBA 预先创建并单独授权；不要授予全库权限或转授权限"
+echo "       FLUSH PRIVILEGES;"
+echo "  ③ /etc/mysql/my.cnf 或 mariadb.conf 的 bind-address 改 [IP] 后重启 mysql"
+echo ""
+
+echo "===== 4. 执行数据库升级 ====="
+if ! command -v mysql &>/dev/null; then
+  echo "❌ 未找到宿主 mysql 客户端，请安装后重试（迁移脚本包含 DELIMITER，必须使用 mysql CLI）"
   exit 1
 fi
+MIGRATIONS=(
+  "sql/004_gateway_hardening.sql"
+  "sql/005_mcp_call_log.sql"
+  "sql/006_connection_platform.sql"
+)
+for migration in "${MIGRATIONS[@]}"; do
+  if [ ! -f "$APP_DIR/$migration" ]; then
+    echo "❌ 未找到 $migration"
+    exit 1
+  fi
+done
+
+echo "使用宿主 mysql CLI 按 004 → 005 → 006 执行迁移（迁移主机默认 127.0.0.1，可用 DB_MIGRATION_HOST 覆盖）"
+for migration in "${MIGRATIONS[@]}"; do
+  echo "执行 $migration"
+  if ! MYSQL_PWD="$DB_PASSWORD" mysql --protocol=TCP \
+    --host="$MIGRATION_HOST" --port="$DB_PORT" --user="$DB_USER" "$DB_NAME" \
+    < "$APP_DIR/$migration"; then
+    echo "❌ 数据库迁移失败（$migration），尚未拉取镜像或启动新应用"
+    exit 1
+  fi
+done
 unset DB_PASSWORD
-echo "✓ 数据库迁移完成"
+echo "✓ 004、005、006 数据库迁移完成"
 
 echo ""
 echo "===== 5. 拉取镜像（GitHub Actions 已构建推送到 GHCR） ====="

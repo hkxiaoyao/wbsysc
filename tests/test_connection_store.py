@@ -1,5 +1,6 @@
 from dataclasses import FrozenInstanceError
 import json
+from pathlib import Path
 
 import pytest
 
@@ -804,6 +805,20 @@ def test_ensure_connection_tables_uses_mysql57_compatible_ddl(monkeypatch):
         assert f"create table if not exists `{table}`" in sql
     assert "unique key `uk_connection_token_hmac` (`token_hmac`)" in sql
     assert "add column if not exists" not in sql
+
+
+def test_connection_platform_migration_expands_declarative_documents_idempotently():
+    migration = (
+        Path(__file__).resolve().parents[1] / "sql" / "006_connection_platform.sql"
+    ).read_text(encoding="utf-8").lower()
+
+    assert "`spec_json` mediumtext not null" in migration
+    assert "`operation_json` mediumtext not null" in migration
+    assert migration.count("from information_schema.columns") >= 2
+    assert "modify column `spec_json` mediumtext not null" in migration
+    assert "modify column `operation_json` mediumtext not null" in migration
+    assert migration.count("prepare ") >= 2
+    assert "add column if not exists" not in migration
 
 
 def test_legacy_wecom_backfill_is_idempotent_and_never_repersists_raw_token(

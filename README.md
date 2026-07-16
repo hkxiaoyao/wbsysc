@@ -76,14 +76,14 @@ docker compose exec wbsysc python -m app.tenant_init \
 
 ### 生产升级（先迁移再切换）
 
-推荐执行 `bash deploy/server_deploy.sh`：脚本会先校验生产配置，再用宿主 `mysql` CLI 执行 `sql/004_gateway_hardening.sql`；只有迁移成功后才拉取镜像并启动新应用。迁移默认连接 `127.0.0.1`，远程 MySQL 可用 `DB_MIGRATION_HOST` 环境变量或 `.env` 同名项覆盖。
+推荐执行 `bash deploy/server_deploy.sh`：脚本会先校验生产配置，再用宿主 `mysql` CLI 严格按顺序执行 `sql/004_gateway_hardening.sql`、`sql/005_mcp_call_log.sql` 和 `sql/006_connection_platform.sql`；任一迁移失败都会在拉取镜像和启动新应用前终止。迁移默认连接 `127.0.0.1`，远程 MySQL 可用 `DB_MIGRATION_HOST` 环境变量或 `.env` 同名项覆盖。
 
 ```bash
 git pull
 bash deploy/server_deploy.sh
 ```
 
-需要手动升级时，顺序必须是“备份数据库 → 执行 `004` → 拉取新镜像 → 启动”。以下非敏感连接参数需与 `.env` 一致，密码通过 `MYSQL_PWD` 环境变量传递，不放在命令行参数中：
+需要手动升级时，顺序必须是“备份数据库 → 执行 `004` → 执行 `005` → 执行 `006` → 拉取新镜像 → 启动”。以下非敏感连接参数需与 `.env` 一致，密码通过 `MYSQL_PWD` 环境变量传递，不放在命令行参数中：
 
 ```bash
 DB_MIGRATION_HOST=127.0.0.1
@@ -93,12 +93,16 @@ DB_NAME=websysc
 read -rsp "DB_PASSWORD: " MYSQL_PWD && export MYSQL_PWD && echo
 mysql --protocol=TCP --host="$DB_MIGRATION_HOST" --port="$DB_PORT" \
   --user="$DB_USER" "$DB_NAME" < sql/004_gateway_hardening.sql
+mysql --protocol=TCP --host="$DB_MIGRATION_HOST" --port="$DB_PORT" \
+  --user="$DB_USER" "$DB_NAME" < sql/005_mcp_call_log.sql
+mysql --protocol=TCP --host="$DB_MIGRATION_HOST" --port="$DB_PORT" \
+  --user="$DB_USER" "$DB_NAME" < sql/006_connection_platform.sql
 unset MYSQL_PWD
 docker pull ghcr.io/hkxiaoyao/wbsysc:latest
 docker compose up -d
 ```
 
-> `004_gateway_hardening.sql` 包含 `DELIMITER` 和存储过程语句，必须使用 MySQL `mysql` CLI 执行。迁移失败时不要启动新版本。
+> `004_gateway_hardening.sql` 包含 `DELIMITER` 和存储过程语句，必须使用 MySQL `mysql` CLI 执行。`006_connection_platform.sql` 会幂等地将旧库的声明式文档列从 `TEXT` 扩容为 `MEDIUMTEXT`，以支持运行时允许的 256 KiB 文档。任一迁移失败时都不要启动新版本。
 
 ### 方式二：本地开发
 
