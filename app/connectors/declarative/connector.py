@@ -20,6 +20,7 @@ from .models import (
     SpecValidationError,
     UnknownToolError,
 )
+from .validator import validate_revision
 
 
 _GENERIC_ERROR = {"error": "declarative operation failed"}
@@ -30,10 +31,33 @@ class DeclarativeConnector:
     """Execute only the operations carried by one immutable revision."""
 
     def __init__(self, *, revision: DeclarativeRevision, client: SafeHttpClient) -> None:
+        self._bind(revision, client, allow_test_transport=False)
+
+    @classmethod
+    def _for_test(
+        cls,
+        *,
+        revision: DeclarativeRevision,
+        client: SafeHttpClient,
+    ) -> "DeclarativeConnector":
+        instance = cls.__new__(cls)
+        instance._bind(revision, client, allow_test_transport=True)
+        return instance
+
+    def _bind(
+        self,
+        revision: DeclarativeRevision,
+        client: SafeHttpClient,
+        *,
+        allow_test_transport: bool,
+    ) -> None:
         if not isinstance(revision, DeclarativeRevision):
             raise TypeError("revision must be a DeclarativeRevision")
         if not isinstance(client, SafeHttpClient):
             raise TypeError("client must be a SafeHttpClient")
+        revision = validate_revision(revision)
+        if not client.uses_pinned_transport and not allow_test_transport:
+            raise ValueError("HTTP client must use the pinned transport")
         if not client.exactly_matches_hosts(revision.allowed_hosts):
             raise ValueError("HTTP client host policy must exactly match the revision")
         self._revision = revision
@@ -137,6 +161,7 @@ class DeclarativeConnector:
                 {"Accept": "application/json"},
                 None,
                 form_body=form_body,
+                allow_redirects=False,
             )
             if not 200 <= response.status_code < 300:
                 raise RuntimeError("OAuth token request failed")
@@ -169,6 +194,7 @@ class DeclarativeConnector:
         json_body: object | None,
         *,
         form_body: Mapping[str, str] | None = None,
+        allow_redirects: bool = True,
     ):
         async with asyncio.timeout(timeout_ms / 1000):
             return await self._client.request(
@@ -177,6 +203,7 @@ class DeclarativeConnector:
                 headers=headers,
                 json_body=json_body,
                 form_body=form_body,
+                allow_redirects=allow_redirects,
             )
 
     @staticmethod

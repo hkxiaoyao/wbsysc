@@ -59,6 +59,18 @@ _PROTECTED_DYNAMIC_HEADERS = frozenset(
         "x-real-ip",
     }
 )
+_EXPRESSION_MARKERS = (
+    "${",
+    "{{",
+    "}}",
+    "{%",
+    "%}",
+    "<script",
+    "javascript:",
+    "__import__",
+    "eval(",
+    "exec(",
+)
 
 
 class SpecValidationError(ValueError):
@@ -155,6 +167,54 @@ def _assert_bounded_json_value(value: Any, *, depth: int = 0) -> None:
     raise SpecValidationError("persisted declaration is not JSON")
 
 
+def assert_safe_declaration_value(
+    value: Any,
+    *,
+    depth: int = 0,
+    counter: list[int] | None = None,
+) -> None:
+    """Apply one bounded, expression-free policy to every declaration path."""
+    if counter is None:
+        counter = [0]
+    counter[0] += 1
+    if counter[0] > 20_000 or depth > MAX_DOCUMENT_DEPTH:
+        raise SpecValidationError("specification mapping exceeds limit")
+    if value is None or isinstance(value, (bool, int)):
+        return
+    if isinstance(value, float):
+        if value != value or value in (float("inf"), float("-inf")):
+            raise SpecValidationError("specification contains unsupported values")
+        return
+    if isinstance(value, str):
+        try:
+            if len(value.encode("utf-8")) > 16_384:
+                raise SpecValidationError("specification string exceeds limit")
+        except UnicodeError:
+            raise SpecValidationError("specification contains unsupported values") from None
+        normalized = value.lower()
+        if any(marker in normalized for marker in _EXPRESSION_MARKERS):
+            raise SpecValidationError("expressions are not supported")
+        return
+    if isinstance(value, Mapping):
+        if len(value) > MAX_PERSISTED_COLLECTION_ITEMS:
+            raise SpecValidationError("specification mapping exceeds limit")
+        for key, child in value.items():
+            if not isinstance(key, str):
+                raise SpecValidationError("specification keys must be strings")
+            if key == "$ref":
+                raise SpecValidationError("references are not supported")
+            assert_safe_declaration_value(key, depth=depth + 1, counter=counter)
+            assert_safe_declaration_value(child, depth=depth + 1, counter=counter)
+        return
+    if isinstance(value, (list, tuple)):
+        if len(value) > MAX_PERSISTED_COLLECTION_ITEMS:
+            raise SpecValidationError("specification list exceeds limit")
+        for child in value:
+            assert_safe_declaration_value(child, depth=depth + 1, counter=counter)
+        return
+    raise SpecValidationError("specification contains unsupported values")
+
+
 def _stored_object(
     value: Any,
     *,
@@ -172,10 +232,9 @@ def _normalize_declaration_host(value: Any, *, allow_wildcard: bool) -> str:
     """Normalize a hostname stored in a declaration, never an IP literal."""
     if not isinstance(value, str) or not value or len(value) > 253:
         raise SpecValidationError("invalid declarative hostname")
-    wildcard = value.startswith("*.")
-    if wildcard and not allow_wildcard:
-        raise SpecValidationError("invalid declarative hostname")
-    host = value[2:] if wildcard else value
+    if "*" in value:
+        raise SpecValidationError("wildcard declarative hosts are not supported")
+    host = value
     if (
         not host
         or "*" in host
@@ -207,7 +266,7 @@ def _normalize_declaration_host(value: Any, *, allow_wildcard: bool) -> str:
         )
     ):
         raise SpecValidationError("invalid declarative hostname")
-    return f"*.{normalized}" if wildcard else normalized
+    return normalized
 
 
 def _declaration_base_host(value: Any) -> str:
@@ -244,15 +303,7 @@ def _declaration_base_host(value: Any) -> str:
 
 
 def _host_is_declared(host: str, allowed_hosts: tuple[str, ...]) -> bool:
-    return any(
-        host == allowed
-        or (
-            allowed.startswith("*.")
-            and host.endswith("." + allowed[2:])
-            and host != allowed[2:]
-        )
-        for allowed in allowed_hosts
-    )
+    return host in allowed_hosts
 
 
 def _assert_scalar(value: Any) -> None:
@@ -291,7 +342,9 @@ class InputMapping:
             raise SpecValidationError("invalid input mapping target")
         if not isinstance(self.required, bool):
             raise SpecValidationError("input required must be a bool")
-        object.__setattr__(self, "schema", _frozen_mapping(self.schema))
+        schema = _frozen_mapping(self.schema)
+        assert_safe_declaration_value(schema)
+        object.__setattr__(self, "schema", schema)
 
 
 @dataclass(frozen=True)
@@ -580,8 +633,8 @@ class DeclarativeOperation:
             or not 0 <= self.cache_ttl_seconds <= 86_400
         ):
             raise SpecValidationError("invalid cache TTL")
-        if self.pagination is not None and not isinstance(self.pagination, PaginationPolicy):
-            raise SpecValidationError("invalid pagination policy")
+        if self.pagination is not None:
+            raise SpecValidationError("pagination is not supported")
         if any(not isinstance(mapping, InputMapping) for mapping in inputs) or any(
             not isinstance(mapping, OutputMapping) for mapping in outputs
         ):
@@ -897,6 +950,7 @@ class DeclarativeRevision:
         stored-sync validation as newly imported ones.
         """
         _assert_bounded_json_value(document)
+        assert_safe_declaration_value(document)
         if _json_size(document) > MAX_DOCUMENT_BYTES:
             raise SpecValidationError("persisted declaration exceeds size limit")
         stored = _stored_object(

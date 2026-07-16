@@ -52,10 +52,10 @@ async def test_target_guard_rechecks_dns_for_each_redirect_hop() -> None:
     def handler(request: httpx.Request) -> httpx.Response:
         return httpx.Response(302, headers={"location": "/next"}, request=request)
 
-    client = SafeHttpClient(
+    client = SafeHttpClient._for_test(
         allowed_hosts={"api.example.com"},
         resolver=rebinding_resolver,
-        client=httpx.AsyncClient(transport=httpx.MockTransport(handler)),
+        transport=httpx.MockTransport(handler),
     )
 
     with pytest.raises(UnsafeTargetError):
@@ -74,11 +74,11 @@ async def test_safe_http_client_streaming_limit_rejects_oversized_response() -> 
     def handler(request: httpx.Request) -> httpx.Response:
         return httpx.Response(200, content=b"x" * 33, request=request)
 
-    client = SafeHttpClient(
+    client = SafeHttpClient._for_test(
         allowed_hosts={"api.example.com"},
         resolver=_public_resolver,
         max_response_bytes=32,
-        client=httpx.AsyncClient(transport=httpx.MockTransport(handler)),
+        transport=httpx.MockTransport(handler),
     )
 
     with pytest.raises(ResponseTooLargeError):
@@ -91,7 +91,7 @@ async def test_safe_http_client_streaming_limit_rejects_oversized_response() -> 
 
 
 @pytest.mark.asyncio
-async def test_cross_host_redirect_drops_sensitive_headers_before_following() -> None:
+async def test_cross_host_redirect_is_rejected_before_a_second_request() -> None:
     received: list[httpx.Request] = []
 
     def handler(request: httpx.Request) -> httpx.Response:
@@ -104,22 +104,65 @@ async def test_cross_host_redirect_drops_sensitive_headers_before_following() ->
             )
         return httpx.Response(200, content=json.dumps({"ok": True}), request=request)
 
-    client = SafeHttpClient(
+    client = SafeHttpClient._for_test(
         allowed_hosts={"api.example.com", "secondary.example.com"},
         resolver=_public_resolver,
-        client=httpx.AsyncClient(transport=httpx.MockTransport(handler)),
+        transport=httpx.MockTransport(handler),
     )
 
-    response = await client.request(
-        "GET",
-        "https://api.example.com/v1/items",
-        headers={"Authorization": "Bearer never-forward", "X-Trace": "safe"},
-        json_body=None,
+    with pytest.raises(SafeRequestError, match="unsafe redirect"):
+        await client.request(
+            "GET",
+            "https://api.example.com/v1/items",
+            headers={"Authorization": "Bearer never-forward", "X-Trace": "safe"},
+            json_body=None,
+        )
+
+    assert [request.url.host for request in received] == ["api.example.com"]
+
+
+@pytest.mark.asyncio
+async def test_cross_origin_redirect_never_replays_a_request_body() -> None:
+    received: list[httpx.Request] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        received.append(request)
+        if request.url.host == "api.example.com":
+            return httpx.Response(
+                307,
+                headers={"location": "https://other.example.com/collect"},
+                request=request,
+            )
+        return httpx.Response(200, json={"ok": True}, request=request)
+
+    client = SafeHttpClient._for_test(
+        allowed_hosts={"api.example.com", "other.example.com"},
+        resolver=_public_resolver,
+        transport=httpx.MockTransport(handler),
     )
 
-    assert response.json() == {"ok": True}
-    assert "authorization" not in received[1].headers
-    assert received[1].headers["x-trace"] == "safe"
+    with pytest.raises(SafeRequestError, match="unsafe redirect"):
+        await client.request(
+            "POST",
+            "https://api.example.com/start",
+            headers={"Authorization": "Bearer sensitive"},
+            json_body={"secret": "never-replay"},
+        )
+
+    assert [request.url.host for request in received] == ["api.example.com"]
+
+
+def test_public_safe_client_constructor_rejects_arbitrary_async_client() -> None:
+    injected = httpx.AsyncClient(
+        transport=httpx.MockTransport(lambda request: httpx.Response(200, request=request))
+    )
+
+    with pytest.raises(TypeError):
+        SafeHttpClient(
+            allowed_hosts={"api.example.com"},
+            resolver=_public_resolver,
+            client=injected,
+        )
 
 
 @pytest.mark.asyncio
@@ -141,10 +184,10 @@ async def test_target_guard_rejects_port_zero_before_transport() -> None:
         calls.append(request)
         return httpx.Response(200, request=request)
 
-    client = SafeHttpClient(
+    client = SafeHttpClient._for_test(
         allowed_hosts={"api.example.com"},
         resolver=_public_resolver,
-        client=httpx.AsyncClient(transport=httpx.MockTransport(handler)),
+        transport=httpx.MockTransport(handler),
     )
 
     with pytest.raises(UnsafeTargetError):
@@ -163,10 +206,10 @@ async def test_safe_http_client_redacts_transport_failures() -> None:
     def handler(request: httpx.Request) -> httpx.Response:
         raise httpx.ConnectError("credential=never-forward", request=request)
 
-    client = SafeHttpClient(
+    client = SafeHttpClient._for_test(
         allowed_hosts={"api.example.com"},
         resolver=_public_resolver,
-        client=httpx.AsyncClient(transport=httpx.MockTransport(handler)),
+        transport=httpx.MockTransport(handler),
     )
 
     with pytest.raises(SafeRequestError) as exc_info:
@@ -183,10 +226,10 @@ async def test_safe_http_client_redacts_transport_failures() -> None:
 
 @pytest.mark.asyncio
 async def test_safe_http_client_redacts_invalid_header_unicode() -> None:
-    client = SafeHttpClient(
+    client = SafeHttpClient._for_test(
         allowed_hosts={"api.example.com"},
         resolver=_public_resolver,
-        client=httpx.AsyncClient(transport=httpx.MockTransport(lambda request: httpx.Response(200, request=request))),
+        transport=httpx.MockTransport(lambda request: httpx.Response(200, request=request)),
     )
 
     with pytest.raises(SafeRequestError) as exc_info:
@@ -202,11 +245,11 @@ async def test_safe_http_client_redacts_invalid_header_unicode() -> None:
 
 @pytest.mark.asyncio
 async def test_safe_http_client_rejects_requests_past_its_page_limit() -> None:
-    client = SafeHttpClient(
+    client = SafeHttpClient._for_test(
         allowed_hosts={"api.example.com"},
         resolver=_public_resolver,
         max_pages=1,
-        client=httpx.AsyncClient(transport=httpx.MockTransport(lambda request: httpx.Response(200, request=request))),
+        transport=httpx.MockTransport(lambda request: httpx.Response(200, request=request)),
     )
 
     with pytest.raises(SafeRequestError, match="pagination limit exceeded"):
@@ -228,22 +271,19 @@ async def test_target_guard_rejects_localhost_even_if_a_resolver_claims_public_i
 
 
 @pytest.mark.asyncio
-async def test_safe_http_client_applies_its_timeout_to_an_injected_client() -> None:
+async def test_safe_http_client_applies_its_timeout_to_a_test_transport() -> None:
     seen: list[httpx.Request] = []
 
     def handler(request: httpx.Request) -> httpx.Response:
         seen.append(request)
         return httpx.Response(200, json={"ok": True}, request=request)
 
-    client = SafeHttpClient(
+    client = SafeHttpClient._for_test(
         allowed_hosts={"api.example.com"},
         resolver=_public_resolver,
         connect_timeout_seconds=1.0,
         read_timeout_seconds=2.0,
-        client=httpx.AsyncClient(
-            timeout=httpx.Timeout(99.0),
-            transport=httpx.MockTransport(handler),
-        ),
+        transport=httpx.MockTransport(handler),
     )
 
     await client.request(
@@ -271,10 +311,10 @@ async def test_safe_http_client_redacts_stream_failures() -> None:
     def handler(request: httpx.Request) -> httpx.Response:
         return httpx.Response(200, stream=_FailingBody(), request=request)
 
-    client = SafeHttpClient(
+    client = SafeHttpClient._for_test(
         allowed_hosts={"api.example.com"},
         resolver=_public_resolver,
-        client=httpx.AsyncClient(transport=httpx.MockTransport(handler)),
+        transport=httpx.MockTransport(handler),
     )
 
     with pytest.raises(SafeRequestError) as exc_info:
@@ -333,10 +373,10 @@ async def test_safe_http_client_closes_the_stream_before_returning_a_buffered_re
     def handler(request: httpx.Request) -> httpx.Response:
         return httpx.Response(200, stream=body, request=request)
 
-    client = SafeHttpClient(
+    client = SafeHttpClient._for_test(
         allowed_hosts={"api.example.com"},
         resolver=_public_resolver,
-        client=httpx.AsyncClient(transport=httpx.MockTransport(handler)),
+        transport=httpx.MockTransport(handler),
     )
 
     response = await client.request(
@@ -352,18 +392,24 @@ async def test_safe_http_client_closes_the_stream_before_returning_a_buffered_re
 
 @pytest.mark.asyncio
 async def test_safe_http_client_does_not_reapply_upstream_content_encoding() -> None:
+    compressed = gzip.compress(b'{"ok":true}')
+
+    class RawGzipBody(httpx.AsyncByteStream):
+        async def __aiter__(self):
+            yield compressed
+
     def handler(request: httpx.Request) -> httpx.Response:
         return httpx.Response(
             200,
             headers={"content-encoding": "gzip"},
-            content=gzip.compress(b'{"ok":true}'),
+            stream=RawGzipBody(),
             request=request,
         )
 
-    client = SafeHttpClient(
+    client = SafeHttpClient._for_test(
         allowed_hosts={"api.example.com"},
         resolver=_public_resolver,
-        client=httpx.AsyncClient(transport=httpx.MockTransport(handler)),
+        transport=httpx.MockTransport(handler),
     )
 
     response = await client.request(
@@ -375,6 +421,75 @@ async def test_safe_http_client_does_not_reapply_upstream_content_encoding() -> 
 
     assert response.json() == {"ok": True}
     assert "content-encoding" not in response.headers
+
+
+@pytest.mark.asyncio
+async def test_gzip_bomb_is_bounded_from_raw_chunks_before_decoding() -> None:
+    compressed = gzip.compress(b"x" * (2 * 1024 * 1024))
+
+    class RawCompressedBody(httpx.AsyncByteStream):
+        def __init__(self, body: bytes) -> None:
+            self.body = body
+            self.closed = False
+
+        async def __aiter__(self):
+            yield self.body
+
+        async def aclose(self) -> None:
+            self.closed = True
+
+    body = RawCompressedBody(compressed)
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(
+            200,
+            headers={"content-encoding": "gzip"},
+            stream=body,
+            request=request,
+        )
+    client = SafeHttpClient._for_test(
+        allowed_hosts={"api.example.com"},
+        resolver=_public_resolver,
+        max_response_bytes=4_096,
+        transport=httpx.MockTransport(handler),
+    )
+
+    with pytest.raises(ResponseTooLargeError):
+        await client.request(
+            "GET",
+            "https://api.example.com/bomb",
+            headers={},
+            json_body=None,
+        )
+
+    assert body.closed is True
+
+
+@pytest.mark.parametrize("module_name", ["httpx", "httpcore"])
+def test_pinned_transport_refuses_unverified_dependency_versions(
+    monkeypatch, module_name: str
+) -> None:
+    module = httpx if module_name == "httpx" else httpcore
+    monkeypatch.setattr(module, "__version__", "0.0.0")
+
+    with pytest.raises(RuntimeError, match="unsupported HTTP transport runtime"):
+        SafeHttpClient(
+            allowed_hosts={"api.example.com"},
+            resolver=_public_resolver,
+        )
+
+
+def test_pinned_transport_refuses_missing_private_backend_hook(monkeypatch) -> None:
+    def broken_transport_init(transport, *_args, **_kwargs) -> None:
+        transport._pool = object()
+
+    monkeypatch.setattr(httpx.AsyncHTTPTransport, "__init__", broken_transport_init)
+
+    with pytest.raises(RuntimeError, match="private network backend hook"):
+        SafeHttpClient(
+            allowed_hosts={"api.example.com"},
+            resolver=_public_resolver,
+        )
 
 
 @pytest.mark.asyncio

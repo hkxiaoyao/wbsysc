@@ -7,6 +7,7 @@ import ipaddress
 import json
 import re
 import socket
+import zlib
 from collections.abc import Awaitable, Callable, Iterable, Mapping
 from dataclasses import dataclass
 from typing import Any
@@ -46,9 +47,9 @@ _PROHIBITED_HEADERS = frozenset(
         "cookie",
     }
 )
-_CROSS_ORIGIN_SAFE_HEADERS = frozenset(
-    {"accept", "accept-language", "content-type", "user-agent", "x-trace"}
-)
+_VERIFIED_HTTPX_VERSION = "0.28.1"
+_VERIFIED_HTTPCORE_VERSION = "1.0.9"
+_TEST_TRANSPORT_TOKEN = object()
 
 
 Resolver = Callable[[str, int], Iterable[str] | Awaitable[Iterable[str]]]
@@ -109,12 +110,10 @@ class TargetGuard:
             raise ValueError("allowed_hosts must be an iterable of hostnames")
         hosts = tuple(_normalize_host(host) for host in allowed_hosts)
         if not hosts or any(
-            host == "*"
-            or (host.startswith("*.") and (len(host) <= 2 or "*" in host[2:]))
-            or (not host.startswith("*.") and "*" in host)
+            "*" in host
             for host in hosts
         ):
-            raise ValueError("allowed_hosts must contain concrete safe hostnames")
+            raise ValueError("wildcard hosts are not supported")
         ports = tuple(allowed_ports)
         if not ports or any(
             not isinstance(port, int) or isinstance(port, bool) or not 1 <= port <= 65_535
@@ -202,14 +201,7 @@ class TargetGuard:
         )
 
     def _host_is_allowed(self, host: str) -> bool:
-        for allowed in self._allowed_hosts:
-            if host == allowed:
-                return True
-            if allowed.startswith("*."):
-                suffix = allowed[1:]
-                if host.endswith(suffix) and host != allowed[2:]:
-                    return True
-        return False
+        return host in self._allowed_hosts
 
     async def _resolve(self, host: str, port: int) -> tuple[str, ...]:
         try:
@@ -287,12 +279,23 @@ class _PinnedAsyncHTTPTransport(httpx.AsyncHTTPTransport):
     """HTTPX transport that uses the guard-backed, DNS-pinning backend."""
 
     def __init__(self, target_guard: TargetGuard) -> None:
+        if (
+            httpx.__version__ != _VERIFIED_HTTPX_VERSION
+            or httpcore.__version__ != _VERIFIED_HTTPCORE_VERSION
+        ):
+            raise RuntimeError("unsupported HTTP transport runtime")
         super().__init__(trust_env=False, retries=0)
         # AsyncHTTPTransport creates an httpcore connection pool.  It has no
         # public resolver hook, so replace the backend before any connection
         # is created.  The origin remains the hostname, preserving TLS SNI and
         # certificate verification while the backend pins TCP to a safe IP.
-        self._pool._network_backend = _PinnedNetworkBackend(target_guard)
+        pool = getattr(self, "_pool", None)
+        if pool is None or not hasattr(pool, "_network_backend"):
+            raise RuntimeError("unsupported HTTP transport private network backend hook")
+        backend = _PinnedNetworkBackend(target_guard)
+        pool._network_backend = backend
+        if pool._network_backend is not backend:
+            raise RuntimeError("unsupported HTTP transport runtime")
 
 
 class SafeHttpClient:
@@ -304,13 +307,16 @@ class SafeHttpClient:
         *,
         target_guard: TargetGuard | None = None,
         resolver: Resolver | Callable[[str], Iterable[str] | Awaitable[Iterable[str]]] | None = None,
-        client: httpx.AsyncClient | None = None,
         connect_timeout_seconds: float = DEFAULT_CONNECT_TIMEOUT_SECONDS,
         read_timeout_seconds: float = DEFAULT_READ_TIMEOUT_SECONDS,
         max_response_bytes: int = DEFAULT_MAX_RESPONSE_BYTES,
         max_redirects: int = DEFAULT_MAX_REDIRECTS,
         max_pages: int = MAX_PAGE_COUNT,
+        _test_transport: httpx.AsyncBaseTransport | None = None,
+        _test_token: object | None = None,
     ) -> None:
+        if _test_transport is not None and _test_token is not _TEST_TRANSPORT_TOKEN:
+            raise TypeError("test transport is private")
         if target_guard is None:
             if allowed_hosts is None:
                 raise ValueError("allowed_hosts or target_guard is required")
@@ -348,23 +354,59 @@ class SafeHttpClient:
         self._max_response_bytes = max_response_bytes
         self._max_redirects = max_redirects
         self._max_pages = max_pages
-        self._owns_client = client is None
+        self._uses_pinned_transport = _test_transport is None
         self._timeout = httpx.Timeout(
             connect=connect_timeout_seconds,
             read=read_timeout_seconds,
             write=read_timeout_seconds,
             pool=connect_timeout_seconds,
         )
-        self._client = client or httpx.AsyncClient(
-            transport=_PinnedAsyncHTTPTransport(target_guard),
+        transport = (
+            _PinnedAsyncHTTPTransport(target_guard)
+            if _test_transport is None
+            else _test_transport
+        )
+        self._client = httpx.AsyncClient(
+            transport=transport,
             follow_redirects=False,
             timeout=self._timeout,
             trust_env=False,
         )
 
+    @classmethod
+    def _for_test(
+        cls,
+        allowed_hosts: Iterable[str],
+        *,
+        resolver: Resolver
+        | Callable[[str], Iterable[str] | Awaitable[Iterable[str]]]
+        | None = None,
+        transport: httpx.AsyncBaseTransport,
+        connect_timeout_seconds: float = DEFAULT_CONNECT_TIMEOUT_SECONDS,
+        read_timeout_seconds: float = DEFAULT_READ_TIMEOUT_SECONDS,
+        max_response_bytes: int = DEFAULT_MAX_RESPONSE_BYTES,
+        max_redirects: int = DEFAULT_MAX_REDIRECTS,
+        max_pages: int = MAX_PAGE_COUNT,
+    ) -> "SafeHttpClient":
+        """Build an explicit in-process test seam, unavailable to declarations."""
+        return cls(
+            allowed_hosts,
+            resolver=resolver,
+            connect_timeout_seconds=connect_timeout_seconds,
+            read_timeout_seconds=read_timeout_seconds,
+            max_response_bytes=max_response_bytes,
+            max_redirects=max_redirects,
+            max_pages=max_pages,
+            _test_transport=transport,
+            _test_token=_TEST_TRANSPORT_TOKEN,
+        )
+
     async def aclose(self) -> None:
-        if self._owns_client:
-            await self._client.aclose()
+        await self._client.aclose()
+
+    @property
+    def uses_pinned_transport(self) -> bool:
+        return self._uses_pinned_transport
 
     def exactly_matches_hosts(self, allowed_hosts: Iterable[str]) -> bool:
         """Expose only the safe policy comparison needed by a connector."""
@@ -379,6 +421,7 @@ class SafeHttpClient:
         *,
         page_count: int = 1,
         form_body: Mapping[str, str] | None = None,
+        allow_redirects: bool = True,
     ) -> httpx.Response:
         """Execute a declared request with fresh target checks at each hop.
 
@@ -396,6 +439,8 @@ class SafeHttpClient:
             raise SafeRequestError("pagination limit exceeded")
         if json_body is not None and form_body is not None:
             raise SafeRequestError("invalid outbound request")
+        if not isinstance(allow_redirects, bool):
+            raise SafeRequestError("invalid redirect policy")
         request_headers = self._validated_headers(headers)
         if json_body is not None and self._json_size(json_body) > MAX_REQUEST_BODY_BYTES:
             raise RequestTooLargeError("request body exceeds limit")
@@ -423,11 +468,7 @@ class SafeHttpClient:
             if current_target is not None and (
                 current_target.host != next_target.host or current_target.port != next_target.port
             ):
-                current_headers = {
-                    name: value
-                    for name, value in current_headers.items()
-                    if name.lower() in _CROSS_ORIGIN_SAFE_HEADERS
-                }
+                raise SafeRequestError("unsafe redirect")
             current_target = next_target
             response = await self._send_bounded(
                 method,
@@ -438,6 +479,8 @@ class SafeHttpClient:
             )
             if not response.is_redirect:
                 return response
+            if not allow_redirects:
+                raise SafeRequestError("unsafe redirect")
             location = response.headers.get("location")
             if not location or redirects >= self._max_redirects:
                 raise SafeRequestError("unsafe redirect")
@@ -514,9 +557,6 @@ class SafeHttpClient:
                     headers={} if location is None else {"location": location},
                 )
             content_bytes = await self._read_bounded(response)
-            # ``aiter_bytes`` yields decoded bytes.  Returning upstream
-            # Content-Encoding/Length alongside that buffered content would
-            # trigger a second decode and expose irrelevant upstream headers.
             return httpx.Response(
                 response.status_code,
                 content=content_bytes,
@@ -532,6 +572,26 @@ class SafeHttpClient:
                 pass
 
     async def _read_bounded(self, response: httpx.Response) -> bytes:
+        # MockTransport handlers commonly return an already-materialized
+        # response. HTTPX has decoded such content before the client receives
+        # it, so this compatibility branch is restricted to the private test
+        # seam. Production responses must always be consumed from raw chunks.
+        if response.is_stream_consumed:
+            if self._uses_pinned_transport:
+                raise SafeRequestError("invalid upstream response stream")
+            content = response.content
+            if len(content) > self._max_response_bytes:
+                raise ResponseTooLargeError("response exceeds limit")
+            return content
+        content_encoding = response.headers.get("content-encoding", "").strip().lower()
+        if content_encoding in {"", "identity"}:
+            decoder = None
+        elif content_encoding == "gzip":
+            decoder = zlib.decompressobj(16 + zlib.MAX_WBITS)
+        elif content_encoding == "deflate":
+            decoder = zlib.decompressobj()
+        else:
+            raise SafeRequestError("unsupported upstream content encoding")
         content_length = response.headers.get("content-length")
         if content_length is not None:
             try:
@@ -543,10 +603,32 @@ class SafeHttpClient:
             if length > self._max_response_bytes:
                 raise ResponseTooLargeError("response exceeds limit")
         chunks: list[bytes] = []
-        total = 0
-        async for chunk in response.aiter_bytes():
-            total += len(chunk)
-            if total > self._max_response_bytes:
+        compressed_total = 0
+        decoded_total = 0
+        async for raw_chunk in response.aiter_raw():
+            compressed_total += len(raw_chunk)
+            if compressed_total > self._max_response_bytes:
                 raise ResponseTooLargeError("response exceeds limit")
-            chunks.append(chunk)
+            if decoder is None:
+                decoded = raw_chunk
+            else:
+                remaining = self._max_response_bytes - decoded_total
+                decoded = decoder.decompress(raw_chunk, remaining + 1)
+                if decoder.unconsumed_tail:
+                    raise ResponseTooLargeError("response exceeds limit")
+            decoded_total += len(decoded)
+            if decoded_total > self._max_response_bytes:
+                raise ResponseTooLargeError("response exceeds limit")
+            if decoded:
+                chunks.append(decoded)
+        if decoder is not None:
+            remaining = self._max_response_bytes - decoded_total
+            tail = decoder.flush(remaining + 1)
+            decoded_total += len(tail)
+            if decoded_total > self._max_response_bytes:
+                raise ResponseTooLargeError("response exceeds limit")
+            if not decoder.eof or decoder.unused_data:
+                raise SafeRequestError("invalid upstream response")
+            if tail:
+                chunks.append(tail)
         return b"".join(chunks)

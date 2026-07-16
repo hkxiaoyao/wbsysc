@@ -134,6 +134,39 @@ def test_connector_rejects_an_http_client_with_a_broader_host_policy() -> None:
         DeclarativeConnector(revision=revision, client=client)
 
 
+def test_import_rejects_wildcard_allowed_hosts_and_normalizes_exact_hosts() -> None:
+    wildcard = _document()
+    wildcard["x-allowed-hosts"] = ["*.example.com"]
+    with pytest.raises(SpecValidationError, match="wildcard"):
+        import_openapi_revision(wildcard)
+
+    exact = _document()
+    exact["x-allowed-hosts"] = ["API.Example.COM."]
+    revision = import_openapi_revision(exact)
+    assert revision.allowed_hosts == ("api.example.com",)
+
+
+def test_programmatic_revision_rejects_wildcard_allowed_hosts() -> None:
+    operation = DeclarativeOperation(
+        tool_key="users.get",
+        mcp_name="users.get",
+        description="Read users",
+        method="GET",
+        path="/users",
+        input_mappings=(),
+        output_mappings=(OutputMapping(name="id", pointer="/id"),),
+        operation_kind="read",
+        base_url="https://api.example.com",
+    )
+
+    with pytest.raises(SpecValidationError, match="wildcard"):
+        DeclarativeRevision(
+            base_url="https://api.example.com",
+            allowed_hosts=("*.example.com",),
+            operations=(operation,),
+        )
+
+
 def test_programmatic_revision_cannot_point_outside_its_allowed_hosts() -> None:
     operation = DeclarativeOperation(
         tool_key="users.get",
@@ -190,6 +223,16 @@ def test_programmatic_operation_cannot_map_a_protected_header() -> None:
             location="header",
             target="Authorization",
             schema={"type": "string"},
+        )
+
+
+def test_programmatic_mapping_rejects_nested_template_markers() -> None:
+    with pytest.raises(SpecValidationError, match="expressions are not supported"):
+        InputMapping(
+            arg_name="name",
+            location="query",
+            target="name",
+            schema={"type": "string", "metadata": {"value": "${danger}"}},
         )
 
 
@@ -435,6 +478,100 @@ def test_import_rejects_an_oauth_token_host_outside_the_allowlist() -> None:
         import_openapi_revision(document)
 
 
+def test_import_rejects_unimplemented_pagination_declarations() -> None:
+    document = _document()
+    operation = document["paths"]["/users/{user_id}"]["get"]
+    operation["parameters"].append(
+        {"name": "cursor", "in": "query", "schema": {"type": "string"}}
+    )
+    operation["x-pagination"] = {
+        "max_pages": 2,
+        "max_items": 100,
+        "items_pointer": "/items",
+        "next_pointer": "/next",
+        "next_query_param": "cursor",
+    }
+
+    with pytest.raises(SpecValidationError, match="pagination is not supported"):
+        import_openapi_revision(document)
+
+
+def test_programmatic_revision_revalidation_rejects_template_description() -> None:
+    operation = DeclarativeOperation(
+        tool_key="users.get",
+        mcp_name="users.get",
+        description="${danger}",
+        method="GET",
+        path="/users",
+        input_mappings=(),
+        output_mappings=(OutputMapping(name="id", pointer="/id"),),
+        operation_kind="read",
+        base_url="https://api.example.com",
+    )
+    revision = DeclarativeRevision(
+        base_url="https://api.example.com",
+        allowed_hosts=("api.example.com",),
+        operations=(operation,),
+    )
+
+    with pytest.raises(SpecValidationError, match="expressions are not supported"):
+        validate_revision(revision)
+
+
+def test_persistence_revalidates_programmatic_revision(monkeypatch) -> None:
+    operation = DeclarativeOperation(
+        tool_key="users.get",
+        mcp_name="users.get",
+        description="${danger}",
+        method="GET",
+        path="/users",
+        input_mappings=(),
+        output_mappings=(OutputMapping(name="id", pointer="/id"),),
+        operation_kind="read",
+        base_url="https://api.example.com",
+    )
+    revision = DeclarativeRevision(
+        base_url="https://api.example.com",
+        allowed_hosts=("api.example.com",),
+        operations=(operation,),
+    )
+    monkeypatch.setattr(
+        db,
+        "get_engine",
+        lambda: pytest.fail("invalid declarations must not reach persistence"),
+    )
+
+    with pytest.raises(SpecValidationError, match="expressions are not supported"):
+        store.save_declarative_revision(revision)
+
+
+def test_connector_revalidates_programmatic_revision_before_publication() -> None:
+    operation = DeclarativeOperation(
+        tool_key="users.get",
+        mcp_name="users.get",
+        description="${danger}",
+        method="GET",
+        path="/users",
+        input_mappings=(),
+        output_mappings=(OutputMapping(name="id", pointer="/id"),),
+        operation_kind="read",
+        base_url="https://api.example.com",
+    )
+    revision = DeclarativeRevision(
+        base_url="https://api.example.com",
+        allowed_hosts=("api.example.com",),
+        operations=(operation,),
+    )
+    client = SafeHttpClient._for_test(
+        allowed_hosts={"api.example.com"},
+        resolver=_resolver,
+        transport=httpx.MockTransport(lambda request: httpx.Response(200, request=request)),
+    )
+
+    with pytest.raises(SpecValidationError, match="expressions are not supported"):
+        DeclarativeConnector._for_test(revision=revision, client=client)
+
+
 @pytest.mark.asyncio
 async def test_declarative_connector_rejects_undeclared_operation() -> None:
     revision = import_openapi_revision(_document())
@@ -460,12 +597,12 @@ async def test_declarative_connector_only_sends_declared_mapping_and_returns_sel
         )
 
     revision = import_openapi_revision(_document())
-    client = SafeHttpClient(
+    client = SafeHttpClient._for_test(
         allowed_hosts={"api.example.com"},
         resolver=_resolver,
-        client=httpx.AsyncClient(transport=httpx.MockTransport(handler)),
+        transport=httpx.MockTransport(handler),
     )
-    connector = DeclarativeConnector(revision=revision, client=client)
+    connector = DeclarativeConnector._for_test(revision=revision, client=client)
 
     result = await connector.execute(_context(), "users.get", {"user_id": "u1", "limit": 2})
 
@@ -496,12 +633,12 @@ async def test_api_key_credentials_are_declared_and_never_in_result_or_errors() 
         return httpx.Response(500, json={"detail": "api-key-should-not-leak"}, request=request)
 
     revision = import_openapi_revision(document)
-    client = SafeHttpClient(
+    client = SafeHttpClient._for_test(
         allowed_hosts={"api.example.com"},
         resolver=_resolver,
-        client=httpx.AsyncClient(transport=httpx.MockTransport(handler)),
+        transport=httpx.MockTransport(handler),
     )
-    connector = DeclarativeConnector(revision=revision, client=client)
+    connector = DeclarativeConnector._for_test(revision=revision, client=client)
 
     result = await connector.execute(
         _context(credentials={"service_api_key": "api-key-should-not-leak"}),
@@ -553,12 +690,12 @@ async def test_oauth_client_credentials_are_typed_and_redacted() -> None:
         return httpx.Response(200, json={"id": "u1", "name": "Ada", "secret": "omit"}, request=request)
 
     revision = import_openapi_revision(document)
-    client = SafeHttpClient(
+    client = SafeHttpClient._for_test(
         allowed_hosts={"api.example.com", "auth.example.com"},
         resolver=_resolver,
-        client=httpx.AsyncClient(transport=httpx.MockTransport(handler)),
+        transport=httpx.MockTransport(handler),
     )
-    connector = DeclarativeConnector(revision=revision, client=client)
+    connector = DeclarativeConnector._for_test(revision=revision, client=client)
 
     result = await connector.execute(
         _context(
@@ -576,6 +713,73 @@ async def test_oauth_client_credentials_are_typed_and_redacted() -> None:
     assert [request.url.host for request in seen] == ["auth.example.com", "api.example.com"]
     assert "oauth-client-secret" not in repr(result)
     assert "oauth-access-token" not in repr(result)
+
+
+@pytest.mark.asyncio
+async def test_oauth_credentials_are_never_replayed_to_a_redirect_host() -> None:
+    document = _document()
+    document["x-allowed-hosts"] = [
+        "api.example.com",
+        "auth.example.com",
+        "redirect.example.com",
+    ]
+    document["components"] = {
+        "securitySchemes": {
+            "serviceOauth": {
+                "type": "oauth2",
+                "flows": {
+                    "clientCredentials": {
+                        "tokenUrl": "https://auth.example.com/oauth/token",
+                        "scopes": {},
+                    }
+                },
+                "x-client-id-credential-key": "oauth_client_id",
+                "x-client-secret-credential-key": "oauth_client_secret",
+            }
+        }
+    }
+    document["security"] = [{"serviceOauth": []}]
+    received: list[httpx.Request] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        received.append(request)
+        if request.url.host == "auth.example.com":
+            return httpx.Response(
+                307,
+                headers={"location": "https://redirect.example.com/collect"},
+                request=request,
+            )
+        return httpx.Response(
+            200,
+            json={"access_token": "stolen-token"},
+            request=request,
+        )
+
+    revision = import_openapi_revision(document)
+    client = SafeHttpClient._for_test(
+        allowed_hosts={
+            "api.example.com",
+            "auth.example.com",
+            "redirect.example.com",
+        },
+        resolver=_resolver,
+        transport=httpx.MockTransport(handler),
+    )
+    connector = DeclarativeConnector._for_test(revision=revision, client=client)
+
+    result = await connector.execute(
+        _context(
+            credentials={
+                "oauth_client_id": "client-id-never-replay",
+                "oauth_client_secret": "client-secret-never-replay",
+            }
+        ),
+        "users.get",
+        {"user_id": "u1"},
+    )
+
+    assert result.status == "error"
+    assert [request.url.host for request in received] == ["auth.example.com"]
 
 
 class _RevisionStoreConnection:
@@ -598,6 +802,57 @@ class _RevisionStoreEngine:
 
     def begin(self) -> _RevisionStoreConnection:
         return self.connection
+
+
+class _ScalarResult:
+    def __init__(self, value: object) -> None:
+        self.value = value
+
+    def scalar(self):
+        return self.value
+
+
+class _DeclarativeSchemaMigrationConnection(_RevisionStoreConnection):
+    def execute(self, statement, params=None):
+        sql = str(statement)
+        bound = dict(params or {})
+        self.statements.append((sql, bound))
+        if "information_schema.COLUMNS" in sql:
+            if "CONCAT(" in sql:
+                return _ScalarResult("NO|")
+            return _ScalarResult(0)
+        if "information_schema.STATISTICS" in sql:
+            if bound.get("index_name") == "PRIMARY":
+                return _ScalarResult("spec_id,revision")
+            return _ScalarResult("spec_id,revision,operation_key")
+        return _ScalarResult(None)
+
+
+def test_declarative_schema_migrates_old_global_keys_without_if_not_exists(
+    monkeypatch,
+) -> None:
+    connection = _DeclarativeSchemaMigrationConnection()
+    monkeypatch.setattr(db, "get_engine", lambda: _RevisionStoreEngine(connection))
+
+    store.ensure_connection_tables()
+
+    sql = " ".join(
+        "\n".join(statement for statement, _ in connection.statements).split()
+    )
+    assert "ADD COLUMN `tenant_id` VARCHAR(64)" in sql
+    assert "MODIFY COLUMN `tenant_id` VARCHAR(64) NOT NULL" in sql
+    assert "JOIN declarative_spec_revision" in sql
+    assert "ADD PRIMARY KEY (`tenant_id`, `spec_id`, `revision`)" in sql
+    assert "UNIQUE KEY `uk_declarative_spec_operation` (`tenant_id`, `spec_id`, `revision`, `operation_key`)" in sql
+    assert "ADD COLUMN IF NOT EXISTS" not in sql
+
+
+def test_fresh_declarative_ddl_uses_tenant_scoped_identity() -> None:
+    sql = " ".join("\n".join(store._CONNECTION_DDLS).split())
+
+    assert "PRIMARY KEY (`tenant_id`, `spec_id`, `revision`)" in sql
+    assert "`tenant_id` VARCHAR(64) NOT NULL" in sql
+    assert "UNIQUE KEY `uk_declarative_spec_operation` (`tenant_id`, `spec_id`, `revision`, `operation_key`)" in sql
 
 
 def test_declarative_revision_persistence_uses_bound_parameters(monkeypatch) -> None:
@@ -623,6 +878,35 @@ def test_declarative_revision_persistence_uses_bound_parameters(monkeypatch) -> 
     assert "DROP TABLE" not in revision_sql
     assert revision_params["spec_id"] == "spec-users"
     assert "DROP TABLE" in str(revision_params["spec_json"])
+
+
+def test_two_tenants_can_persist_the_same_spec_revision_identity(monkeypatch) -> None:
+    connection = _RevisionStoreConnection()
+    monkeypatch.setattr(db, "get_engine", lambda: _RevisionStoreEngine(connection))
+    revisions = [
+        import_openapi_revision(
+            _document(),
+            spec_id="shared-spec",
+            revision=1,
+            tenant_id=tenant_id,
+            connection_id=f"conn-{tenant_id}",
+        )
+        for tenant_id in ("tenant-a", "tenant-b")
+    ]
+
+    for revision in revisions:
+        store.save_declarative_revision(revision)
+
+    operation_params = [
+        params
+        for sql, params in connection.statements
+        if "INSERT INTO declarative_spec_operation" in sql
+    ]
+    assert {params["tenant_id"] for params in operation_params} == {
+        "tenant-a",
+        "tenant-b",
+    }
+    assert len({params["operation_id"] for params in operation_params}) == 2
 
 
 class _RevisionReadResult:

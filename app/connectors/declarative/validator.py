@@ -20,19 +20,17 @@ from .models import (
     ALLOWED_METHODS,
     DEFAULT_TIMEOUT_MS,
     MAX_DOCUMENT_BYTES,
-    MAX_DOCUMENT_DEPTH,
     MAX_MAPPING_DEPTH,
     MAX_OPERATION_COUNT,
-    MAX_PAGE_COUNT,
-    MAX_PAGE_LIMIT,
     AuthScheme,
     DeclarativeOperation,
     DeclarativeRevision,
     InputMapping,
     OutputMapping,
-    PaginationPolicy,
     SpecValidationError,
     SyncSpec,
+    _normalize_declaration_host,
+    assert_safe_declaration_value,
 )
 
 
@@ -56,28 +54,7 @@ _PROTECTED_HEADERS = frozenset(
         "x-real-ip",
     }
 )
-_EXPRESSION_MARKERS = (
-    "${",
-    "{{",
-    "}}",
-    "{%",
-    "%}",
-    "<script",
-    "javascript:",
-    "__import__",
-    "eval(",
-    "exec(",
-)
 _PATH_PARAMETER_RE = re.compile(r"\{([A-Za-z][A-Za-z0-9_.-]{0,127})\}")
-
-
-def _raise_expression() -> None:
-    raise SpecValidationError("expressions are not supported")
-
-
-def _contains_expression(value: str) -> bool:
-    normalized = value.lower()
-    return any(marker in normalized for marker in _EXPRESSION_MARKERS)
 
 
 def _scan_yaml(text: str) -> None:
@@ -144,40 +121,7 @@ def load_revision_document(document: str | bytes | Mapping[str, Any]) -> dict[st
 
 
 def _assert_safe_value(value: Any, *, depth: int = 0, counter: list[int] | None = None) -> None:
-    if counter is None:
-        counter = [0]
-    counter[0] += 1
-    if counter[0] > 20_000 or depth > MAX_DOCUMENT_DEPTH:
-        raise SpecValidationError("specification mapping exceeds limit")
-    if value is None or isinstance(value, (bool, int)):
-        return
-    if isinstance(value, float):
-        if value != value or value in (float("inf"), float("-inf")):
-            raise SpecValidationError("specification contains unsupported values")
-        return
-    if isinstance(value, str):
-        if len(value.encode("utf-8")) > 16_384:
-            raise SpecValidationError("specification string exceeds limit")
-        if _contains_expression(value):
-            _raise_expression()
-        return
-    if isinstance(value, Mapping):
-        for key, child in value.items():
-            if not isinstance(key, str):
-                raise SpecValidationError("specification keys must be strings")
-            if key == "$ref":
-                raise SpecValidationError("references are not supported")
-            if _contains_expression(key):
-                _raise_expression()
-            _assert_safe_value(child, depth=depth + 1, counter=counter)
-        return
-    if isinstance(value, (list, tuple)):
-        if len(value) > 2_000:
-            raise SpecValidationError("specification list exceeds limit")
-        for child in value:
-            _assert_safe_value(child, depth=depth + 1, counter=counter)
-        return
-    raise SpecValidationError("specification contains unsupported values")
+    assert_safe_declaration_value(value, depth=depth, counter=counter)
 
 
 def _string(value: Any, message: str, *, maximum: int = 512) -> str:
@@ -236,29 +180,12 @@ def _safe_base_url(value: Any) -> tuple[str, str]:
 def _normalize_allowed_hosts(values: Iterable[Any], base_host: str) -> tuple[str, ...]:
     hosts: list[str] = []
     for value in values:
-        if not isinstance(value, str) or not value or len(value) > 253:
-            raise SpecValidationError("invalid allowed hostname")
-        host = value.lower().rstrip(".")
-        if host.startswith("*."):
-            bare = host[2:]
-            if not bare or "*" in bare or "/" in bare or ":" in bare:
-                raise SpecValidationError("invalid allowed hostname")
-        elif "*" in host or "/" in host or ":" in host:
-            raise SpecValidationError("invalid allowed hostname")
-        try:
-            ipaddress.ip_address(host)
-        except ValueError:
-            pass
-        else:
-            raise SpecValidationError("allowed IP literals are not supported")
+        host = _normalize_declaration_host(value, allow_wildcard=False)
         if host not in hosts:
             hosts.append(host)
     if not hosts:
         hosts = [base_host]
-    if not any(
-        base_host == host or (host.startswith("*.") and base_host.endswith("." + host[2:]))
-        for host in hosts
-    ):
+    if base_host not in hosts:
         raise SpecValidationError("server host is absent from allowed hosts")
     return tuple(hosts)
 
@@ -528,35 +455,14 @@ def _output_mappings(operation: Mapping[str, Any]) -> tuple[OutputMapping, ...]:
     return tuple(mappings)
 
 
-def _pagination(operation: Mapping[str, Any], input_mappings: tuple[InputMapping, ...]) -> PaginationPolicy | None:
+def _pagination(
+    operation: Mapping[str, Any],
+    _input_mappings: tuple[InputMapping, ...],
+) -> None:
     raw = operation.get("x-pagination")
     if raw is None:
         return None
-    if not isinstance(raw, Mapping):
-        raise SpecValidationError("invalid pagination policy")
-    max_pages = raw.get("max_pages", 1)
-    max_items = raw.get("max_items", MAX_PAGE_LIMIT)
-    if not isinstance(max_pages, int) or isinstance(max_pages, bool) or not 1 <= max_pages <= MAX_PAGE_COUNT:
-        raise SpecValidationError("invalid pagination page limit")
-    if not isinstance(max_items, int) or isinstance(max_items, bool) or not 1 <= max_items <= MAX_PAGE_LIMIT:
-        raise SpecValidationError("invalid pagination item limit")
-    if max_pages == 1:
-        return PaginationPolicy(max_pages=1, max_items=max_items)
-    items_pointer = raw.get("items_pointer")
-    next_pointer = raw.get("next_pointer")
-    next_query_param = raw.get("next_query_param")
-    if not all(isinstance(value, str) for value in (items_pointer, next_pointer, next_query_param)):
-        raise SpecValidationError("pagination cursor is required")
-    query_targets = {mapping.target for mapping in input_mappings if mapping.location == "query"}
-    if next_query_param not in query_targets:
-        raise SpecValidationError("pagination cursor must use a declared query parameter")
-    return PaginationPolicy(
-        max_pages=max_pages,
-        max_items=max_items,
-        items_pointer=items_pointer,
-        next_pointer=next_pointer,
-        next_query_param=next_query_param,
-    )
+    raise SpecValidationError("pagination is not supported")
 
 
 def _operation_auth(document: Mapping[str, Any], operation: Mapping[str, Any]) -> AuthScheme | None:
@@ -631,6 +537,19 @@ def validate_operation(operation: DeclarativeOperation) -> None:
         raise SpecValidationError("unsupported HTTP method")
     if operation.operation_kind == "write" and not operation.explicit_write_enabled:
         raise SpecValidationError("write operation requires explicit enablement")
+
+
+def _canonical_revision(revision: DeclarativeRevision) -> DeclarativeRevision:
+    document = revision.storage_document()
+    assert_safe_declaration_value(document)
+    return DeclarativeRevision.from_storage_document(
+        spec_id=revision.spec_id,
+        revision=revision.revision,
+        tenant_id=revision.tenant_id,
+        connection_id=revision.connection_id,
+        status=revision.status,
+        document=document,
+    )
 
 
 def _compile_operation(
@@ -756,18 +675,10 @@ def import_openapi_revision(
     auth_scheme = next(iter(auth_schemes), None)
     if auth_scheme is not None and auth_scheme.kind == "oauth2_client_credentials":
         _, token_host = _safe_base_url(auth_scheme.token_url)
-        if not any(
-            token_host == allowed
-            or (
-                allowed.startswith("*.")
-                and token_host.endswith("." + allowed[2:])
-                and token_host != allowed[2:]
-            )
-            for allowed in normalized_hosts
-        ):
+        if token_host not in normalized_hosts:
             raise SpecValidationError("OAuth token host is absent from allowed hosts")
     compiled_sync = _sync_spec(sync_spec if sync_spec is not None else data.get("x-sync-spec"))
-    return DeclarativeRevision(
+    return _canonical_revision(DeclarativeRevision(
         spec_id=spec_id,
         revision=revision,
         tenant_id=tenant_id,
@@ -778,17 +689,17 @@ def import_openapi_revision(
         operations=tuple(operations),
         auth_scheme=auth_scheme,
         sync_spec=compiled_sync,
-    )
+    ))
 
 
 def validate_revision(
     revision: DeclarativeRevision | Mapping[str, Any] | str | bytes,
     *,
     data_mode: str | None = None,
-) -> DeclarativeRevision | None:
+) -> DeclarativeRevision:
     """Validate a revision or a raw document without evaluating any content."""
     if isinstance(revision, DeclarativeRevision):
-        compiled = revision
+        compiled = _canonical_revision(revision)
     else:
         data = load_revision_document(revision)
         if "openapi" not in data:

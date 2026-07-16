@@ -105,13 +105,14 @@ _CONNECTION_DDLS = (
       `status` VARCHAR(16) NOT NULL DEFAULT 'draft',
       `spec_json` MEDIUMTEXT NOT NULL,
       `created_at` DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
-      PRIMARY KEY (`spec_id`, `revision`),
+      PRIMARY KEY (`tenant_id`, `spec_id`, `revision`),
       KEY `idx_declarative_spec_tenant` (`tenant_id`, `connection_id`, `status`)
     ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4
     """,
     """
     CREATE TABLE IF NOT EXISTS `declarative_spec_operation` (
       `operation_id` VARCHAR(64) NOT NULL,
+      `tenant_id` VARCHAR(64) NOT NULL,
       `spec_id` VARCHAR(64) NOT NULL,
       `revision` INT NOT NULL,
       `connection_id` VARCHAR(64) NOT NULL,
@@ -121,7 +122,8 @@ _CONNECTION_DDLS = (
       `updated_at` DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP
         ON UPDATE CURRENT_TIMESTAMP,
       PRIMARY KEY (`operation_id`),
-      UNIQUE KEY `uk_declarative_spec_operation` (`spec_id`, `revision`, `operation_key`),
+      UNIQUE KEY `uk_declarative_spec_operation`
+        (`tenant_id`, `spec_id`, `revision`, `operation_key`),
       KEY `idx_declarative_operation_connection` (`connection_id`)
     ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4
     """,
@@ -210,6 +212,101 @@ def ensure_connection_tables() -> None:
     with _engine().begin() as conn:
         for ddl in _CONNECTION_DDLS:
             conn.execute(text(ddl))
+        _migrate_declarative_tenant_identity(conn)
+
+
+def _declarative_index_columns(conn: Any, table_name: str, index_name: str) -> str:
+    value = conn.execute(
+        text("""
+            SELECT GROUP_CONCAT(COLUMN_NAME ORDER BY SEQ_IN_INDEX SEPARATOR ',')
+            FROM information_schema.STATISTICS
+            WHERE TABLE_SCHEMA=DATABASE()
+              AND TABLE_NAME=:table_name AND INDEX_NAME=:index_name
+        """),
+        {"table_name": table_name, "index_name": index_name},
+    ).scalar()
+    return value.lower() if isinstance(value, str) else ""
+
+
+def _migrate_declarative_tenant_identity(conn: Any) -> None:
+    """Idempotently upgrade pre-tenant declarative keys on MySQL 5.7."""
+    tenant_column = conn.execute(
+        text("""
+            SELECT COUNT(*) FROM information_schema.COLUMNS
+            WHERE TABLE_SCHEMA=DATABASE()
+              AND TABLE_NAME='declarative_spec_operation'
+              AND COLUMN_NAME='tenant_id'
+        """)
+    ).scalar()
+    added_tenant_column = not bool(tenant_column)
+    if added_tenant_column:
+        conn.execute(text("""
+            ALTER TABLE declarative_spec_operation
+            ADD COLUMN `tenant_id` VARCHAR(64) NOT NULL DEFAULT '' AFTER `operation_id`
+        """))
+
+    # This remains safe to retry after an interrupted DDL migration.  The old
+    # global revision key guarantees one unambiguous tenant for every old row.
+    conn.execute(text("""
+        UPDATE declarative_spec_operation AS operation_row
+        JOIN declarative_spec_revision AS revision_row
+          ON revision_row.spec_id=operation_row.spec_id
+         AND revision_row.revision=operation_row.revision
+        SET operation_row.tenant_id=revision_row.tenant_id
+        WHERE operation_row.tenant_id=''
+    """))
+    orphan_count = conn.execute(text("""
+        SELECT COUNT(*) FROM declarative_spec_operation WHERE tenant_id=''
+    """)).scalar()
+    if isinstance(orphan_count, int) and orphan_count > 0:
+        raise RuntimeError("declarative tenant identity migration is incomplete")
+    tenant_column_shape = conn.execute(
+        text("""
+            SELECT CONCAT(
+                IS_NULLABLE, '|',
+                IF(COLUMN_DEFAULT IS NULL, '<NULL>', COLUMN_DEFAULT)
+            )
+            FROM information_schema.COLUMNS
+            WHERE TABLE_SCHEMA=DATABASE()
+              AND TABLE_NAME='declarative_spec_operation'
+              AND COLUMN_NAME='tenant_id'
+            LIMIT 1
+        """)
+    ).scalar()
+    if added_tenant_column or tenant_column_shape != "NO|<NULL>":
+        conn.execute(text("""
+            ALTER TABLE declarative_spec_operation
+            MODIFY COLUMN `tenant_id` VARCHAR(64) NOT NULL
+        """))
+
+    revision_pk = _declarative_index_columns(
+        conn,
+        "declarative_spec_revision",
+        "PRIMARY",
+    )
+    if revision_pk != "tenant_id,spec_id,revision":
+        conn.execute(text("""
+            ALTER TABLE declarative_spec_revision
+            DROP PRIMARY KEY,
+            ADD PRIMARY KEY (`tenant_id`, `spec_id`, `revision`)
+        """))
+
+    operation_unique = _declarative_index_columns(
+        conn,
+        "declarative_spec_operation",
+        "uk_declarative_spec_operation",
+    )
+    if operation_unique != "tenant_id,spec_id,revision,operation_key":
+        if operation_unique:
+            conn.execute(text("""
+                ALTER TABLE declarative_spec_operation
+                DROP INDEX `uk_declarative_spec_operation`
+            """))
+        conn.execute(text("""
+            ALTER TABLE declarative_spec_operation
+            ADD UNIQUE KEY `uk_declarative_spec_operation`
+              (`tenant_id`, `spec_id`, `revision`, `operation_key`)
+        """))
 
 
 def create_connection(
@@ -332,9 +429,11 @@ def save_declarative_revision(revision: Any) -> None:
     parameter rather than interpolated into SQL.
     """
     from app.connectors.declarative.models import DeclarativeRevision, MAX_DOCUMENT_BYTES
+    from app.connectors.declarative.validator import validate_revision
 
     if not isinstance(revision, DeclarativeRevision):
         raise TypeError("revision must be a DeclarativeRevision")
+    revision = validate_revision(revision)
     if not revision.spec_id or not revision.tenant_id or not revision.connection_id:
         raise ValueError("declarative revision identity is required")
     document = revision.storage_document()
@@ -376,20 +475,21 @@ def save_declarative_revision(revision: Any) -> None:
             conn.execute(
                 text("""
                     INSERT INTO declarative_spec_operation
-                        (operation_id, spec_id, revision, connection_id, operation_key,
-                         operation_json)
-                    VALUES (:operation_id, :spec_id, :revision, :connection_id,
-                            :operation_key, :operation_json)
+                        (operation_id, tenant_id, spec_id, revision, connection_id,
+                         operation_key, operation_json)
+                    VALUES (:operation_id, :tenant_id, :spec_id, :revision,
+                            :connection_id, :operation_key, :operation_json)
                 """),
                 {
                     "operation_id": str(
                         uuid.uuid5(
                             uuid.NAMESPACE_URL,
-                            f"wbsysc:declarative:{revision.spec_id}:{revision.revision}:{operation['tool_key']}",
+                            f"wbsysc:declarative:{revision.tenant_id}:{revision.spec_id}:{revision.revision}:{operation['tool_key']}",
                         )
                     ),
                     "spec_id": revision.spec_id,
                     "revision": revision.revision,
+                    "tenant_id": revision.tenant_id,
                     "connection_id": revision.connection_id,
                     "operation_key": operation["tool_key"],
                     "operation_json": operation_json,
@@ -459,7 +559,7 @@ def get_published_declarative_revision(
             or row_status != "published"
         ):
             raise ValueError("stored declarative revision is invalid")
-        return DeclarativeRevision.from_storage_document(
+        loaded = DeclarativeRevision.from_storage_document(
             spec_id=row_spec_id,
             revision=row_revision,
             tenant_id=row_tenant_id,
@@ -467,6 +567,9 @@ def get_published_declarative_revision(
             status=row_status,
             document=document,
         )
+        from app.connectors.declarative.validator import validate_revision
+
+        return validate_revision(loaded)
     except Exception:
         # Neither malformed stored JSON nor a rejected declaration should leak
         # raw database content into a connector response or log message.
