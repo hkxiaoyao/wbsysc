@@ -164,13 +164,15 @@ if [ "$CREDENTIAL_KEY" = "<强随机串>" ] || [ "$(byte_length "$CREDENTIAL_KEY
   echo "❌ CREDENTIAL_KEY 必须为非示例值且至少 32 UTF-8 字节"
   CONFIG_INVALID=1
 fi
+DB_USER="$(read_env_value DB_USER)"
+DB_USER="${DB_USER:-websysc}"
 DB_MIGRATION_USER="${DB_MIGRATION_USER:-}"
 DB_MIGRATION_PASSWORD="${DB_MIGRATION_PASSWORD:-}"
 if [ -z "$DB_MIGRATION_USER" ] || is_example_password "$DB_MIGRATION_PASSWORD"; then
   echo "❌ DB_MIGRATION_USER/DB_MIGRATION_PASSWORD 必须使用独立迁移账户的真实值"
   CONFIG_INVALID=1
 fi
-if [ "$DB_MIGRATION_USER" = "$(read_env_value DB_USER)" ]; then
+if [ "$DB_MIGRATION_USER" = "$DB_USER" ]; then
   echo "❌ DB_MIGRATION_USER 必须与运行时 DB_USER 不同"
   CONFIG_INVALID=1
 fi
@@ -195,8 +197,6 @@ DB_PORT="$(read_env_value DB_PORT)"
 DB_PORT="${DB_PORT:-3306}"
 DB_NAME="$(read_env_value DB_NAME)"
 DB_NAME="${DB_NAME:-websysc}"
-DB_USER="$(read_env_value DB_USER)"
-DB_USER="${DB_USER:-websysc}"
 
 echo ""
 echo "===== 3.1 MySQL 同台访问检查（关键） ====="

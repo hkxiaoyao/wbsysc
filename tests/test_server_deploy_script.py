@@ -49,6 +49,10 @@ def test_deployer_documents_schema_scoped_least_privilege_grants():
     assert 'DB_MIGRATION_USER="${DB_MIGRATION_USER:-}"' in script
     assert 'DB_MIGRATION_PASSWORD="${DB_MIGRATION_PASSWORD:-}"' in script
     assert "read_env_value DB_MIGRATION_PASSWORD" not in script
-    assert 'if [ "$DB_MIGRATION_USER" = "$(read_env_value DB_USER)" ]' in script
+    default_user = 'DB_USER="${DB_USER:-websysc}"'
+    distinct_check = 'if [ "$DB_MIGRATION_USER" = "$DB_USER" ]'
+    assert default_user in script
+    assert distinct_check in script
+    assert script.index(default_user) < script.index(distinct_check)
     assert 'echo "$DB_PASSWORD"' not in script
     assert 'printf \'%s\' "$DB_PASSWORD"' not in script
