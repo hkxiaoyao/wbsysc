@@ -133,7 +133,29 @@ export function createRequestSequence() {
   let current = 0
   return {
     begin() { current += 1; return current },
+    capture() { return current },
     isCurrent(value) { return value === current },
+    invalidate() { current += 1 },
+  }
+}
+
+export function createConnectionMutationSequence() {
+  let current = 0
+  return {
+    begin(connectionId, detailRequestId) {
+      current += 1
+      return {
+        connectionId: cleanText(connectionId),
+        detailRequestId,
+        mutationRequestId: current,
+      }
+    },
+    isCurrent(ticket, connectionId, detailRequestId) {
+      return Boolean(ticket)
+        && ticket.connectionId === cleanText(connectionId)
+        && ticket.detailRequestId === detailRequestId
+        && ticket.mutationRequestId === current
+    },
     invalidate() { current += 1 },
   }
 }

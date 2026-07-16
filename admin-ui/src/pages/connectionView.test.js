@@ -4,6 +4,7 @@ import {
   buildConnectionMcpConfig,
   canEnableWriteTool,
   closeTokenModal,
+  createConnectionMutationSequence,
   createRequestSequence,
   createWizardState,
   hasExplicitPolicies,
@@ -201,6 +202,26 @@ test('request sequence rejects stale and invalidated responses', () => {
   assert.equal(sequence.isCurrent(second), true)
   sequence.invalidate()
   assert.equal(sequence.isCurrent(second), false)
+})
+
+test('connection mutation sequence rejects another connection and a replaced detail request', () => {
+  const sequence = createConnectionMutationSequence()
+  const ticket = sequence.begin('conn-a', 4)
+
+  assert.equal(sequence.isCurrent(ticket, 'conn-a', 4), true)
+  assert.equal(sequence.isCurrent(ticket, 'conn-b', 4), false)
+  assert.equal(sequence.isCurrent(ticket, 'conn-a', 5), false)
+})
+
+test('connection mutation sequence rejects superseded and explicitly invalidated mutations', () => {
+  const sequence = createConnectionMutationSequence()
+  const first = sequence.begin('conn-a', 4)
+  const second = sequence.begin('conn-a', 4)
+
+  assert.equal(sequence.isCurrent(first, 'conn-a', 4), false)
+  assert.equal(sequence.isCurrent(second, 'conn-a', 4), true)
+  sequence.invalidate()
+  assert.equal(sequence.isCurrent(second, 'conn-a', 4), false)
 })
 
 test('schema metadata summary exposes approved properties without values', () => {

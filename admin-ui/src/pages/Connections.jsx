@@ -10,7 +10,7 @@ import api from '../api.js'
 import DeclarativeSpecWizard from './DeclarativeSpecWizard.jsx'
 import {
   buildConnectionMcpConfig, canEnableWriteTool, closeTokenModal, safeServerError,
-  createRequestSequence, isActiveDeclarativeConfigReadOnly, selectActiveTokenHint,
+  createConnectionMutationSequence, createRequestSequence, isActiveDeclarativeConfigReadOnly, selectActiveTokenHint,
   setExplicitToolPolicy,
 } from './connectionView.js'
 import './Connections.css'
@@ -63,11 +63,42 @@ export default function Connections({ tenantId = '', initialConnectionId = '', e
   const compact = !screens.md
   const listSequence = useRef(createRequestSequence())
   const detailSequence = useRef(createRequestSequence())
+  const mutationSequence = useRef(createConnectionMutationSequence())
+  const createSequence = useRef(createRequestSequence())
   const listController = useRef(null)
   const detailController = useRef(null)
+  const mutationController = useRef(null)
+  const createController = useRef(null)
+  const mounted = useRef(true)
   const openedInitialConnection = useRef('')
   const openDetailId = useRef('')
-  const tokenSecret = useRef('')
+
+  const isDetailCurrent = (requestId, connectionId, controller) => (
+    mounted.current && !controller.signal.aborted
+    && openDetailId.current === connectionId
+    && detailSequence.current.isCurrent(requestId)
+  )
+  const beginDrawerMutation = (connectionId) => {
+    mutationController.current?.abort()
+    const controller = new AbortController()
+    mutationController.current = controller
+    return {
+      controller,
+      ticket: mutationSequence.current.begin(connectionId, detailSequence.current.capture()),
+    }
+  }
+  const isDrawerMutationCurrent = (ticket, controller) => (
+    mounted.current && !controller.signal.aborted
+    && mutationSequence.current.isCurrent(
+      ticket,
+      openDetailId.current,
+      detailSequence.current.capture(),
+    )
+  )
+  const invalidateDrawerMutations = () => {
+    mutationSequence.current.invalidate()
+    mutationController.current?.abort()
+  }
 
   const load = useCallback(async () => {
     const requestId = listSequence.current.begin()
@@ -80,6 +111,7 @@ export default function Connections({ tenantId = '', initialConnectionId = '', e
       let tenantRows = tenants
       if (!tenantId || tenantRows.length === 0) {
         const tenantResponse = await api.get('/admin/tenants', { signal: controller.signal })
+        if (!mounted.current || controller.signal.aborted || !listSequence.current.isCurrent(requestId)) return
         tenantRows = tenantResponse.data?.items || []
         setTenants(tenantRows)
       }
@@ -98,13 +130,13 @@ export default function Connections({ tenantId = '', initialConnectionId = '', e
           tool_count: toolResponse?.data?.items?.length ?? 0,
         }
       }))
-      if (listSequence.current.isCurrent(requestId) && !controller.signal.aborted) setItems(enriched)
+      if (mounted.current && listSequence.current.isCurrent(requestId) && !controller.signal.aborted) setItems(enriched)
     } catch (error) {
-      if (!controller.signal.aborted && listSequence.current.isCurrent(requestId)) {
+      if (mounted.current && !controller.signal.aborted && listSequence.current.isCurrent(requestId)) {
         setLoadError(safeServerError(error, '连接实例加载失败'))
       }
     } finally {
-      if (listSequence.current.isCurrent(requestId)) setLoading(false)
+      if (mounted.current && !controller.signal.aborted && listSequence.current.isCurrent(requestId)) setLoading(false)
     }
   }, [scopeTenant, tenantId, tenants.length])
 
@@ -116,10 +148,15 @@ export default function Connections({ tenantId = '', initialConnectionId = '', e
     openedInitialConnection.current = ''
     detailSequence.current.invalidate()
     detailController.current?.abort()
+    invalidateDrawerMutations()
     openDetailId.current = ''
     setDetail(null)
     setTools([])
     setTokens([])
+    setCredentialsText('{}')
+    setConfigText('{}')
+    setTokenLabel('')
+    setTokenModal(closeTokenModal())
   }, [tenantId])
   useEffect(() => {
     load()
@@ -128,15 +165,24 @@ export default function Connections({ tenantId = '', initialConnectionId = '', e
       listController.current?.abort()
     }
   }, [scopeTenant])
-  useEffect(() => () => {
-    listSequence.current.invalidate()
-    detailSequence.current.invalidate()
-    listController.current?.abort()
-    detailController.current?.abort()
-    tokenSecret.current = ''
+  useEffect(() => {
+    mounted.current = true
+    return () => {
+      mounted.current = false
+      listSequence.current.invalidate()
+      detailSequence.current.invalidate()
+      mutationSequence.current.invalidate()
+      createSequence.current.invalidate()
+      listController.current?.abort()
+      detailController.current?.abort()
+      mutationController.current?.abort()
+      createController.current?.abort()
+    }
   }, [])
 
-  const openDetail = useCallback(async (row) => {
+  const openDetail = useCallback(async (row, preserveToken = false) => {
+    invalidateDrawerMutations()
+    if (!preserveToken) setTokenModal(closeTokenModal())
     openDetailId.current = row.connection_id
     const requestId = detailSequence.current.begin()
     detailController.current?.abort()
@@ -148,32 +194,38 @@ export default function Connections({ tenantId = '', initialConnectionId = '', e
     setTokens([])
     setConfigText(JSON.stringify(row.public_config || {}, null, 2))
     setCredentialsText('{}')
+    setTokenLabel('')
     setDrawerBusy('detail')
     try {
       const [detailResponse, toolResponse] = await Promise.all([
         api.get(`/admin/connections/${encodeURIComponent(row.connection_id)}`, { signal: controller.signal }),
         api.get(`/admin/connections/${encodeURIComponent(row.connection_id)}/tools`, { signal: controller.signal }).catch(() => ({ data: { items: [] } })),
       ])
-      if (!detailSequence.current.isCurrent(requestId) || controller.signal.aborted) return
+      if (!isDetailCurrent(requestId, row.connection_id, controller)) return
       const next = detailResponse.data?.connection || row
       setDetail(next)
       setTokens(detailResponse.data?.tokens || [])
       setTools(toolResponse.data?.items || [])
       setConfigText(JSON.stringify(next.public_config || {}, null, 2))
     } catch (error) {
-      if (!controller.signal.aborted && detailSequence.current.isCurrent(requestId)) messageApi.error(safeServerError(error, '连接详情加载失败'))
+      if (isDetailCurrent(requestId, row.connection_id, controller)) messageApi.error(safeServerError(error, '连接详情加载失败'))
     } finally {
-      if (detailSequence.current.isCurrent(requestId)) setDrawerBusy('')
+      if (isDetailCurrent(requestId, row.connection_id, controller)) setDrawerBusy('')
     }
   }, [messageApi])
 
   useEffect(() => {
     detailSequence.current.invalidate()
     detailController.current?.abort()
+    invalidateDrawerMutations()
     openDetailId.current = ''
     setDetail(null)
     setTools([])
     setTokens([])
+    setCredentialsText('{}')
+    setConfigText('{}')
+    setTokenLabel('')
+    setTokenModal(closeTokenModal())
     openedInitialConnection.current = ''
   }, [initialConnectionId])
   useEffect(() => {
@@ -199,6 +251,7 @@ export default function Connections({ tenantId = '', initialConnectionId = '', e
   const closeDetail = () => {
     detailSequence.current.invalidate()
     detailController.current?.abort()
+    invalidateDrawerMutations()
     openDetailId.current = ''
     setDetail(null)
     setTools([])
@@ -206,22 +259,49 @@ export default function Connections({ tenantId = '', initialConnectionId = '', e
     setCredentialsText('{}')
     setConfigText('{}')
     setTokenLabel('')
+    setTokenModal(closeTokenModal())
     setActiveTab('config')
   }
 
   const showToken = (connection, rawToken) => {
-    tokenSecret.current = rawToken
     setTokenModal({ open: true, rawToken, connectionId: connection.connection_id })
   }
   const dismissToken = () => {
-    tokenSecret.current = ''
     setTokenModal(closeTokenModal())
   }
 
+  const refreshDrawerDetail = async (connection, ticket, controller) => {
+    const id = encodeURIComponent(connection.connection_id)
+    const [detailResponse, toolResponse] = await Promise.all([
+      api.get(`/admin/connections/${id}`, { signal: controller.signal }),
+      api.get(`/admin/connections/${id}/tools`, { signal: controller.signal }).catch(() => ({ data: { items: [] } })),
+    ])
+    if (!isDrawerMutationCurrent(ticket, controller)) return
+    const next = detailResponse.data?.connection || connection
+    setDetail(next)
+    setTokens(detailResponse.data?.tokens || [])
+    setTools(toolResponse.data?.items || [])
+    setConfigText(JSON.stringify(next.public_config || {}, null, 2))
+  }
+
+  const closeCreate = () => {
+    createSequence.current.invalidate()
+    createController.current?.abort()
+    setCreateBusy(false)
+    setCreateOpen(false)
+    form.resetFields()
+  }
+
   const create = async () => {
+    const requestId = createSequence.current.begin()
+    createController.current?.abort()
+    const controller = new AbortController()
+    createController.current = controller
+    const isCurrent = () => mounted.current && !controller.signal.aborted && createSequence.current.isCurrent(requestId)
     setCreateBusy(true)
     try {
       const values = await form.validateFields()
+      if (!isCurrent()) return
       const connectorKey = String(values.connector_key || '').trim()
       const declarative = connectorKey === 'http_declarative'
       const response = await api.post(`/admin/tenants/${encodeURIComponent(values.tenant_id)}/connections`, {
@@ -231,66 +311,91 @@ export default function Connections({ tenantId = '', initialConnectionId = '', e
         status: declarative ? 'draft' : 'active',
         public_config: declarative ? {} : parseObject(values.public_config, '公开配置'),
         credentials: declarative ? {} : parseObject(values.credentials, '凭据'),
-      })
+      }, { signal: controller.signal })
+      if (!isCurrent()) return
       const connection = response.data.connection
       form.resetFields()
       setCreateOpen(false)
       showToken(connection, response.data.initial_token)
       messageApi.success('连接已创建；Token 只显示这一次')
       await load()
-      if (declarative) openDetail(connection)
+      if (isCurrent() && declarative) openDetail(connection, true)
     } catch (error) {
-      if (!error?.errorFields) messageApi.error(error.message || safeServerError(error, '创建连接失败'))
-    } finally { setCreateBusy(false) }
+      if (isCurrent() && !error?.errorFields) messageApi.error(error.message || safeServerError(error, '创建连接失败'))
+    } finally {
+      if (isCurrent()) setCreateBusy(false)
+    }
   }
 
   const saveConfig = async () => {
     if (!detail) return
-    if (isActiveDeclarativeConfigReadOnly(detail)) {
+    const connection = detail
+    if (isActiveDeclarativeConfigReadOnly(connection)) {
       messageApi.warning('活动声明式连接不可通过通用配置修改；请先停用连接，再使用声明式向导发布待激活修订。')
       return
     }
+    const { ticket, controller } = beginDrawerMutation(connection.connection_id)
     setDrawerBusy('config')
-    const connectionId = detail.connection_id
     try {
-      const response = await api.put(`/admin/connections/${encodeURIComponent(detail.connection_id)}`, {
-        display_name: detail.display_name,
-        data_mode: detail.data_mode,
-        public_config: parseObject(configText, '公开配置'),
-        status: detail.connector_key === 'http_declarative' ? null : detail.status,
-      })
-      if (openDetailId.current === connectionId) setDetail(response.data.connection)
+      const publicConfig = parseObject(configText, '公开配置')
+      const response = await api.put(`/admin/connections/${encodeURIComponent(connection.connection_id)}`, {
+        display_name: connection.display_name,
+        data_mode: connection.data_mode,
+        public_config: publicConfig,
+        status: connection.connector_key === 'http_declarative' ? null : connection.status,
+      }, { signal: controller.signal })
+      if (!isDrawerMutationCurrent(ticket, controller)) return
+      setDetail(response.data.connection)
       messageApi.success('连接配置已保存')
       load()
-    } catch (error) { messageApi.error(error.message || safeServerError(error, '保存配置失败')) }
-    finally { setDrawerBusy('') }
+    } catch (error) {
+      if (isDrawerMutationCurrent(ticket, controller)) messageApi.error(error.message || safeServerError(error, '保存配置失败'))
+    } finally {
+      if (isDrawerMutationCurrent(ticket, controller)) setDrawerBusy('')
+    }
   }
 
   const saveCredentials = async () => {
+    if (!detail) return
+    const connection = detail
+    const { ticket, controller } = beginDrawerMutation(connection.connection_id)
     setDrawerBusy('credentials')
     try {
-      await api.put(`/admin/connections/${encodeURIComponent(detail.connection_id)}/credentials`, {
-        credentials: parseObject(credentialsText, '新凭据'),
-      })
+      const credentials = parseObject(credentialsText, '新凭据')
+      await api.put(`/admin/connections/${encodeURIComponent(connection.connection_id)}/credentials`, {
+        credentials,
+      }, { signal: controller.signal })
+      if (!isDrawerMutationCurrent(ticket, controller)) return
       setCredentialsText('{}')
       messageApi.success('凭据已替换，输入内容已清除')
-    } catch (error) { messageApi.error(error.message || safeServerError(error, '替换凭据失败')) }
-    finally { setDrawerBusy('') }
+    } catch (error) {
+      if (isDrawerMutationCurrent(ticket, controller)) messageApi.error(error.message || safeServerError(error, '替换凭据失败'))
+    } finally {
+      if (isDrawerMutationCurrent(ticket, controller)) setDrawerBusy('')
+    }
   }
 
   const issueToken = async (rotate = false) => {
-    const connectionId = detail.connection_id
+    if (!detail) return
+    const connection = detail
+    const label = tokenLabel.trim()
+    const { ticket, controller } = beginDrawerMutation(connection.connection_id)
     setDrawerBusy('token')
     try {
       const response = await api.post(
-        `/admin/connections/${encodeURIComponent(detail.connection_id)}/tokens${rotate ? '/rotate' : ''}`,
-        { label: tokenLabel.trim() },
+        `/admin/connections/${encodeURIComponent(connection.connection_id)}/tokens${rotate ? '/rotate' : ''}`,
+        { label },
+        { signal: controller.signal },
       )
+      if (!isDrawerMutationCurrent(ticket, controller)) return
       setTokenLabel('')
-      showToken(detail, response.data.token)
-      if (openDetailId.current === connectionId) await openDetail(detail)
-    } catch (error) { messageApi.error(safeServerError(error, 'Token 操作失败')) }
-    finally { setDrawerBusy('') }
+      showToken(connection, response.data.token)
+      await refreshDrawerDetail(connection, ticket, controller)
+    } catch (error) {
+      if (isDrawerMutationCurrent(ticket, controller)) messageApi.error(safeServerError(error, 'Token 操作失败'))
+    } finally {
+      if (isDrawerMutationCurrent(ticket, controller)) setDrawerBusy('')
+    }
   }
 
   const revokeToken = (token) => modal.confirm({
@@ -300,47 +405,73 @@ export default function Connections({ tenantId = '', initialConnectionId = '', e
     okButtonProps: { danger: true },
     cancelText: '取消',
     onOk: async () => {
-      const connectionId = detail.connection_id
+      if (!detail) return
+      const connection = detail
+      const { ticket, controller } = beginDrawerMutation(connection.connection_id)
+      setDrawerBusy('token')
       try {
-        await api.delete(`/admin/connections/${encodeURIComponent(detail.connection_id)}/tokens/${encodeURIComponent(token.token_id)}`)
+        await api.delete(`/admin/connections/${encodeURIComponent(connection.connection_id)}/tokens/${encodeURIComponent(token.token_id)}`, {
+          signal: controller.signal,
+        })
+        if (!isDrawerMutationCurrent(ticket, controller)) return
         messageApi.success('Token 已撤销')
-        if (openDetailId.current === connectionId) await openDetail(detail)
+        await refreshDrawerDetail(connection, ticket, controller)
       } catch (error) {
-        messageApi.error(safeServerError(error, '撤销 Token 失败'))
-        throw error
+        if (isDrawerMutationCurrent(ticket, controller)) {
+          messageApi.error(safeServerError(error, '撤销 Token 失败'))
+          throw error
+        }
+      } finally {
+        if (isDrawerMutationCurrent(ticket, controller)) setDrawerBusy('')
       }
     },
   })
 
   const saveTools = async () => {
+    if (!detail) return
+    const connection = detail
     const invalidWrite = tools.some((tool) => tool.enabled && !canEnableWriteTool(tool, {
       explicitEnable: Boolean(tool.enabled), explicitWrite: tool.policy?.allow_write,
     }))
     if (invalidWrite) { messageApi.warning('启用写操作时必须明确同意写入'); return }
+    const policies = tools.map((tool) => ({
+      tool_key: tool.tool_key,
+      enabled: Boolean(tool.enabled),
+      allow_write: tool.operation_kind === 'write' && Boolean(tool.policy?.allow_write),
+    }))
+    const { ticket, controller } = beginDrawerMutation(connection.connection_id)
     setDrawerBusy('tools')
     try {
-      await api.put(`/admin/connections/${encodeURIComponent(detail.connection_id)}/tools`, {
-        policies: tools.map((tool) => ({
-          tool_key: tool.tool_key,
-          enabled: Boolean(tool.enabled),
-          allow_write: tool.operation_kind === 'write' && Boolean(tool.policy?.allow_write),
-        })),
-      })
+      await api.put(`/admin/connections/${encodeURIComponent(connection.connection_id)}/tools`, {
+        policies,
+      }, { signal: controller.signal })
+      if (!isDrawerMutationCurrent(ticket, controller)) return
       messageApi.success('工具策略已保存')
-    } catch (error) { messageApi.error(safeServerError(error, '工具策略保存失败')) }
-    finally { setDrawerBusy('') }
+    } catch (error) {
+      if (isDrawerMutationCurrent(ticket, controller)) messageApi.error(safeServerError(error, '工具策略保存失败'))
+    } finally {
+      if (isDrawerMutationCurrent(ticket, controller)) setDrawerBusy('')
+    }
   }
 
   const action = async (name, path, success) => {
-    const connectionId = detail.connection_id
+    if (!detail) return
+    const connection = detail
+    const { ticket, controller } = beginDrawerMutation(connection.connection_id)
     setDrawerBusy(name)
     try {
-      const response = await api.post(`/admin/connections/${encodeURIComponent(detail.connection_id)}/${path}`)
+      const response = await api.post(`/admin/connections/${encodeURIComponent(connection.connection_id)}/${path}`, undefined, {
+        signal: controller.signal,
+      })
+      if (!isDrawerMutationCurrent(ticket, controller)) return
       messageApi.success(success)
-      if (response.data?.connection && openDetailId.current === connectionId) setDetail(response.data.connection)
+      if (response.data?.connection) setDetail(response.data.connection)
       load()
-    } catch (error) { messageApi.error(safeServerError(error)) }
-    finally { setDrawerBusy('') }
+    } catch (error) {
+      if (isDrawerMutationCurrent(ticket, controller)) messageApi.error(safeServerError(error))
+    } finally {
+      if (isDrawerMutationCurrent(ticket, controller)) setDrawerBusy('')
+    }
   }
 
   const columns = [
@@ -408,7 +539,7 @@ export default function Connections({ tenantId = '', initialConnectionId = '', e
         {detail && <><div className="connection-drawer-rail"><span><ApiOutlined /> {detail.connector_key}</span><span>{DATA_MODE[detail.data_mode] || detail.data_mode}</span><Text code>{endpoint(detail.connection_id)}</Text></div><Tabs activeKey={activeTab} items={tabs} onChange={(key) => { setActiveTab(key); if (key !== 'credentials') setCredentialsText('{}') }} /></>}
       </Drawer>
 
-      <Modal title="新建连接实例" open={createOpen} onCancel={() => { setCreateOpen(false); form.resetFields() }} onOk={create} confirmLoading={createBusy} okText="创建连接" cancelText="取消" width={620}>
+      <Modal title="新建连接实例" open={createOpen} onCancel={closeCreate} onOk={create} confirmLoading={createBusy} okText="创建连接" cancelText="取消" width={620}>
         <Form form={form} layout="vertical" initialValues={{ tenant_id: tenantId || scopeTenant || undefined, connector_key: 'wecom', data_mode: 'direct', public_config: '{}', credentials: '{}' }}>
           <Form.Item name="tenant_id" label="租户" rules={[{ required: true, message: '请选择租户' }]}><Select disabled={Boolean(tenantId)} showSearch optionFilterProp="label" options={tenants.map((tenant) => ({ value: tenant.tenant_id, label: tenant.display_name ? `${tenant.display_name} · ${tenant.tenant_id}` : tenant.tenant_id }))} /></Form.Item>
           <Form.Item name="display_name" label="连接名称" rules={[{ required: true, whitespace: true, max: 128 }]}><Input placeholder="例如 华东企微生产连接" /></Form.Item>
