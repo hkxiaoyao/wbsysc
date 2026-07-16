@@ -379,8 +379,11 @@ def test_legacy_migration_is_bounded_mapped_and_marks_completion(monkeypatch):
     assert "legacy_schema" in sql and "legacy_id" in sql
     assert "connection_instance" in sql
     assert "connection_id, connector_key, tool_key" in sql
-    # MySQL 5.7 accepts unqualified target-column references in the duplicate
-    # update clause; qualifying the target table is not portable there.
+    # Keep the source column name distinct so the MySQL 5.7 duplicate-update
+    # target reference cannot become ambiguous.
+    assert "SELECT connection_id AS mapped_connection_id" in sql
+    assert "connection_map.mapped_connection_id" in sql
+    assert "connection_map.connection_id" not in sql
     assert "mcp_call_log.connection_id" not in sql
     assert "SELECT tenant_id, schema_name, created_at FROM tenant_config" in sql
     assert "created_at >= :tenant_created_at" in sql
