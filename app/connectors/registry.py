@@ -2,9 +2,11 @@
 
 from __future__ import annotations
 
-from collections.abc import Iterable
+from collections.abc import Iterable, Mapping
+import math
 import re
 from types import MappingProxyType
+import unicodedata
 
 from .contracts import Connector, ConnectorSpec, ToolSpec
 
@@ -14,6 +16,68 @@ _MANIFEST_VERSION_PATTERN = re.compile(
     r"^[0-9]+(?:\.[0-9]+){0,2}(?:[-+][A-Za-z0-9][A-Za-z0-9.-]*)?$"
 )
 _TOOL_IDENTIFIER_PATTERN = re.compile(r"^[A-Za-z][A-Za-z0-9_.-]{0,127}$")
+_MAX_DESCRIPTION_LENGTH = 2_048
+_MAX_JSON_DEPTH = 24
+_MAX_JSON_NODES = 4_096
+_MAX_JSON_KEY_LENGTH = 256
+_MAX_JSON_STRING_LENGTH = 16_384
+
+
+def _has_control_characters(value: str) -> bool:
+    return any(unicodedata.category(character).startswith("C") for character in value)
+
+
+def _freeze_json_tree(value: object, *, field_name: str) -> object:
+    """Validate and detach a bounded, acyclic JSON-compatible tree."""
+    active: set[int] = set()
+    nodes = 0
+
+    def freeze(node: object, depth: int) -> object:
+        nonlocal nodes
+        nodes += 1
+        if nodes > _MAX_JSON_NODES or depth > _MAX_JSON_DEPTH:
+            raise ValueError(f"invalid connector {field_name}")
+        if node is None or isinstance(node, bool):
+            return node
+        if isinstance(node, int) and not isinstance(node, bool):
+            return node
+        if isinstance(node, float):
+            if not math.isfinite(node):
+                raise ValueError(f"invalid connector {field_name}")
+            return node
+        if isinstance(node, str):
+            if len(node) > _MAX_JSON_STRING_LENGTH or _has_control_characters(node):
+                raise ValueError(f"invalid connector {field_name}")
+            return node
+
+        identity = id(node)
+        if identity in active:
+            raise ValueError(f"invalid connector {field_name}")
+        if isinstance(node, Mapping):
+            active.add(identity)
+            try:
+                frozen: dict[str, object] = {}
+                for key, item in node.items():
+                    if (
+                        not isinstance(key, str)
+                        or not key
+                        or len(key) > _MAX_JSON_KEY_LENGTH
+                        or _has_control_characters(key)
+                    ):
+                        raise ValueError(f"invalid connector {field_name}")
+                    frozen[key] = freeze(item, depth + 1)
+                return MappingProxyType(frozen)
+            finally:
+                active.remove(identity)
+        if isinstance(node, (list, tuple)):
+            active.add(identity)
+            try:
+                return tuple(freeze(item, depth + 1) for item in node)
+            finally:
+                active.remove(identity)
+        raise ValueError(f"invalid connector {field_name}")
+
+    return freeze(value, 0)
 
 
 def validate_connector_manifest(
@@ -39,8 +103,8 @@ def validate_connector_manifest(
         or not _MANIFEST_VERSION_PATTERN.fullmatch(spec.version)
     ):
         raise ValueError("connector manifest version is invalid")
-    if not isinstance(spec.config_schema, dict) or not isinstance(
-        spec.credential_schema, dict
+    if not isinstance(spec.config_schema, Mapping) or not isinstance(
+        spec.credential_schema, Mapping
     ):
         raise ValueError("invalid connector manifest")
     if not isinstance(spec.supports_sync, bool):
@@ -57,6 +121,7 @@ def validate_connector_manifest(
         raise ValueError("invalid connector manifest")
 
     identifiers: set[str] = set()
+    frozen_tools: list[ToolSpec] = []
     for tool in spec.tools:
         if not isinstance(tool, ToolSpec):
             raise ValueError("invalid connector tool")
@@ -71,6 +136,13 @@ def validate_connector_manifest(
         if tool.operation_kind not in {"read", "write"}:
             raise ValueError("invalid connector tool operation")
         if (
+            not isinstance(tool.description, str)
+            or not tool.description
+            or len(tool.description) > _MAX_DESCRIPTION_LENGTH
+            or _has_control_characters(tool.description)
+        ):
+            raise ValueError("invalid connector tool description")
+        if (
             isinstance(tool.default_timeout_ms, bool)
             or not isinstance(tool.default_timeout_ms, int)
             or tool.default_timeout_ms <= 0
@@ -82,15 +154,44 @@ def validate_connector_manifest(
             or tool.cache_ttl_seconds < 0
         ):
             raise ValueError("invalid connector tool cache ttl")
-        if not isinstance(tool.input_schema, dict) or (
-            tool.output_schema is not None and not isinstance(tool.output_schema, dict)
+        if not isinstance(tool.input_schema, Mapping) or (
+            tool.output_schema is not None
+            and not isinstance(tool.output_schema, Mapping)
         ):
             raise ValueError("invalid connector tool schema")
         for identifier in {tool.tool_key, tool.mcp_name}:
             if identifier in identifiers:
                 raise ValueError("invalid connector manifest")
             identifiers.add(identifier)
-    return spec
+        frozen_tools.append(
+            ToolSpec(
+                tool_key=tool.tool_key,
+                mcp_name=tool.mcp_name,
+                description=tool.description,
+                input_schema=_freeze_json_tree(
+                    tool.input_schema, field_name="tool schema"
+                ),
+                output_schema=(
+                    None
+                    if tool.output_schema is None
+                    else _freeze_json_tree(tool.output_schema, field_name="tool schema")
+                ),
+                operation_kind=tool.operation_kind,
+                default_timeout_ms=tool.default_timeout_ms,
+                cache_ttl_seconds=tool.cache_ttl_seconds,
+            )
+        )
+    return ConnectorSpec(
+        connector_key=spec.connector_key,
+        tools=tuple(frozen_tools),
+        supports_sync=spec.supports_sync,
+        version=spec.version,
+        config_schema=_freeze_json_tree(spec.config_schema, field_name="config schema"),
+        credential_schema=_freeze_json_tree(
+            spec.credential_schema, field_name="credential schema"
+        ),
+        supports_data_modes=tuple(spec.supports_data_modes),
+    )
 
 
 class ConnectorRegistry:
@@ -145,9 +246,14 @@ class ConnectorRegistry:
         validated = validate_connector_manifest(spec)
         self._validate_registration(validated)
 
-    def _validate_registration(self, spec: ConnectorSpec) -> set[str]:
+    @staticmethod
+    def _validate_against(
+        spec: ConnectorSpec,
+        connectors: Mapping[str, Connector],
+        tool_identities: Mapping[str, str],
+    ) -> set[str]:
         connector_key = spec.connector_key
-        if connector_key in self._connectors:
+        if connector_key in connectors:
             raise ValueError(f"duplicate connector_key: {connector_key}")
         candidate_identities = {
             identifier
@@ -156,13 +262,99 @@ class ConnectorRegistry:
         }
         if (
             connector_key in candidate_identities
-            or connector_key in self._tool_identities
-            or (candidate_identities & self._connectors.keys())
+            or connector_key in tool_identities
+            or (candidate_identities & connectors.keys())
         ):
             raise ValueError("cross-namespace connector identity collision")
-        if candidate_identities & self._tool_identities.keys():
+        if candidate_identities & tool_identities.keys():
             raise ValueError("duplicate tool identifier across connectors")
         return candidate_identities
+
+    def _validate_registration(self, spec: ConnectorSpec) -> set[str]:
+        return self._validate_against(spec, self._connectors, self._tool_identities)
+
+    def _base_without_discovered(self):
+        stale = set(self._discovered_keys)
+        connectors = {
+            key: connector
+            for key, connector in self._connectors.items()
+            if key not in stale
+        }
+        specs = {key: spec for key, spec in self._specs.items() if key not in stale}
+        identities = {
+            identity: owner
+            for identity, owner in self._tool_identities.items()
+            if owner not in stale
+        }
+        return connectors, specs, identities
+
+    def validate_discovered_batch(
+        self, specs: Iterable[ConnectorSpec]
+    ) -> tuple[ConnectorSpec, ...]:
+        """Validate a complete replacement batch without mutating live state."""
+        connectors, _registered_specs, identities = self._base_without_discovered()
+        snapshots: list[ConnectorSpec] = []
+        for spec in specs:
+            snapshot = validate_connector_manifest(spec)
+            candidate_identities = self._validate_against(
+                snapshot, connectors, identities
+            )
+            connectors[snapshot.connector_key] = None  # type: ignore[assignment]
+            identities.update(
+                {identity: snapshot.connector_key for identity in candidate_identities}
+            )
+            snapshots.append(snapshot)
+        return tuple(snapshots)
+
+    def partition_discovered_batch(
+        self, specs: Iterable[ConnectorSpec]
+    ) -> tuple[tuple[tuple[int, ConnectorSpec], ...], tuple[int, ...]]:
+        """Select a deterministic non-conflicting subset without live mutation."""
+        connectors, _registered_specs, identities = self._base_without_discovered()
+        accepted: list[tuple[int, ConnectorSpec]] = []
+        rejected: list[int] = []
+        for index, spec in enumerate(specs):
+            try:
+                snapshot = validate_connector_manifest(spec)
+                candidate_identities = self._validate_against(
+                    snapshot, connectors, identities
+                )
+            except ValueError:
+                rejected.append(index)
+                continue
+            connectors[snapshot.connector_key] = None  # type: ignore[assignment]
+            identities.update(
+                {identity: snapshot.connector_key for identity in candidate_identities}
+            )
+            accepted.append((index, snapshot))
+        return tuple(accepted), tuple(rejected)
+
+    def replace_discovered_connectors(
+        self,
+        connectors: Iterable[tuple[Connector, ConnectorSpec]],
+    ) -> None:
+        """Atomically replace the whole package batch after global preflight."""
+        items = tuple(connectors)
+        snapshots = self.validate_discovered_batch(spec for _, spec in items)
+        next_connectors, next_specs, next_identities = self._base_without_discovered()
+        next_discovered: set[str] = set()
+        for (connector, _spec), snapshot in zip(items, snapshots, strict=True):
+            identities = {
+                identifier
+                for tool in snapshot.tools
+                for identifier in (tool.tool_key, tool.mcp_name)
+            }
+            next_connectors[snapshot.connector_key] = connector
+            next_specs[snapshot.connector_key] = snapshot
+            next_identities.update(
+                {identity: snapshot.connector_key for identity in identities}
+            )
+            next_discovered.add(snapshot.connector_key)
+
+        self._connectors = next_connectors
+        self._specs = next_specs
+        self._tool_identities = next_identities
+        self._discovered_keys = next_discovered
 
     def _register(self, connector: Connector, spec: ConnectorSpec) -> None:
         connector_key = spec.connector_key

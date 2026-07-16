@@ -117,6 +117,17 @@ def test_registry_rejects_duplicate_connector_keys():
         registry.register(FakeConnector("wecom"))
 
 
+def test_runtime_uses_registry_snapshot_without_reexecuting_connector_spec():
+    connector = FakeConnector(tools=(READ_TOOL,))
+    registry = ConnectorRegistry([connector])
+    runtime = ConnectorRuntime(registry)
+    connector.spec = lambda: (_ for _ in ()).throw(
+        AssertionError("runtime re-executed connector.spec")
+    )
+
+    assert runtime.list_enabled_tools(context()) == (READ_TOOL,)
+
+
 def test_contracts_are_immutable_and_resolve_tool_keys_and_mcp_names():
     spec = ConnectorSpec(connector_key="wecom", tools=(READ_TOOL, WRITE_TOOL))
 
@@ -380,11 +391,7 @@ async def test_runtime_normalizes_policy_timeouts_before_waiting(monkeypatch):
     monkeypatch.setattr(runtime_module.asyncio, "wait_for", capture_wait_for)
     connector = FakeConnector()
     policies = FakePolicyStore(
-        (
-            ToolPolicy(
-                "conn-a", "reports.list", enabled=True, policy={"timeout_ms": -1}
-            ),
-        )
+        (ToolPolicy("conn-a", "reports.list", enabled=True, policy={"timeout_ms": -1}),)
     )
     runtime = ConnectorRuntime(registry_with(connector), policy_store=policies)
 
@@ -464,7 +471,9 @@ async def test_runtime_audit_handoff_omits_credentials_bodies_and_exception_text
             raise OpaqueFailure()
 
     events = []
-    runtime = ConnectorRuntime(registry_with(FailingConnector()), audit_sink=events.append)
+    runtime = ConnectorRuntime(
+        registry_with(FailingConnector()), audit_sink=events.append
+    )
     ctx = context(
         credentials={"Authorization": "Bearer secret-value", "Cookie": "session=abc"}
     )
@@ -500,7 +509,9 @@ async def test_runtime_audit_uses_a_fixed_code_for_an_adversarial_exception_name
             raise AdversarialFailure()
 
     events = []
-    runtime = ConnectorRuntime(registry_with(FailingConnector()), audit_sink=events.append)
+    runtime = ConnectorRuntime(
+        registry_with(FailingConnector()), audit_sink=events.append
+    )
 
     with pytest.raises(AdversarialFailure):
         await runtime.execute(context(), "reports.list", {})

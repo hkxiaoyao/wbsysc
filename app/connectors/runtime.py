@@ -1,4 +1,5 @@
 """Connection-scoped policy enforcement and connector execution runtime."""
+
 from __future__ import annotations
 
 import asyncio
@@ -38,6 +39,30 @@ class InvalidToolPolicyError(PermissionError):
 
 class UnsupportedDataModeError(ValueError):
     """Raised when a connection mode is absent from the connector manifest."""
+
+
+def _thaw_json(value: Any) -> Any:
+    if isinstance(value, Mapping):
+        return {key: _thaw_json(item) for key, item in value.items()}
+    if isinstance(value, tuple):
+        return [_thaw_json(item) for item in value]
+    return value
+
+
+def _public_tool_copy(tool: ToolSpec) -> ToolSpec:
+    """Return JSON-serializable schemas without exposing the registry snapshot."""
+    return ToolSpec(
+        tool_key=tool.tool_key,
+        mcp_name=tool.mcp_name,
+        description=tool.description,
+        input_schema=_thaw_json(tool.input_schema),
+        output_schema=(
+            None if tool.output_schema is None else _thaw_json(tool.output_schema)
+        ),
+        operation_kind=tool.operation_kind,
+        default_timeout_ms=tool.default_timeout_ms,
+        cache_ttl_seconds=tool.cache_ttl_seconds,
+    )
 
 
 @dataclass(frozen=True)
@@ -104,9 +129,7 @@ class PolicyGuard:
         return ResolvedToolPolicy(
             enabled=enabled,
             allow_write=(
-                allow_write is True
-                and read_only is not True
-                and readonly is not True
+                allow_write is True and read_only is not True and readonly is not True
             ),
             timeout_ms=normalize_timeout_ms(
                 values.get("timeout_ms"),
@@ -137,7 +160,9 @@ def normalize_timeout_ms(value: Any, default_timeout_ms: int) -> int:
         and default_timeout_ms > 0
         else MAX_TIMEOUT_MS
     )
-    timeout_ms = value if isinstance(value, int) and not isinstance(value, bool) else fallback
+    timeout_ms = (
+        value if isinstance(value, int) and not isinstance(value, bool) else fallback
+    )
     if timeout_ms <= 0:
         timeout_ms = fallback
     return min(timeout_ms, MAX_TIMEOUT_MS)
@@ -154,7 +179,9 @@ def normalize_rate_limit(values: Mapping[str, Any]) -> RateLimit | None:
     if has_nested_limit and isinstance(raw_limit, Mapping):
         limit = raw_limit.get("limit", raw_limit.get("max_calls"))
         window_seconds = raw_limit.get("window_seconds")
-        if window_seconds is None and isinstance(raw_limit.get("window_ms"), (int, float)):
+        if window_seconds is None and isinstance(
+            raw_limit.get("window_ms"), (int, float)
+        ):
             window_seconds = raw_limit["window_ms"] / 1000
     elif not has_nested_limit and has_per_minute_limit:
         limit = values.get("rate_limit_per_minute")
@@ -232,7 +259,9 @@ class ExecutionPlanner:
             return await connector.execute(context, tool.tool_key, args)
         result = executor(context, connector, tool, args)
         if not inspect.isawaitable(result):
-            raise TypeError("data-mode executor must return an awaitable ExecutionResult")
+            raise TypeError(
+                "data-mode executor must return an awaitable ExecutionResult"
+            )
         return await result
 
 
@@ -244,7 +273,9 @@ class ConnectorRuntime:
         self,
         registry: ConnectorRegistry,
         *,
-        policy_store: ToolPolicyStore | Mapping[tuple[str, str], ToolPolicy] | None = None,
+        policy_store: ToolPolicyStore
+        | Mapping[tuple[str, str], ToolPolicy]
+        | None = None,
         policy_guard: PolicyGuard | None = None,
         planner: ExecutionPlanner | None = None,
         rate_limiter: SlidingWindowRateLimiter | None = None,
@@ -262,15 +293,17 @@ class ConnectorRuntime:
     def list_enabled_tools(self, context: ConnectionContext) -> tuple[ToolSpec, ...]:
         if context.connection.status != "active":
             return ()
-        connector = self._registry.get(context.connection.connector_key)
+        spec = self._registry.validated_spec(context.connection.connector_key)
+        if spec is None:
+            raise KeyError(f"unknown connector_key: {context.connection.connector_key}")
         enabled_tools = []
-        for tool in connector.spec().tools:
+        for tool in spec.tools:
             policy = self._policy_for(context, tool)
             try:
                 self._policy_guard.assert_allowed(tool, policy)
             except (ToolDisabledError, WritePolicyError, InvalidToolPolicyError):
                 continue
-            enabled_tools.append(tool)
+            enabled_tools.append(_public_tool_copy(tool))
         return tuple(enabled_tools)
 
     async def execute(
@@ -284,13 +317,17 @@ class ConnectorRuntime:
         if context.connection.status != "active":
             raise ConnectionUnavailableError("connection is unavailable")
 
-        connector = self._registry.get(context.connection.connector_key)
-        tool = connector.spec().tool(tool_key)
+        spec = self._registry.validated_spec(context.connection.connector_key)
+        if spec is None:
+            raise KeyError(f"unknown connector_key: {context.connection.connector_key}")
+        tool = spec.tool(tool_key)
         policy = self._policy_for(context, tool)
         try:
             resolved_policy = self._policy_guard.assert_allowed(tool, policy)
         except ToolDisabledError:
-            await self._audit(context, tool, "denied", 0, "tool_disabled", "tool disabled")
+            await self._audit(
+                context, tool, "denied", 0, "tool_disabled", "tool disabled"
+            )
             raise
         except WritePolicyError:
             await self._audit(
@@ -313,13 +350,10 @@ class ConnectorRuntime:
             )
             raise
 
-        if (
-            resolved_policy.rate_limit is not None
-            and not self._rate_limiter.allow(
-                context.connection.connection_id,
-                tool.tool_key,
-                resolved_policy.rate_limit,
-            )
+        if resolved_policy.rate_limit is not None and not self._rate_limiter.allow(
+            context.connection.connection_id,
+            tool.tool_key,
+            resolved_policy.rate_limit,
         ):
             await self._audit(
                 context,
@@ -360,7 +394,9 @@ class ConnectorRuntime:
             )
             raise
 
-        status = result.status if result.status in {"ok", "partial", "error"} else "error"
+        status = (
+            result.status if result.status in {"ok", "partial", "error"} else "error"
+        )
         await self._audit(context, tool, status, self._cost_ms(started_at))
         return result
 
@@ -371,7 +407,10 @@ class ConnectorRuntime:
         args: dict[str, Any],
     ) -> ExecutionResult:
         connector = self._registry.get(context.connection.connector_key)
-        if context.data_mode not in connector.spec().supports_data_modes:
+        spec = self._registry.validated_spec(context.connection.connector_key)
+        if spec is None:
+            raise KeyError(f"unknown connector_key: {context.connection.connector_key}")
+        if context.data_mode not in spec.supports_data_modes:
             raise UnsupportedDataModeError("connection data mode is not supported")
         return await self._planner.execute(context, connector, tool, args)
 

@@ -70,11 +70,14 @@ def _manifest_key_for_entry_point(entry_point_name: str) -> str:
 def discover_connector_packages() -> ConnectorDiscoveryResult:
     """Discover packages while retaining only safe, deterministic failures."""
     allowed = parse_connector_allowlist(get_settings().connector_allowlist)
-    candidates = [
-        entry_point
-        for entry_point in entry_points(group=ENTRY_POINT_GROUP)
-        if normalize_connector_name(entry_point.name) in allowed
-    ]
+    candidates = sorted(
+        (
+            entry_point
+            for entry_point in entry_points(group=ENTRY_POINT_GROUP)
+            if normalize_connector_name(entry_point.name) in allowed
+        ),
+        key=lambda entry_point: normalize_connector_name(entry_point.name),
+    )
 
     normalized_names = [normalize_connector_name(ep.name) for ep in candidates]
     if len(normalized_names) != len(set(normalized_names)):
@@ -120,17 +123,22 @@ def discover_connector_packages() -> ConnectorDiscoveryResult:
             failures.append(ConnectorDiscoveryFailure(expected_key, reason))
             continue
 
-        if spec.connector_key in connector_keys:
-            failures.append(ConnectorDiscoveryFailure(expected_key, "duplicate"))
-            continue
+        has_identity_collision = (
+            spec.connector_key in connector_keys
+            or spec.connector_key in tool_identities
+        )
         package_tool_ids = {
             identifier
             for tool in spec.tools
             for identifier in (tool.tool_key, tool.mcp_name)
         }
-        if package_tool_ids & tool_identities:
+        has_identity_collision = has_identity_collision or (
+            spec.connector_key in package_tool_ids
+            or package_tool_ids & tool_identities
+            or package_tool_ids & connector_keys
+        )
+        if has_identity_collision:
             failures.append(ConnectorDiscoveryFailure(expected_key, "duplicate"))
-            continue
         connector_keys.add(spec.connector_key)
         tool_identities.update(package_tool_ids)
         connectors.append(ValidatedConnector(connector, spec))
@@ -206,6 +214,6 @@ def register_discovered_connectors(
     result: ConnectorDiscoveryResult,
 ) -> None:
     """Idempotently register validated package metadata into one explicit registry."""
-    registry.clear_discovered_connectors()
-    for item in result.connectors:
-        registry.register_validated(item.connector, item.spec, discovered=True)
+    registry.replace_discovered_connectors(
+        (item.connector, item.spec) for item in result.connectors
+    )

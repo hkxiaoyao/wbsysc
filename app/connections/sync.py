@@ -1,4 +1,5 @@
 """Connection-scoped synchronization scheduling with redaction-only outcomes."""
+
 from __future__ import annotations
 
 import asyncio
@@ -134,14 +135,19 @@ def _safe_sync_data(data: Any) -> dict[str, int | bool]:
 
 
 def _eligible(connection: ConnectionRecord) -> bool:
-    if connection.status != "active" or connection.data_mode not in {"stored", "hybrid"}:
+    if connection.status != "active" or connection.data_mode not in {
+        "stored",
+        "hybrid",
+    }:
         return False
     if connection.data_mode == "hybrid":
         return connection.public_config.get("sync_enabled") is not False
     return True
 
 
-def _sync_resources(connection: ConnectionRecord, resource_key: str | None) -> tuple[str, ...]:
+def _sync_resources(
+    connection: ConnectionRecord, resource_key: str | None
+) -> tuple[str, ...]:
     if resource_key is not None:
         return (_safe_resource_key(resource_key),)
     configured = connection.public_config.get("sync_resources")
@@ -220,9 +226,7 @@ def list_syncable_connections() -> tuple[ConnectionRecord, ...]:
     with get_engine().connect() as conn:
         rows = conn.execute(statement, {"status": "active"}).mappings().all()
     return tuple(
-        record
-        for row in rows
-        if (record := _connection_from_row(row)) is not None
+        record for row in rows if (record := _connection_from_row(row)) is not None
     )
 
 
@@ -234,7 +238,9 @@ class SyncOrchestrator:
         registry: ConnectorRegistry,
         *,
         contexts: ConnectionContextBuilder,
-        connection_lister: Callable[[], Iterable[ConnectionRecord]] = list_syncable_connections,
+        connection_lister: Callable[
+            [], Iterable[ConnectionRecord]
+        ] = list_syncable_connections,
         event_writer: Callable[[McpLogEvent], Any] | None = None,
     ) -> None:
         if not isinstance(registry, ConnectorRegistry):
@@ -263,18 +269,23 @@ class SyncOrchestrator:
         async with self._locks.acquire(connection.connection_id):
             try:
                 connector = self._registry.get(connection.connector_key)
-                if connector.spec().supports_sync is not True:
+                spec = self._registry.validated_spec(connection.connector_key)
+                if spec is None or spec.supports_sync is not True:
                     return None
                 context = self._contexts.build(connection)
                 if inspect.isawaitable(context):
                     context = await context
                 if not isinstance(context, ConnectionContext):
-                    raise TypeError("connection context builder returned an invalid context")
+                    raise TypeError(
+                        "connection context builder returned an invalid context"
+                    )
                 if context.connection.connection_id != connection.connection_id:
                     raise ValueError("connection context scope does not match")
                 result = connector.sync(context, resource)
                 if not inspect.isawaitable(result):
-                    raise TypeError("connector sync must return an awaitable SyncResult")
+                    raise TypeError(
+                        "connector sync must return an awaitable SyncResult"
+                    )
                 result = await result
                 if not isinstance(result, SyncResult):
                     raise TypeError("connector sync returned an invalid result")
@@ -317,11 +328,15 @@ class SyncOrchestrator:
                 else tuple(await asyncio.to_thread(self._connection_lister))
             )
         except Exception:
-            logger.warning("Connection sync enumeration failed code=sync_enumeration_failed")
+            logger.warning(
+                "Connection sync enumeration failed code=sync_enumeration_failed"
+            )
             return ()
         results: list[SyncResult] = []
         for connection in scheduled:
-            if not isinstance(connection, ConnectionRecord) or not _eligible(connection):
+            if not isinstance(connection, ConnectionRecord) or not _eligible(
+                connection
+            ):
                 continue
             for resource in _sync_resources(connection, resource_key):
                 result = await self.run_connection(connection, resource)

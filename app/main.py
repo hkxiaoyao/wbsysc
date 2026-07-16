@@ -35,6 +35,8 @@ from .connectors.discovery import (
     ConnectorDiscoveryResult,
     ValidatedConnector,
     discover_connector_packages,
+    normalize_connector_name,
+    parse_connector_allowlist,
     register_discovered_connectors,
     validate_active_connector_dependencies,
 )
@@ -88,24 +90,32 @@ def list_active_connector_dependencies() -> tuple[_ConnectorDependency, ...]:
 def _registerable_discovery_result(
     registry: ConnectorRegistry,
     result: ConnectorDiscoveryResult,
+    *,
+    preferred_keys: frozenset[str] = frozenset(),
 ) -> ConnectorDiscoveryResult:
     """Preflight built-in/package collisions without executing connector code."""
-    registerable: list[ValidatedConnector] = []
     failures = list(result.failures)
-    for item in result.connectors:
-        existing = registry.validated_spec(item.spec.connector_key)
-        if existing == item.spec:
-            registerable.append(item)
-            continue
-        try:
-            registry.validate_registration(item.spec)
-        except ValueError:
-            failures.append(
-                ConnectorDiscoveryFailure(item.spec.connector_key, "registration")
-            )
-            continue
-        registerable.append(item)
-    return ConnectorDiscoveryResult(tuple(registerable), tuple(failures))
+    ordered = tuple(
+        sorted(
+            result.connectors,
+            key=lambda item: (
+                normalize_connector_name(item.spec.connector_key) not in preferred_keys,
+                normalize_connector_name(item.spec.connector_key),
+            ),
+        )
+    )
+    accepted, rejected = registry.partition_discovered_batch(
+        item.spec for item in ordered
+    )
+    for index in rejected:
+        failures.append(
+            ConnectorDiscoveryFailure(ordered[index].spec.connector_key, "registration")
+        )
+    registerable = tuple(
+        ValidatedConnector(ordered[index].connector, snapshot)
+        for index, snapshot in accepted
+    )
+    return ConnectorDiscoveryResult(registerable, tuple(failures))
 
 
 def configure_trusted_connectors(
@@ -114,12 +124,24 @@ def configure_trusted_connectors(
     """Discover, validate active dependencies, and idempotently register packages."""
     target = connector_registry if registry is None else registry
     dependencies = list_active_connector_dependencies()
-    target.clear_discovered_connectors()
-    result = _registerable_discovery_result(target, discover_connector_packages())
+    settings = get_settings()
+    allowed = parse_connector_allowlist(settings.connector_allowlist)
+    required = frozenset(
+        normalized
+        for dependency in dependencies
+        if dependency.status == "active"
+        and (normalized := normalize_connector_name(dependency.connector_key))
+        in allowed
+    )
+    result = _registerable_discovery_result(
+        target,
+        discover_connector_packages(),
+        preferred_keys=required,
+    )
     validate_active_connector_dependencies(
         dependencies,
         result,
-        allowlist=get_settings().connector_allowlist,
+        allowlist=settings.connector_allowlist,
     )
     register_discovered_connectors(target, result)
     for item in result.connectors:
@@ -131,9 +153,11 @@ def configure_trusted_connectors(
     return result
 
 
-def _build_connection_sync_orchestrator() -> SyncOrchestrator:
+def _build_connection_sync_orchestrator(
+    registry: ConnectorRegistry | None = None,
+) -> SyncOrchestrator:
     return SyncOrchestrator(
-        connector_registry,
+        connector_registry if registry is None else registry,
         contexts=ResolverConnectionContextBuilder(),
     )
 
@@ -146,6 +170,12 @@ def create_app(*, gateway: ConnectionMcpGateway | None = None) -> FastAPI:
     gateway = gateway or mcp_gateway
     app = FastAPI(title="企微数据中转 MCP Gateway", version="0.1.0")
     app.state.mcp_gateway = gateway
+    gateway_registry = getattr(
+        getattr(gateway, "_runtime", None), "_registry", connector_registry
+    )
+    app.state.connection_sync_orchestrator = _build_connection_sync_orchestrator(
+        gateway_registry
+    )
 
     # WorkBuddy 等客户端 POST /mcp（无尾斜杠）。Starlette Mount("/mcp") 时
     # 子应用拿到 path=""，匹配不到 FastMCP 的 "/"，会 405。进入路由前补上斜杠。
@@ -252,17 +282,18 @@ def create_app(*, gateway: ConnectionMcpGateway | None = None) -> FastAPI:
     return app
 
 
-async def _sync_job_async():
+async def _sync_job_async(orchestrator: SyncOrchestrator | None = None):
     """Legacy WeCom scheduler entrypoint delegated to connection-scoped sync."""
     settings = get_settings()
     if getattr(settings, "wecom_use_mock", False):
         logger.debug("mock 模式，跳过真实同步")
         return
     loop = asyncio.get_running_loop()
+    selected_orchestrator = orchestrator or connection_sync_orchestrator
     try:
         await loop.run_in_executor(
             None,
-            lambda: asyncio.run(connection_sync_orchestrator.run_scheduled()),
+            lambda: asyncio.run(selected_orchestrator.run_scheduled()),
         )
     except Exception:  # noqa: BLE001
         logger.error("Connection sync job failed code=sync_job_failed")
@@ -288,6 +319,9 @@ async def lifespan(app):
     db.run_startup_migrations()
     app_state = getattr(app, "state", None)
     gateway = getattr(app_state, "mcp_gateway", mcp_gateway)
+    sync_orchestrator = getattr(
+        app_state, "connection_sync_orchestrator", connection_sync_orchestrator
+    )
     if app_state is not None:
         gateway_registry = getattr(
             getattr(gateway, "_runtime", None), "_registry", connector_registry
@@ -339,6 +373,7 @@ async def lifespan(app):
                     _sync_job_async,
                     IntervalTrigger(minutes=min_interval),
                     id="wecom_sync",
+                    kwargs={"orchestrator": sync_orchestrator},
                     max_instances=1,
                     coalesce=True,
                 )
@@ -356,7 +391,7 @@ async def lifespan(app):
 
                 # 额外：启动后立即跑一次首次同步（独立后台任务，不依赖调度器）
                 # 这样既快响应（立即拉一次），又不干扰调度器的周期触发
-                asyncio.create_task(_sync_job_async())
+                asyncio.create_task(_sync_job_async(sync_orchestrator))
                 yield
             finally:
                 if scheduler is not None:

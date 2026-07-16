@@ -94,9 +94,24 @@ async def test_sync_orchestrator_scopes_context_and_resource_to_connection():
 
     assert result == SyncResult.ok("conn-b", "reports.list", {"stored": 1})
     assert contexts.connections == [connection("conn-b")]
-    assert [(context.connection_id, resource_key) for context, resource_key in connector.calls] == [
-        ("conn-b", "reports.list")
-    ]
+    assert [
+        (context.connection_id, resource_key)
+        for context, resource_key in connector.calls
+    ] == [("conn-b", "reports.list")]
+
+
+@pytest.mark.asyncio
+async def test_sync_orchestrator_uses_registry_snapshot_without_reexecuting_spec():
+    connector = SyncingConnector()
+    registry = ConnectorRegistry([connector])
+    orchestrator = SyncOrchestrator(registry, contexts=Contexts())
+    connector.spec = lambda: (_ for _ in ()).throw(
+        AssertionError("sync re-executed connector.spec")
+    )
+
+    result = await orchestrator.run_connection(connection(), "reports.list")
+
+    assert result == SyncResult.ok("conn-a", "reports.list", {"stored": 1})
 
 
 def test_connection_locks_serialize_across_event_loop_threads():
@@ -225,7 +240,9 @@ def test_wecom_connection_sync_busy_log_does_not_echo_connection_id(
     monkeypatch.setattr(dispatch.db, "connection_sync_lock", busy_connection_lock)
 
     with caplog.at_level(logging.WARNING, logger="wecom-sync"):
-        result = dispatch.run_sync_connection(wecom_connection_context(connection_id), "reports")
+        result = dispatch.run_sync_connection(
+            wecom_connection_context(connection_id), "reports"
+        )
 
     assert result == {"busy": True}
     assert "connection sync busy" in caplog.text
@@ -250,7 +267,10 @@ async def test_scheduler_runs_only_active_stored_and_eligible_hybrid_connections
         )
     )
 
-    assert [result.connection_id for result in results] == ["conn-stored", "conn-hybrid"]
+    assert [result.connection_id for result in results] == [
+        "conn-stored",
+        "conn-hybrid",
+    ]
     assert [context.connection_id for context, _ in connector.calls] == [
         "conn-stored",
         "conn-hybrid",
@@ -262,7 +282,9 @@ async def test_scheduler_drops_credential_bearing_resource_labels_before_logging
     connector = SyncingConnector()
     orchestrator = SyncOrchestrator(ConnectorRegistry([connector]), contexts=Contexts())
     unsafe = connection("conn-a")
-    object.__setattr__(unsafe, "public_config", {"sync_resources": ["token=top-secret"]})
+    object.__setattr__(
+        unsafe, "public_config", {"sync_resources": ["token=top-secret"]}
+    )
 
     results = await orchestrator.run_scheduled(connections=(unsafe,))
 
@@ -442,7 +464,9 @@ async def test_direct_cache_load_bypasses_retained_entries():
 @pytest.mark.asyncio
 async def test_sync_failures_return_a_fixed_safe_summary(caplog):
     class FailingConnector(SyncingConnector):
-        async def sync(self, context: ConnectionContext, resource_key: str) -> SyncResult:
+        async def sync(
+            self, context: ConnectionContext, resource_key: str
+        ) -> SyncResult:
             raise RuntimeError("token=top-secret raw response body")
 
     contexts = Contexts()
