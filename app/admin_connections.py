@@ -342,6 +342,8 @@ def _plain_schema_metadata(value: Any) -> Any:
         return {
             str(key): _plain_schema_metadata(item)
             for key, item in value.items()
+            if key not in {"const", "default", "enum", "example", "examples"}
+            and not str(key).lower().startswith("x-")
         }
     if isinstance(value, (list, tuple)):
         return [_plain_schema_metadata(item) for item in value]

@@ -701,7 +701,9 @@ def test_disabled_pending_revision_drives_credentials_tools_and_real_test(monkey
         },
         output_schema={
             "type": "object",
-            "properties": {"ok": {"type": "boolean"}},
+            "properties": {
+                "ok": {"type": "boolean", "example": True},
+            },
             "additionalProperties": False,
         },
         operation_kind="read",
@@ -714,7 +716,13 @@ def test_disabled_pending_revision_drives_credentials_tools_and_real_test(monkey
         credential_schema={
             "type": "object",
             "required": ["new_key"],
-            "properties": {"new_key": {"type": "string"}},
+            "properties": {
+                "new_key": {
+                    "type": "string",
+                    "default": "must-not-leak",
+                    "x-internal-example": "must-not-leak",
+                },
+            },
             "additionalProperties": False,
         },
     )
@@ -804,6 +812,7 @@ def test_disabled_pending_revision_drives_credentials_tools_and_real_test(monkey
         "properties": {"ok": {"type": "boolean"}},
         "additionalProperties": False,
     }
+    assert "must-not-leak" not in repr(listed.json())
     assert mutations == [("credentials", 7), ("policies", 7)]
     assert selected and all(item == ("spec-b", 2) for item in selected)
     assert executed == [
