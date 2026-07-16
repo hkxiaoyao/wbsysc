@@ -16,10 +16,21 @@ from app.connectors import (
     ExecutionResult,
     ToolSpec,
 )
-from app.mcp_gateway import ConnectionMcpGateway
+from app.mcp_gateway import (
+    ConnectionMcpGateway,
+    ConnectionResolver,
+    default_wecom_connection_id,
+)
 
 
 TOOLS_LIST = {"jsonrpc": "2.0", "id": 1, "method": "tools/list", "params": {}}
+TOOLS_CALL = {
+    "jsonrpc": "2.0",
+    "id": 2,
+    "method": "tools/call",
+    "params": {"name": "wecom_list_reports", "arguments": {}},
+}
+CONNECTION_ID = default_wecom_connection_id("migration_tenant")
 
 
 def _bearer(token: str) -> dict[str, str]:
@@ -37,7 +48,7 @@ def _tool_contracts(response) -> list[dict[str, Any]]:
 def _ctx() -> ConnectionCtx:
     return ConnectionCtx(
         tenant_id="migration_tenant",
-        connection_id="migration_wecom",
+        connection_id=CONNECTION_ID,
         connector_key="wecom",
         data_mode="stored",
         public_config={"schema_name": "wbd_migration_test"},
@@ -46,32 +57,36 @@ def _ctx() -> ConnectionCtx:
 
 
 @dataclass
-class _MutableResolver:
+class _TokenDirectory:
+    """Component-test storage boundary; production SQL/HMAC has separate store tests."""
+
     current_tokens: set[str]
 
-    def resolve(self, connection_id: str, bearer_token: str) -> ConnectionCtx | None:
+    def record(self) -> ConnectionRecord:
         current = _ctx()
-        if connection_id == current.connection_id and bearer_token in self.current_tokens:
-            return current
-        return None
-
-    def resolve_legacy(self, bearer_token: str) -> ConnectionCtx | None:
-        return _ctx() if bearer_token in self.current_tokens else None
-
-    def execution_context(self, ctx: ConnectionCtx) -> ConnectionContext:
-        return ConnectionContext(
-            connection=ConnectionRecord(
-                connection_id=ctx.connection_id,
-                tenant_id=ctx.tenant_id,
-                connector_key=ctx.connector_key,
-                display_name="Migration WeCom",
-                status="active",
-                data_mode=ctx.data_mode,
-                public_config=dict(ctx.public_config),
-                config_version=ctx.config_version,
-            ),
-            credentials={},
+        return ConnectionRecord(
+            connection_id=current.connection_id,
+            tenant_id=current.tenant_id,
+            connector_key=current.connector_key,
+            display_name="Migration WeCom",
+            status="active",
+            data_mode=current.data_mode,
+            public_config=dict(current.public_config),
+            config_version=current.config_version,
         )
+
+    def resolve_token(
+        self, bearer_token: str, connection_id: str
+    ) -> ConnectionRecord | None:
+        if bearer_token not in self.current_tokens:
+            return None
+        record = self.record()
+        return record if record.connection_id == connection_id else None
+
+    def legacy_tenant(self, bearer_token: str):
+        if bearer_token not in self.current_tokens:
+            return None
+        return type("Tenant", (), {"tenant_id": _ctx().tenant_id})()
 
     def rotate(self, old_token: str, new_token: str) -> None:
         self.current_tokens.discard(old_token)
@@ -109,39 +124,55 @@ class _WeComParityConnector:
         raise NotImplementedError
 
 
-def _client() -> tuple[TestClient, _MutableResolver]:
-    resolver = _MutableResolver({"legacy_token_value"})
+def _client() -> tuple[TestClient, _TokenDirectory]:
+    tokens = _TokenDirectory({"legacy_token_value"})
+    resolver = ConnectionResolver(
+        token_resolver=tokens.resolve_token,
+        legacy_tenant_lookup=tokens.legacy_tenant,
+        legacy_tenant_reload=lambda: None,
+        credential_loader=lambda _connection_id: {},
+    )
     runtime = ConnectorRuntime(
         ConnectorRegistry([_WeComParityConnector()]),
     )
     gateway = ConnectionMcpGateway(resolver=resolver, runtime=runtime)
     app = main.create_app(gateway=gateway)
     app.router.lifespan_context = lambda _app: gateway.run()
-    return TestClient(app), resolver
+    return TestClient(app), tokens
 
 
-def test_legacy_and_connection_wecom_endpoints_have_identical_tool_contracts():
+def test_component_legacy_and_connection_routes_have_identical_tools_and_results():
     client, _resolver = _client()
 
     with client:
         legacy = client.post("/mcp", headers=_bearer("legacy_token_value"), json=TOOLS_LIST)
         modern = client.post(
-            "/mcp/migration_wecom",
+            f"/mcp/{CONNECTION_ID}",
             headers=_bearer("legacy_token_value"),
             json=TOOLS_LIST,
+        )
+        legacy_call = client.post(
+            "/mcp", headers=_bearer("legacy_token_value"), json=TOOLS_CALL
+        )
+        modern_call = client.post(
+            f"/mcp/{CONNECTION_ID}",
+            headers=_bearer("legacy_token_value"),
+            json=TOOLS_CALL,
         )
 
     assert legacy.status_code == modern.status_code == 200
     assert _tool_contracts(legacy) == _tool_contracts(modern)
+    assert legacy_call.status_code == modern_call.status_code == 200
+    assert legacy_call.json()["result"] == modern_call.json()["result"]
 
 
 def test_connection_endpoint_rejects_missing_invalid_and_wrong_connection_tokens():
     client, _resolver = _client()
 
     with client:
-        missing = client.post("/mcp/migration_wecom", json=TOOLS_LIST)
+        missing = client.post(f"/mcp/{CONNECTION_ID}", json=TOOLS_LIST)
         invalid = client.post(
-            "/mcp/migration_wecom",
+            f"/mcp/{CONNECTION_ID}",
             headers=_bearer("invalid_token_value"),
             json=TOOLS_LIST,
         )
@@ -158,18 +189,19 @@ def test_connection_endpoint_rejects_missing_invalid_and_wrong_connection_tokens
     )
 
 
-def test_rotated_and_revoked_tokens_take_effect_on_both_routes():
-    client, resolver = _client()
+def test_component_real_resolver_observes_rotated_and_revoked_tokens_on_both_routes():
+    client, tokens = _client()
 
     with client:
-        resolver.rotate("legacy_token_value", "rotated_token_value")
+        tokens.current_tokens.remove("legacy_token_value")
+        tokens.current_tokens.add("rotated_token_value")
         assert client.post(
-            "/mcp/migration_wecom",
+            f"/mcp/{CONNECTION_ID}",
             headers=_bearer("legacy_token_value"),
             json=TOOLS_LIST,
         ).status_code == 401
         assert client.post(
-            "/mcp/migration_wecom",
+            f"/mcp/{CONNECTION_ID}",
             headers=_bearer("rotated_token_value"),
             json=TOOLS_LIST,
         ).status_code == 200
@@ -179,9 +211,9 @@ def test_rotated_and_revoked_tokens_take_effect_on_both_routes():
             json=TOOLS_LIST,
         ).status_code == 200
 
-        resolver.revoke("rotated_token_value")
+        tokens.current_tokens.remove("rotated_token_value")
         assert client.post(
-            "/mcp/migration_wecom",
+            f"/mcp/{CONNECTION_ID}",
             headers=_bearer("rotated_token_value"),
             json=TOOLS_LIST,
         ).status_code == 401

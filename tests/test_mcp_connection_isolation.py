@@ -7,6 +7,7 @@ from typing import Any
 from fastapi.testclient import TestClient
 
 from app import main
+from app import mcp_gateway
 from app.auth import ConnectionCtx
 from app.connections.cache import ConnectionCache
 from app.connections.models import ConnectionRecord, ToolPolicy
@@ -207,6 +208,7 @@ class _Result:
 class _LogConnection:
     def __init__(self, rows: list[dict[str, Any]]) -> None:
         self.rows = rows
+        self.statements: list[tuple[str, dict[str, Any]]] = []
 
     def __enter__(self):
         return self
@@ -215,15 +217,9 @@ class _LogConnection:
         return False
 
     def execute(self, statement, params=None) -> _Result:
-        params = params or {}
-        selected = [
-            row
-            for row in self.rows
-            if row["tenant_id"] == params.get("tenant_id", row["tenant_id"])
-            and row["connection_id"]
-            == params.get("connection_id", row["connection_id"])
-        ]
-        return _Result(selected)
+        bound = dict(params or {})
+        self.statements.append((str(statement), bound))
+        return _Result(self.rows)
 
 
 class _LogEngine:
@@ -234,13 +230,32 @@ class _LogEngine:
         return self._connection
 
 
-def test_tenant_and_connection_log_filters_form_one_isolation_boundary(monkeypatch):
+def test_credential_loader_binds_only_the_resolved_connection_id(monkeypatch):
+    engine = _LogEngine(
+        [{"credential_key": "account_marker", "encrypted_value": b"ciphertext"}]
+    )
+    monkeypatch.setattr(mcp_gateway.connection_store, "_engine", lambda: engine)
+    monkeypatch.setattr(
+        mcp_gateway,
+        "decrypt_credential",
+        lambda value: "credential_a" if value == b"ciphertext" else "wrong",
+    )
+
+    credentials = mcp_gateway._load_connection_credentials("connection_a")
+
+    assert credentials == {"account_marker": "credential_a"}
+    assert len(engine._connection.statements) == 1
+    sql, params = engine._connection.statements[0]
+    assert "WHERE connection_id=:connection_id" in sql
+    assert params == {"connection_id": "connection_a"}
+
+
+def test_log_query_binds_tenant_and_connection_as_one_sql_boundary(monkeypatch):
     rows = [
         {"id": 1, "tenant_id": "tenant_one", "connection_id": "connection_a"},
-        {"id": 2, "tenant_id": "tenant_one", "connection_id": "connection_b"},
-        {"id": 3, "tenant_id": "tenant_two", "connection_id": "connection_a"},
     ]
-    monkeypatch.setattr(mcp_log_store, "_engine", lambda: _LogEngine(rows))
+    engine = _LogEngine(rows)
+    monkeypatch.setattr(mcp_log_store, "_engine", lambda: engine)
 
     result = mcp_log_store.list_logs(
         LogFilters(tenant_id="tenant_one", connection_id="connection_a"),
@@ -252,3 +267,9 @@ def test_tenant_and_connection_log_filters_form_one_isolation_boundary(monkeypat
     assert [(item["tenant_id"], item["connection_id"]) for item in result["items"]] == [
         ("tenant_one", "connection_a")
     ]
+    assert len(engine._connection.statements) == 2
+    for sql, params in engine._connection.statements:
+        assert "tenant_id = :tenant_id" in sql
+        assert "connection_id = :connection_id" in sql
+        assert params["tenant_id"] == "tenant_one"
+        assert params["connection_id"] == "connection_a"

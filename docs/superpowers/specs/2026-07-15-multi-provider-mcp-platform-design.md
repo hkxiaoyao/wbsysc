@@ -153,11 +153,11 @@ GET/POST   /admin/declarative-specs/{spec_id}/revisions
 
 旧企微回填使用提交后水位并保持幂等。兼容期保留旧 `/mcp` 和 legacy adapter，只有新旧工具、鉴权、抽样结果与连接日志全部对账通过，才能切换客户端或评审移除旧路径。
 
-若对账失败，平台禁用受影响连接，失效精确 `(connection_id, config_version)` MCP 缓存，保留数据和日志，并让旧企微 Token 继续通过 legacy adapter 访问旧 `/mcp`。修正后重新对账，不影响其他连接。
+若对账失败，停止该租户的新入口切换并让客户端恢复旧 `/mcp`，但保持确定性默认企微连接为 `active`，因为双入口共享连接、Token 和运行时。平台只失效精确 `(connection_id, config_version)` MCP 缓存并保留数据和日志；若旧入口也失败，则回滚整个应用版本。修正后重新对账，不影响其他连接。
 
 连接器包只能通过签名、源码、依赖和 manifest 评审后安装固定版本。部署将归一化入口名写入 `CONNECTOR_ALLOWLIST`，重启后才加载；回滚先禁用依赖连接，再恢复旧镜像与允许列表。
 
-声明式规范发布前必须评审精确 HTTPS 主机、DNS/IP 解析、逐跳重定向、OAuth 重定向 URI、响应大小、分页和字段提取限制。监控与审计按 `tenant_id` 和 `connection_id` 双维度查询，且不记录凭证或原始正文。
+声明式规范发布前必须评审精确 HTTPS 主机、DNS/IP 解析、逐跳重定向、OAuth 2.0 client credentials Token URL、响应大小和字段提取限制。当前声明式分页不受支持，导入相关声明必须失败关闭。监控与审计按 `tenant_id` 和 `connection_id` 双维度查询，且不记录凭证或原始正文。
 
 ## 验收标准
 
