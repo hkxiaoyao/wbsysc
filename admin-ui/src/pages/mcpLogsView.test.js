@@ -14,6 +14,8 @@ import {
 
 const EXPLICIT_FILTERS = Object.freeze({
   tenantId: 'tenant-a',
+  connectionId: 'conn-a',
+  connectorKey: 'http_declarative',
   category: 'tool',
   eventName: 'wecom_list_reports',
   status: 'partial',
@@ -46,7 +48,8 @@ test('parseLogLocation restores tenant and defaults to the last 24 hours', () =>
 
 test('parseLogLocation restores every structured filter and normalizes timestamps', () => {
   const filters = parseLogLocation(
-    '?tenant_id=tenant-a&category=tool&event_name=wecom_list_reports&status=partial'
+    '?tenant_id=tenant-a&connection_id=conn-a&connector_key=http_declarative'
+      + '&category=tool&event_name=wecom_list_reports&status=partial'
       + '&from=2026-07-13T01%3A02%3A03Z&to=2026-07-14T04%3A05%3A06Z'
       + '&q=quarterly+report&request_id=req-42&client_ip=203.0.113.8'
       + '&cost_min=25&cost_max=2500',
@@ -89,7 +92,8 @@ test('serializeLogFilters is deterministic, omits defaults, and round trips filt
 
   assert.equal(
     search,
-    'tenant_id=tenant-a&category=tool&event_name=wecom_list_reports&status=partial'
+    'tenant_id=tenant-a&connection_id=conn-a&connector_key=http_declarative'
+      + '&category=tool&event_name=wecom_list_reports&status=partial'
       + '&from=2026-07-13T01%3A02%3A03.000Z&to=2026-07-14T04%3A05%3A06.000Z'
       + '&q=quarterly+report&request_id=req-42&client_ip=203.0.113.8'
       + '&cost_min=25&cost_max=2500',
@@ -101,6 +105,8 @@ test('serializeLogFilters is deterministic, omits defaults, and round trips filt
 test('buildLogQuery maps filters to API fields and normalizes pagination', () => {
   assert.deepEqual(buildLogQuery(EXPLICIT_FILTERS, 3, 50), {
     tenant_id: 'tenant-a',
+    connection_id: 'conn-a',
+    connector_key: 'http_declarative',
     category: 'tool',
     event_name: 'wecom_list_reports',
     status: 'partial',
@@ -131,6 +137,8 @@ test('buildDeleteSpec produces every supported delete payload without UI paginat
     mode: 'filter',
     filter: {
       tenant_id: 'tenant-a',
+      connection_id: 'conn-a',
+      connector_key: 'http_declarative',
       category: 'tool',
       event_name: 'wecom_list_reports',
       status: 'partial',

@@ -19,6 +19,8 @@ const UNKNOWN_STATUS_META = Object.freeze({ label: '未知', color: 'default' })
 
 export const DEFAULT_LOG_FILTERS = Object.freeze({
   tenantId: '',
+  connectionId: '',
+  connectorKey: '',
   category: '',
   eventName: '',
   status: '',
@@ -84,6 +86,8 @@ function normalizeCosts(minValue, maxValue) {
 function filterQuery(filters = DEFAULT_LOG_FILTERS) {
   const query = {}
   const tenantId = normalizeText(filters?.tenantId)
+  const connectionId = normalizeText(filters?.connectionId)
+  const connectorKey = normalizeText(filters?.connectorKey)
   const category = normalizeEnum(filters?.category, CATEGORY_VALUES)
   const eventName = normalizeText(filters?.eventName)
   const status = normalizeEnum(filters?.status, STATUS_VALUES)
@@ -94,6 +98,8 @@ function filterQuery(filters = DEFAULT_LOG_FILTERS) {
   const costs = normalizeCosts(filters?.costMin, filters?.costMax)
 
   if (tenantId) query.tenant_id = tenantId
+  if (connectionId) query.connection_id = connectionId
+  if (connectorKey) query.connector_key = connectorKey
   if (category) query.category = category
   if (eventName) query.event_name = eventName
   if (status) query.status = status
@@ -176,6 +182,8 @@ export function parseLogLocation(search = '') {
 
   return {
     tenantId: normalizeText(params.get('tenant_id')),
+    connectionId: normalizeText(params.get('connection_id')),
+    connectorKey: normalizeText(params.get('connector_key')),
     category: normalizeEnum(params.get('category'), CATEGORY_VALUES),
     eventName: normalizeText(params.get('event_name')),
     status: normalizeEnum(params.get('status'), STATUS_VALUES),

@@ -349,3 +349,12 @@
     animation-duration: 0.01ms !important;
   }
 }
+/* Tenant rows open the same connection workbench used by the top-level entrance. */
+.tenant-connection-drawer .ant-drawer-body {
+  padding: 16px;
+  background: #edf2f4;
+}
+
+@media (max-width: 680px) {
+  .tenant-connection-drawer .ant-drawer-body { padding: 10px; }
+}
