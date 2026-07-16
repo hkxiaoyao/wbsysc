@@ -103,7 +103,7 @@ _CONNECTION_DDLS = (
       `tenant_id` VARCHAR(64) NOT NULL,
       `connection_id` VARCHAR(64) NOT NULL,
       `status` VARCHAR(16) NOT NULL DEFAULT 'draft',
-      `spec_json` TEXT NOT NULL,
+      `spec_json` MEDIUMTEXT NOT NULL,
       `created_at` DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
       PRIMARY KEY (`spec_id`, `revision`),
       KEY `idx_declarative_spec_tenant` (`tenant_id`, `connection_id`, `status`)
@@ -116,7 +116,7 @@ _CONNECTION_DDLS = (
       `revision` INT NOT NULL,
       `connection_id` VARCHAR(64) NOT NULL,
       `operation_key` VARCHAR(128) NOT NULL,
-      `operation_json` TEXT NOT NULL,
+      `operation_json` MEDIUMTEXT NOT NULL,
       `created_at` DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
       `updated_at` DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP
         ON UPDATE CURRENT_TIMESTAMP,
@@ -321,6 +321,156 @@ def list_connections(tenant_id: str) -> list[ConnectionRecord]:
     with _engine().connect() as conn:
         rows = conn.execute(statement, {"tenant_id": tenant_id}).mappings().all()
     return [_connection_from_row(row) for row in rows]
+
+
+def save_declarative_revision(revision: Any) -> None:
+    """Persist one compiled revision without accepting a raw upstream payload.
+
+    A revision is append-only: the primary key intentionally has no upsert
+    clause, so a published revision cannot be overwritten in place.  Every
+    value, including serialized operation metadata, is sent as a bound
+    parameter rather than interpolated into SQL.
+    """
+    from app.connectors.declarative.models import DeclarativeRevision, MAX_DOCUMENT_BYTES
+
+    if not isinstance(revision, DeclarativeRevision):
+        raise TypeError("revision must be a DeclarativeRevision")
+    if not revision.spec_id or not revision.tenant_id or not revision.connection_id:
+        raise ValueError("declarative revision identity is required")
+    document = revision.storage_document()
+    try:
+        spec_json = json.dumps(
+            document,
+            ensure_ascii=False,
+            separators=(",", ":"),
+            allow_nan=False,
+        )
+    except (TypeError, ValueError, OverflowError, RecursionError):
+        raise ValueError("declarative revision is not JSON serializable") from None
+    if len(spec_json.encode("utf-8")) > MAX_DOCUMENT_BYTES:
+        raise ValueError("declarative revision exceeds size limit")
+
+    with _engine().begin() as conn:
+        conn.execute(
+            text("""
+                INSERT INTO declarative_spec_revision
+                    (spec_id, revision, tenant_id, connection_id, status, spec_json)
+                VALUES (:spec_id, :revision, :tenant_id, :connection_id, :status, :spec_json)
+            """),
+            {
+                "spec_id": revision.spec_id,
+                "revision": revision.revision,
+                "tenant_id": revision.tenant_id,
+                "connection_id": revision.connection_id,
+                "status": revision.status,
+                "spec_json": spec_json,
+            },
+        )
+        for operation in document["operations"]:
+            operation_json = json.dumps(
+                operation,
+                ensure_ascii=False,
+                separators=(",", ":"),
+                allow_nan=False,
+            )
+            conn.execute(
+                text("""
+                    INSERT INTO declarative_spec_operation
+                        (operation_id, spec_id, revision, connection_id, operation_key,
+                         operation_json)
+                    VALUES (:operation_id, :spec_id, :revision, :connection_id,
+                            :operation_key, :operation_json)
+                """),
+                {
+                    "operation_id": str(
+                        uuid.uuid5(
+                            uuid.NAMESPACE_URL,
+                            f"wbsysc:declarative:{revision.spec_id}:{revision.revision}:{operation['tool_key']}",
+                        )
+                    ),
+                    "spec_id": revision.spec_id,
+                    "revision": revision.revision,
+                    "connection_id": revision.connection_id,
+                    "operation_key": operation["tool_key"],
+                    "operation_json": operation_json,
+                },
+            )
+
+
+def get_published_declarative_revision(
+    spec_id: str,
+    revision: int,
+    tenant_id: str,
+) -> Any | None:
+    """Load one tenant-scoped, published declarative revision safely.
+
+    The database stores only the compiled, credential-free declaration.  It
+    is revalidated before use rather than trusted merely because it came from
+    our persistence layer, which preserves the same execution boundary after
+    corruption or an out-of-band database change.
+    """
+    from app.connectors.declarative.models import DeclarativeRevision, MAX_DOCUMENT_BYTES
+
+    if (
+        not isinstance(spec_id, str)
+        or not spec_id
+        or not isinstance(tenant_id, str)
+        or not tenant_id
+        or not isinstance(revision, int)
+        or isinstance(revision, bool)
+        or revision < 1
+    ):
+        raise ValueError("declarative revision identity is required")
+    statement = text("""
+        SELECT spec_id, revision, tenant_id, connection_id, status, spec_json
+        FROM declarative_spec_revision
+        WHERE spec_id=:spec_id AND revision=:revision AND tenant_id=:tenant_id
+          AND status='published'
+        LIMIT 1
+    """)
+    with _engine().connect() as conn:
+        row = conn.execute(
+            statement,
+            {"spec_id": spec_id, "revision": revision, "tenant_id": tenant_id},
+        ).fetchone()
+    if row is None:
+        return None
+    values = _row_values(row)
+    raw_document = values.get("spec_json")
+    if isinstance(raw_document, str):
+        encoded_document = raw_document.encode("utf-8")
+    elif isinstance(raw_document, bytes):
+        encoded_document = raw_document
+    else:
+        raise ValueError("stored declarative revision is invalid")
+    if len(encoded_document) > MAX_DOCUMENT_BYTES:
+        raise ValueError("stored declarative revision is invalid")
+    try:
+        document = json.loads(encoded_document)
+        row_spec_id = values["spec_id"]
+        row_revision = values["revision"]
+        row_tenant_id = values["tenant_id"]
+        row_connection_id = values["connection_id"]
+        row_status = values["status"]
+        if (
+            row_spec_id != spec_id
+            or row_revision != revision
+            or row_tenant_id != tenant_id
+            or row_status != "published"
+        ):
+            raise ValueError("stored declarative revision is invalid")
+        return DeclarativeRevision.from_storage_document(
+            spec_id=row_spec_id,
+            revision=row_revision,
+            tenant_id=row_tenant_id,
+            connection_id=row_connection_id,
+            status=row_status,
+            document=document,
+        )
+    except Exception:
+        # Neither malformed stored JSON nor a rejected declaration should leak
+        # raw database content into a connector response or log message.
+        raise ValueError("stored declarative revision is invalid") from None
 
 
 def set_tool_policy(
