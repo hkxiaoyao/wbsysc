@@ -21,6 +21,9 @@ _MAX_JSON_DEPTH = 24
 _MAX_JSON_NODES = 4_096
 _MAX_JSON_KEY_LENGTH = 256
 _MAX_JSON_STRING_LENGTH = 16_384
+_MIN_JSON_INTEGER = -(2**63)
+_MAX_JSON_INTEGER = 2**63 - 1
+_MAX_JSON_FLOAT_MAGNITUDE = 1e308
 
 
 def _has_control_characters(value: str) -> bool:
@@ -40,9 +43,11 @@ def _freeze_json_tree(value: object, *, field_name: str) -> object:
         if node is None or isinstance(node, bool):
             return node
         if isinstance(node, int) and not isinstance(node, bool):
+            if not _MIN_JSON_INTEGER <= node <= _MAX_JSON_INTEGER:
+                raise ValueError(f"invalid connector {field_name}")
             return node
         if isinstance(node, float):
-            if not math.isfinite(node):
+            if not math.isfinite(node) or abs(node) > _MAX_JSON_FLOAT_MAGNITUDE:
                 raise ValueError(f"invalid connector {field_name}")
             return node
         if isinstance(node, str):

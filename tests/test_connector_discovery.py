@@ -822,6 +822,17 @@ def test_manifest_rejects_unicode_control_abuse_in_metadata_and_schema():
         )
 
 
+def test_manifest_rejects_extremely_large_schema_integer_before_registration():
+    oversized_integer = 10**100000
+    tool = ToolSpec(**{**TOOL.__dict__, "input_schema": {"maximum": oversized_integer}})
+    registry = ConnectorRegistry()
+
+    with pytest.raises(ValueError, match="schema"):
+        registry.register(FakeConnector(tools=(tool,)))
+
+    assert tuple(registry.registered) == ()
+
+
 def test_create_app_custom_gateway_builds_scheduler_from_gateway_registry():
     from app import main
 
