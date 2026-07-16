@@ -368,12 +368,15 @@
 
 .mcp-filter-bar {
   display: grid;
-  grid-template-columns: minmax(180px, 1fr) 132px 126px minmax(310px, 1.25fr) minmax(240px, 1.15fr) auto;
+  grid-template-columns: repeat(4, minmax(0, 1fr));
   gap: 9px;
   padding: 14px;
   border-bottom: 1px solid #e2eaec;
   background: #f8fafb;
 }
+
+.mcp-filter-bar .ant-picker,
+.mcp-filter-bar .ant-input-search { grid-column: span 2; }
 
 .mcp-filter-summary {
   display: flex;

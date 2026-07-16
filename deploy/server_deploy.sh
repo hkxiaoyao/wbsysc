@@ -32,7 +32,14 @@ read_env_value() {
 
 is_example_password() {
   case "$1" in
-    ""|"CHANGE_ME"|"<强密码，与开发库不同>"|"<强密码，登录管理后台用>") return 0 ;;
+    ""|"CHANGE_ME"|"database_password_here"|"migration_password_here"|"admin_password_here"|"<强密码，与开发库不同>"|"<强密码，登录管理后台用>") return 0 ;;
+    *) return 1 ;;
+  esac
+}
+
+is_example_mcp_token_hmac_key() {
+  case "$1" in
+    ""|"CHANGE_ME"|"<强随机串>"|"<独立强随机串>"|"MCP_TOKEN_HMAC_KEY"|"<MCP_TOKEN_HMAC_KEY>"|"PoC_DEFAULT_KEY_DO_NOT_USE_IN_PRODUCTION_32bytes!") return 0 ;;
     *) return 1 ;;
   esac
 }
@@ -76,12 +83,12 @@ if [ ! -f .env ]; then
   echo "首次运行：生成 .env 模板，请编辑填入真实值后重新运行本脚本"
   cp .env.prod.example .env
   echo ""
-  echo "生产必填：APP_ENV=prod / WECOM_USE_MOCK=false / DB_PASSWORD / ADMIN_PASSWORD / CREDENTIAL_KEY"
+  echo "生产必填：APP_ENV=prod / WECOM_USE_MOCK=false / DB_PASSWORD / ADMIN_PASSWORD / CREDENTIAL_KEY / MCP_TOKEN_HMAC_KEY"
   echo "  ADMIN_PASSWORD = 管理后台登录强密码"
   echo "  DB_PASSWORD    = MySQL websysc 账户密码（需与 MySQL 一致）"
   echo "  DB_HOST 已默认 host.docker.internal（同台部署容器访问宿主MySQL）"
-  echo "  CREDENTIAL_KEY 可保留模板占位符，下次运行会自动生成 32 字节以上强密钥"
-  echo "  CREDENTIAL_KEY 不能长期留空；弱的自定义值会被拒绝"
+  echo "  CREDENTIAL_KEY 和 MCP_TOKEN_HMAC_KEY 可保留模板占位符，下次运行会分别自动生成 32 字节以上强密钥"
+  echo "  两把密钥必须保持独立；弱的自定义值会被拒绝"
   echo ""
   echo "编辑：vim $APP_DIR/.env"
   exit 1
@@ -111,6 +118,27 @@ if [ -z "$CREDENTIAL_KEY" ] || [ "$CREDENTIAL_KEY" = "<强随机串>" ]; then
   echo "✓ 已自动生成 CREDENTIAL_KEY"
 fi
 
+# MCP Token HMAC 密钥必须与凭证加密密钥独立生成，禁止复用或派生。
+MCP_TOKEN_HMAC_KEY="$(read_env_value MCP_TOKEN_HMAC_KEY)"
+if is_example_mcp_token_hmac_key "$MCP_TOKEN_HMAC_KEY"; then
+  if command -v python3 &>/dev/null; then
+    GENERATED_MCP_TOKEN_HMAC_KEY="$(python3 -c "import secrets;print(secrets.token_urlsafe(48))")"
+  elif command -v openssl &>/dev/null; then
+    GENERATED_MCP_TOKEN_HMAC_KEY="$(openssl rand -hex 32)"
+  else
+    echo "❌ 无法自动生成 MCP_TOKEN_HMAC_KEY：需要 python3 或 openssl"
+    exit 1
+  fi
+  if grep -q '^MCP_TOKEN_HMAC_KEY=' .env; then
+    sed -i "s|^MCP_TOKEN_HMAC_KEY=.*|MCP_TOKEN_HMAC_KEY=$GENERATED_MCP_TOKEN_HMAC_KEY|" .env
+  else
+    printf '\nMCP_TOKEN_HMAC_KEY=%s\n' "$GENERATED_MCP_TOKEN_HMAC_KEY" >> .env
+  fi
+  unset GENERATED_MCP_TOKEN_HMAC_KEY
+  MCP_TOKEN_HMAC_KEY="$(read_env_value MCP_TOKEN_HMAC_KEY)"
+  echo "✓ 已自动生成 MCP_TOKEN_HMAC_KEY"
+fi
+
 chmod 600 .env
 
 CONFIG_INVALID=0
@@ -136,21 +164,53 @@ if [ "$CREDENTIAL_KEY" = "<强随机串>" ] || [ "$(byte_length "$CREDENTIAL_KEY
   echo "❌ CREDENTIAL_KEY 必须为非示例值且至少 32 UTF-8 字节"
   CONFIG_INVALID=1
 fi
+DB_USER="$(read_env_value DB_USER)"
+DB_USER="${DB_USER:-websysc}"
+DB_MIGRATION_USER="${DB_MIGRATION_USER:-}"
+DB_MIGRATION_PASSWORD="${DB_MIGRATION_PASSWORD:-}"
+if [ -z "$DB_MIGRATION_USER" ] || is_example_password "$DB_MIGRATION_PASSWORD"; then
+  echo "❌ DB_MIGRATION_USER/DB_MIGRATION_PASSWORD 必须使用独立迁移账户的真实值"
+  CONFIG_INVALID=1
+fi
+if [ "$DB_MIGRATION_USER" = "$DB_USER" ]; then
+  echo "❌ DB_MIGRATION_USER 必须与运行时 DB_USER 不同"
+  CONFIG_INVALID=1
+fi
+if is_example_mcp_token_hmac_key "$MCP_TOKEN_HMAC_KEY" || [ "$(byte_length "$MCP_TOKEN_HMAC_KEY")" -lt 32 ]; then
+  echo "❌ MCP_TOKEN_HMAC_KEY 必须为非示例值且至少 32 UTF-8 字节"
+  CONFIG_INVALID=1
+fi
+if [ "$MCP_TOKEN_HMAC_KEY" = "$CREDENTIAL_KEY" ]; then
+  echo "❌ MCP_TOKEN_HMAC_KEY 必须与 CREDENTIAL_KEY 保持独立"
+  CONFIG_INVALID=1
+fi
 if [ "$CONFIG_INVALID" -ne 0 ]; then
   echo "❌ .env 生产配置校验失败，尚未拉取镜像或启动应用"
   exit 1
 fi
-unset ADMIN_PASSWORD CREDENTIAL_KEY
+unset ADMIN_PASSWORD CREDENTIAL_KEY MCP_TOKEN_HMAC_KEY
 echo "✓ .env 生产配置校验通过"
+
+ENV_MIGRATION_HOST="$(read_env_value DB_MIGRATION_HOST)"
+MIGRATION_HOST="${DB_MIGRATION_HOST:-${ENV_MIGRATION_HOST:-127.0.0.1}}"
+DB_PORT="$(read_env_value DB_PORT)"
+DB_PORT="${DB_PORT:-3306}"
+DB_NAME="$(read_env_value DB_NAME)"
+DB_NAME="${DB_NAME:-websysc}"
 
 echo ""
 echo "===== 3.1 MySQL 同台访问检查（关键） ====="
 echo "容器访问宿主 MySQL 需要："
 echo "  ① MySQL bind-address = 0.0.0.0（非仅 [IP]）"
-echo "  ② 授权 websysc 账户可从容器网段登录："
+echo "  ② 授权配置的数据库账户可从容器网段登录："
 echo "     mysql -uroot -p 执行:"
-echo "       ALTER USER 'websysc'@'%' IDENTIFIED BY '你的强密码';"
-echo "       GRANT ALL PRIVILEGES ON *.* TO 'websysc'@'%' WITH GRANT OPTION;"
+echo "       ALTER USER '$DB_USER'@'%' IDENTIFIED BY '你的强密码';"
+echo "       GRANT SELECT, INSERT, UPDATE, DELETE, CREATE, ALTER, INDEX ON \`$DB_NAME\`.* TO '$DB_USER'@'%';"
+echo "     中心 schema: \`$DB_NAME\`"
+echo "     既有租户 schema: 从 $DB_NAME.tenant_config.schema_name 读取后，逐个执行:"
+echo "       GRANT SELECT, INSERT, UPDATE, DELETE, CREATE, ALTER, INDEX ON \`wbd_<tenant>\`.* TO '$DB_USER'@'%';"
+echo "     新租户 schema 需由 DBA 预先创建并单独授权；不要授予全库权限或转授权限"
+echo "     发布迁移使用独立账户 '$DB_MIGRATION_USER'；其 ROUTINE/DDL 权限不得授予运行时账户"
 echo "       FLUSH PRIVILEGES;"
 echo "  ③ /etc/mysql/my.cnf 或 mariadb.conf 的 bind-address 改 [IP] 后重启 mysql"
 echo ""
@@ -160,29 +220,30 @@ if ! command -v mysql &>/dev/null; then
   echo "❌ 未找到宿主 mysql 客户端，请安装后重试（迁移脚本包含 DELIMITER，必须使用 mysql CLI）"
   exit 1
 fi
-if [ ! -f "$APP_DIR/sql/004_gateway_hardening.sql" ]; then
-  echo "❌ 未找到 sql/004_gateway_hardening.sql"
-  exit 1
-fi
+MIGRATIONS=(
+  "sql/004_gateway_hardening.sql"
+  "sql/005_mcp_call_log.sql"
+  "sql/006_connection_platform.sql"
+)
+for migration in "${MIGRATIONS[@]}"; do
+  if [ ! -f "$APP_DIR/$migration" ]; then
+    echo "❌ 未找到 $migration"
+    exit 1
+  fi
+done
 
-ENV_MIGRATION_HOST="$(read_env_value DB_MIGRATION_HOST)"
-MIGRATION_HOST="${DB_MIGRATION_HOST:-${ENV_MIGRATION_HOST:-127.0.0.1}}"
-DB_PORT="$(read_env_value DB_PORT)"
-DB_PORT="${DB_PORT:-3306}"
-DB_NAME="$(read_env_value DB_NAME)"
-DB_NAME="${DB_NAME:-websysc}"
-DB_USER="$(read_env_value DB_USER)"
-DB_USER="${DB_USER:-websysc}"
-
-echo "使用宿主 mysql CLI 执行 004 迁移（迁移主机默认 127.0.0.1，可用 DB_MIGRATION_HOST 覆盖）"
-if ! MYSQL_PWD="$DB_PASSWORD" mysql --protocol=TCP \
-  --host="$MIGRATION_HOST" --port="$DB_PORT" --user="$DB_USER" "$DB_NAME" \
-  < "$APP_DIR/sql/004_gateway_hardening.sql"; then
-  echo "❌ 数据库迁移失败，尚未拉取镜像或启动新应用"
-  exit 1
-fi
-unset DB_PASSWORD
-echo "✓ 数据库迁移完成"
+echo "使用宿主 mysql CLI 按 004 → 005 → 006 执行迁移（迁移主机默认 127.0.0.1，可用 DB_MIGRATION_HOST 覆盖）"
+for migration in "${MIGRATIONS[@]}"; do
+  echo "执行 $migration"
+  if ! MYSQL_PWD="$DB_MIGRATION_PASSWORD" mysql --protocol=TCP \
+    --host="$MIGRATION_HOST" --port="$DB_PORT" --user="$DB_MIGRATION_USER" "$DB_NAME" \
+    < "$APP_DIR/$migration"; then
+    echo "❌ 数据库迁移失败（$migration），尚未拉取镜像或启动新应用"
+    exit 1
+  fi
+done
+unset DB_PASSWORD DB_MIGRATION_USER DB_MIGRATION_PASSWORD
+echo "✓ 004、005、006 数据库迁移完成"
 
 echo ""
 echo "===== 5. 拉取镜像（GitHub Actions 已构建推送到 GHCR） ====="

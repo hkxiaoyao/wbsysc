@@ -9,6 +9,8 @@ from apscheduler.triggers.interval import IntervalTrigger
 
 from app import main, mcp_audit, mcp_log_store
 from app.auth import BearerTokenMiddleware
+from app.connectors.runtime import ConnectorAuditEvent
+from app import mcp_gateway
 from app.mcp_audit import McpProtocolAuditMiddleware
 
 
@@ -32,16 +34,20 @@ def test_runtime_registers_log_admin_before_static_and_mcp_mounts():
 
 def test_mcp_protocol_audit_runs_inside_bearer_authentication():
     runtime = main.create_app()
-    mcp_mount = next(
-        route for route in runtime.routes if getattr(route, "path", None) == "/mcp"
-    )
-    middleware_classes = [entry.cls for entry in mcp_mount.app.user_middleware]
+    mcp_mounts = [
+        route
+        for route in runtime.routes
+        if getattr(route, "path", None) in {"/mcp", "/mcp/{connection_id}"}
+    ]
 
-    assert BearerTokenMiddleware in middleware_classes
-    assert McpProtocolAuditMiddleware in middleware_classes
-    assert middleware_classes.index(BearerTokenMiddleware) < middleware_classes.index(
-        McpProtocolAuditMiddleware
-    )
+    assert [route.path for route in mcp_mounts] == ["/mcp/{connection_id}", "/mcp"]
+    for mcp_mount in mcp_mounts:
+        middleware_classes = [entry.cls for entry in mcp_mount.app.user_middleware]
+        assert BearerTokenMiddleware in middleware_classes
+        assert McpProtocolAuditMiddleware in middleware_classes
+        assert middleware_classes.index(BearerTokenMiddleware) < middleware_classes.index(
+            McpProtocolAuditMiddleware
+        )
 
 
 def test_daily_cleanup_runs_in_executor(monkeypatch):
@@ -59,6 +65,33 @@ def test_daily_cleanup_runs_in_executor(monkeypatch):
     assert cleanup_threads[0] != calling_thread
 
 
+def test_runtime_audit_writes_server_resolved_connection_dimensions(monkeypatch):
+    events = []
+    monkeypatch.setattr(mcp_gateway, "write_event", events.append)
+    monkeypatch.setattr(
+        mcp_gateway,
+        "current_request_metadata",
+        lambda: {"request_id": "req-1", "client_ip": "203.0.113.8", "http_method": "POST"},
+    )
+
+    mcp_gateway.ConnectionMcpGateway._write_runtime_audit(
+        object(),
+        ConnectorAuditEvent(
+            tenant_id="tenant-a",
+            connection_id="conn-a",
+            connector_key="wecom",
+            tool_key="reports.list",
+            status="ok",
+            cost_ms=12,
+        ),
+    )
+
+    assert len(events) == 1
+    assert events[0].connection_id == "conn-a"
+    assert events[0].connector_key == "wecom"
+    assert events[0].tool_key == "reports.list"
+
+
 def test_lifespan_schedules_daily_cleanup_without_running_it_immediately(monkeypatch):
     events: list[str] = []
     scheduled_jobs: list[tuple[object, object, dict]] = []
@@ -66,7 +99,7 @@ def test_lifespan_schedules_daily_cleanup_without_running_it_immediately(monkeyp
     shutdown_threads: list[int] = []
     event_loop_thread = threading.get_ident()
 
-    class FakeSessionManager:
+    class FakeGateway:
         @contextlib.asynccontextmanager
         async def run(self):
             events.append("session_enter")
@@ -105,8 +138,8 @@ def test_lifespan_schedules_daily_cleanup_without_running_it_immediately(monkeyp
     )
     monkeypatch.setattr(
         main,
-        "mcp",
-        SimpleNamespace(session_manager=FakeSessionManager()),
+        "mcp_gateway",
+        FakeGateway(),
     )
     monkeypatch.setattr(
         main.db,
@@ -163,7 +196,7 @@ def test_lifespan_schedules_daily_cleanup_without_running_it_immediately(monkeyp
 
 
 def test_real_lifespans_share_then_restart_the_audit_writer(monkeypatch):
-    class FakeSessionManager:
+    class FakeGateway:
         @contextlib.asynccontextmanager
         async def run(self):
             yield
@@ -191,7 +224,7 @@ def test_real_lifespans_share_then_restart_the_audit_writer(monkeypatch):
     monkeypatch.setattr(main, "acquire_audit_writer", mcp_audit.acquire_audit_writer)
     monkeypatch.setattr(main, "release_audit_writer", mcp_audit.release_audit_writer)
     monkeypatch.setattr(main.db, "run_startup_migrations", lambda: None)
-    monkeypatch.setattr(main, "mcp", SimpleNamespace(session_manager=FakeSessionManager()))
+    monkeypatch.setattr(main, "mcp_gateway", FakeGateway())
     monkeypatch.setattr(main, "AsyncIOScheduler", FakeScheduler)
     monkeypatch.setattr(main.asyncio, "create_task", fake_create_task)
     monkeypatch.setattr(
@@ -233,7 +266,7 @@ def test_real_lifespans_share_then_restart_the_audit_writer(monkeypatch):
 def test_lifespan_retries_audit_release_after_thread_dispatch_failure(monkeypatch):
     events: list[str] = []
 
-    class FailingSessionManager:
+    class FailingGateway:
         @contextlib.asynccontextmanager
         async def run(self):
             events.append("session_enter_failed")
@@ -250,7 +283,7 @@ def test_lifespan_retries_audit_release_after_thread_dispatch_failure(monkeypatc
         return operation(*args)
 
     monkeypatch.setattr(main.db, "run_startup_migrations", lambda: None)
-    monkeypatch.setattr(main, "mcp", SimpleNamespace(session_manager=FailingSessionManager()))
+    monkeypatch.setattr(main, "mcp_gateway", FailingGateway())
     monkeypatch.setattr(main, "acquire_audit_writer", lambda: events.append("audit_start"))
     monkeypatch.setattr(
         main,

@@ -1,0 +1,114 @@
+.connection-workbench {
+  --connection-graphite: #101820;
+  --connection-navy: #172638;
+  --connection-cyan: #32b7d6;
+  --connection-green: #39a86b;
+  --connection-amber: #d69a2d;
+  --connection-red: #d95656;
+  min-height: calc(100vh - 64px);
+  margin: -24px;
+  padding: 24px;
+  color: var(--connection-graphite);
+  background: #edf2f4;
+}
+
+.connection-workbench--embedded { min-height: 100%; margin: 0; padding: 0; background: transparent; }
+.connection-heading { display: flex; align-items: flex-start; justify-content: space-between; gap: 24px; margin-bottom: 18px; }
+.connection-heading h1.ant-typography { margin: 5px 0 4px; color: var(--connection-graphite); font-size: clamp(30px, 3.2vw, 42px); line-height: 1.04; letter-spacing: -.04em; }
+.connection-heading p.ant-typography { margin: 0; color: #65747d; }
+.connection-eyebrow { color: #147f8f; font: 700 11px/1.2 ui-monospace, SFMono-Regular, Consolas, monospace; letter-spacing: .14em; }
+
+.connection-control-rail {
+  display: grid;
+  grid-template-columns: 1fr 44px 1.25fr 44px 1.15fr;
+  align-items: stretch;
+  overflow: hidden;
+  margin-bottom: 16px;
+  border: 1px solid #c8d5da;
+  border-top: 3px solid var(--connection-cyan);
+  border-radius: 11px;
+  background: #fff;
+  box-shadow: 0 8px 26px rgba(16, 24, 32, .05);
+}
+.connection-control-rail > div { display: flex; min-width: 0; flex-direction: column; padding: 14px 18px; }
+.connection-control-rail span { color: #16859a; font: 700 10px/1.4 ui-monospace, SFMono-Regular, Consolas, monospace; letter-spacing: .08em; text-transform: uppercase; }
+.connection-control-rail strong { margin-top: 2px; color: var(--connection-navy); font-size: 14px; }
+.connection-control-rail small { margin-top: 3px; color: #718088; }
+.connection-control-rail i { position: relative; background: #f2f6f7; }
+.connection-control-rail i::before { position: absolute; top: 50%; left: 50%; width: 20px; border-top: 1px solid #9eb2ba; content: ''; transform: translate(-50%, -50%); }
+.connection-control-rail i::after { position: absolute; top: 50%; right: 10px; width: 7px; height: 7px; border-top: 1px solid #9eb2ba; border-right: 1px solid #9eb2ba; content: ''; transform: translateY(-50%) rotate(45deg); }
+
+.connection-panel { overflow: hidden; border: 1px solid #d2dde1; border-radius: 12px; background: #fff; box-shadow: 0 10px 28px rgba(20, 42, 52, .045); }
+.connection-toolbar { display: grid; grid-template-columns: minmax(210px, 1.2fr) minmax(170px, 1fr) 160px 140px auto auto; gap: 9px; padding: 13px; border-bottom: 1px solid #e1e9ec; background: #f8fafb; }
+.connection-panel > .ant-alert { margin: 12px; }
+.connection-panel .ant-table-wrapper { padding: 0 12px 12px; }
+.connection-panel .ant-table-thead > tr > th { color: #5c6d76; font-size: 11px; font-weight: 800; letter-spacing: .035em; }
+.connection-identity { display: flex; min-width: 0; flex-direction: column; align-items: flex-start; gap: 3px; }
+.connection-identity > .ant-typography { overflow: hidden; max-width: 100%; text-overflow: ellipsis; }
+.connection-identity .ant-typography code { font-size: 10px; }
+
+.connection-drawer .ant-drawer-header { border-bottom-color: #d8e2e6; background: var(--connection-navy); }
+.connection-drawer .ant-drawer-title, .connection-drawer .ant-drawer-close { color: #fff; }
+.connection-drawer .ant-drawer-body { padding: 0; background: #eef3f5; }
+.connection-drawer-rail { display: grid; grid-template-columns: auto auto minmax(0, 1fr); gap: 0; border-bottom: 1px solid #cad8dd; background: #fff; }
+.connection-drawer-rail > * { overflow: hidden; padding: 13px 16px; border-right: 1px solid #dbe4e7; text-overflow: ellipsis; white-space: nowrap; }
+.connection-drawer .ant-tabs-nav { margin: 0; padding: 0 18px; background: #fff; }
+.connection-drawer .ant-tabs-content-holder { padding: 18px; }
+.connection-editor, .declarative-stage { display: flex; flex-direction: column; gap: 14px; max-width: 760px; padding: 18px; border: 1px solid #d4e0e4; border-radius: 10px; background: #fff; }
+.connection-editor > label { display: flex; flex-direction: column; gap: 6px; color: #4f626c; font-size: 12px; font-weight: 700; }
+.connection-token-list { display: grid; gap: 7px; }
+.connection-token-list > div { display: flex; justify-content: space-between; padding: 9px 10px; border: 1px solid #e0e7e9; border-radius: 7px; }
+.connection-tools { display: grid; gap: 8px; }
+.connection-tools > div, .declarative-tool { display: flex; align-items: center; justify-content: space-between; gap: 12px; padding: 11px; border: 1px solid #dce5e8; border-left: 3px solid var(--connection-cyan); border-radius: 7px; background: #fbfcfc; }
+.connection-operation-grid { display: grid; grid-template-columns: 1fr 1fr; gap: 9px; }
+.connection-token-once { display: flex; flex-direction: column; gap: 12px; margin-top: 14px; }
+.connection-token-once > .ant-typography { overflow-wrap: anywhere; }
+
+.declarative-wizard { display: flex; flex-direction: column; gap: 16px; }
+.declarative-wizard > .ant-steps { padding: 14px; border: 1px solid #d5e1e5; border-radius: 9px; background: #fff; }
+.declarative-stage header { display: flex; align-items: center; justify-content: space-between; gap: 10px; padding-bottom: 9px; border-bottom: 1px solid #e2e9eb; }
+.declarative-stage .ant-typography { margin-bottom: 0; }
+.declarative-id-grid { display: grid; grid-template-columns: 1fr 140px; gap: 12px; }
+.declarative-id-grid .ant-input-number { width: 100%; }
+.declarative-source { margin-top: 10px; font: 12px/1.6 ui-monospace, SFMono-Regular, Consolas, monospace; }
+.declarative-tool-list { display: grid; gap: 8px; }
+.declarative-tool { align-items: flex-start; flex-direction: column; }
+.declarative-tool details, .declarative-stage > details { width: 100%; color: #52656e; font-size: 12px; }
+.declarative-tool summary, .declarative-stage > details summary { cursor: pointer; font-weight: 700; }
+.declarative-tool pre, .declarative-stage > details pre { overflow: auto; max-height: 220px; margin: 8px 0 0; padding: 10px; border-radius: 6px; color: #334a54; background: #edf3f5; font: 11px/1.55 ui-monospace, SFMono-Regular, Consolas, monospace; white-space: pre-wrap; }
+.declarative-stage--actions { flex-direction: row; align-items: center; max-width: none; }
+
+.connection-workbench .ant-btn:focus-visible,
+.connection-workbench .ant-input:focus-visible,
+.connection-workbench .ant-input-affix-wrapper:focus-visible,
+.connection-workbench .ant-select-selector:focus-visible,
+.connection-drawer .ant-btn:focus-visible,
+.connection-drawer .ant-input:focus-visible { outline: 2px solid var(--connection-cyan); outline-offset: 2px; }
+
+@media (max-width: 1000px) {
+  .connection-toolbar { grid-template-columns: 1fr 1fr 140px; }
+  .connection-control-rail { grid-template-columns: 1fr 30px 1fr 30px 1fr; }
+}
+@media (max-width: 680px) {
+  .connection-workbench { padding: 16px 12px 22px; }
+  .connection-heading { flex-direction: column; }
+  .connection-heading > .ant-btn { width: 100%; }
+  .connection-control-rail { grid-template-columns: 1fr; }
+  .connection-control-rail i { height: 24px; }
+  .connection-control-rail i::before { width: 1px; height: 14px; border-top: 0; border-left: 1px solid #9eb2ba; }
+  .connection-control-rail i::after { top: auto; right: 50%; bottom: 5px; transform: translateX(50%) rotate(135deg); }
+  .connection-toolbar { grid-template-columns: 1fr 1fr; }
+  .connection-toolbar > :first-child, .connection-toolbar > :nth-child(2) { grid-column: 1 / -1; }
+  .connection-drawer-rail { grid-template-columns: 1fr 1fr; }
+  .connection-drawer-rail > :last-child { grid-column: 1 / -1; border-top: 1px solid #dbe4e7; }
+  .connection-drawer .ant-tabs-nav { padding-inline: 8px; }
+  .connection-drawer .ant-tabs-content-holder { padding: 10px; }
+  .connection-editor, .declarative-stage { padding: 13px; }
+  .connection-tools > div { align-items: flex-start; flex-direction: column; }
+  .declarative-id-grid, .connection-operation-grid { grid-template-columns: 1fr; }
+  .declarative-stage--actions { align-items: stretch; flex-direction: column; }
+}
+@media (prefers-reduced-motion: reduce) {
+  .connection-workbench *, .connection-workbench *::before, .connection-workbench *::after,
+  .connection-drawer *, .connection-drawer *::before, .connection-drawer *::after { transition-duration: .01ms !important; animation-duration: .01ms !important; scroll-behavior: auto !important; }
+}

@@ -58,6 +58,8 @@ const DETAIL_FIELDS = Object.freeze([
   ['id', '日志 ID'],
   ['created_at', '发生时间'],
   ['tenant_id', '租户 ID'],
+  ['connection_id', '连接 ID'],
+  ['connector_key', '连接器'],
   ['category', '类别'],
   ['event_name', '事件'],
   ['target', '目标摘要'],
@@ -568,6 +570,8 @@ export default function McpLogs({ filters, onFiltersChange = () => {} }) {
 
   const summaryTags = [
     activeFilters.tenantId && `租户：${activeTenantLabel}`,
+    activeFilters.connectionId && `连接：${activeFilters.connectionId}`,
+    activeFilters.connectorKey && `连接器：${activeFilters.connectorKey}`,
     activeFilters.category && `类别：${CATEGORY_LABELS[activeFilters.category]}`,
     activeFilters.status && `状态：${statusMeta(activeFilters.status).label}`,
     activeFilters.keyword && `关键词：${activeFilters.keyword}`,
@@ -586,6 +590,14 @@ export default function McpLogs({ filters, onFiltersChange = () => {} }) {
     {
       title: '租户', dataIndex: 'tenant_id', key: 'tenant_id', width: 150, responsive: ['md'],
       render: (value) => <Text ellipsis={{ tooltip: value }}>{value || '未识别租户'}</Text>,
+    },
+    {
+      title: '连接', dataIndex: 'connection_id', key: 'connection_id', width: 170,
+      render: (value) => <Text code ellipsis={{ tooltip: value }}>{value || '旧版租户端点'}</Text>,
+    },
+    {
+      title: '连接器', dataIndex: 'connector_key', key: 'connector_key', width: 140, responsive: ['lg'],
+      render: (value) => value ? <Tag color="cyan">{value}</Tag> : <Text type="secondary">—</Text>,
     },
     {
       title: '类别', dataIndex: 'category', key: 'category', width: 100, responsive: ['sm'],
@@ -662,8 +674,8 @@ export default function McpLogs({ filters, onFiltersChange = () => {} }) {
       <section className="mcp-scope-rail" aria-label="当前日志视角">
         <div className="mcp-scope-rail__signal"><span /><span /><span /></div>
         <div>
-          <Text>{activeFilters.tenantId ? '租户视角' : '全局视角'}</Text>
-          <strong>{activeTenantLabel}</strong>
+          <Text>{activeFilters.connectionId ? '连接视角' : activeFilters.tenantId ? '租户视角' : '全局视角'}</Text>
+          <strong>{activeFilters.connectionId || activeTenantLabel}</strong>
         </div>
         <div className="mcp-scope-rail__range">
           <Text>时间窗</Text>
@@ -686,6 +698,23 @@ export default function McpLogs({ filters, onFiltersChange = () => {} }) {
             value={activeFilters.tenantId || undefined}
             options={tenantOptions}
             onChange={(tenantId) => updateFilters({ tenantId: tenantId || '' })}
+          />
+          <Select
+            allowClear
+            showSearch
+            aria-label="按连接实例筛选"
+            placeholder="全部连接"
+            value={activeFilters.connectionId || undefined}
+            options={[...new Set(items.map((item) => item.connection_id).filter(Boolean))].map((value) => ({ value, label: value }))}
+            onChange={(connectionId) => updateFilters({ connectionId: connectionId || '' })}
+          />
+          <Select
+            allowClear
+            aria-label="按连接器筛选"
+            placeholder="全部连接器"
+            value={activeFilters.connectorKey || undefined}
+            options={[...new Set(items.map((item) => item.connector_key).filter(Boolean))].map((value) => ({ value, label: value }))}
+            onChange={(connectorKey) => updateFilters({ connectorKey: connectorKey || '' })}
           />
           <Select
             allowClear

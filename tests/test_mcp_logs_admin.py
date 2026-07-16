@@ -63,6 +63,9 @@ def test_list_logs_defaults_to_24_hours_and_whitelists_output(
             "items": [{
                 "id": 2**53 + 1,
                 "tenant_id": "tenant-a",
+                "connection_id": "conn-a",
+                "connector_key": "wecom",
+                "tool_key": "reports.list",
                 "category": "tool",
                 "event_name": "wecom_list_reports",
                 "target": "report",
@@ -114,6 +117,9 @@ def test_list_converts_only_structured_query_fields(monkeypatch, authed_client):
         "/admin/mcp-logs",
         params={
             "tenant_id": "tenant-a",
+            "connection_id": "conn-a",
+            "connector_key": "wecom",
+            "tool_key": "reports.list",
             "category": "auth",
             "event_name": "auth_invalid",
             "status": "denied",
@@ -132,11 +138,55 @@ def test_list_converts_only_structured_query_fields(monkeypatch, authed_client):
     filters = captured["filters"]
     assert isinstance(filters, LogFilters)
     assert filters.tenant_id == "tenant-a"
+    assert filters.connection_id == "conn-a"
+    assert filters.connector_key == "wecom"
+    assert filters.tool_key == "reports.list"
     assert filters.category == "auth"
     assert filters.from_time == datetime(2026, 7, 13)
     assert filters.to_time == datetime(2026, 7, 14)
     assert filters.q == r"50%_done\\ok"
     assert not hasattr(filters, "raw_sql")
+
+
+def test_connection_filter_is_bound_into_delete_confirmation(monkeypatch, authed_client):
+    captured = {}
+    monkeypatch.setattr(api, "_now", lambda: 1_000.0)
+    monkeypatch.setattr(
+        api,
+        "preview_delete",
+        lambda spec: captured.update(preview=spec) or {"matched_count": 1, "max_id": 9},
+    )
+    monkeypatch.setattr(
+        api,
+        "delete_matching",
+        lambda spec, max_id: captured.update(execute=spec, max_id=max_id) or 1,
+    )
+
+    preview = authed_client.post(
+        "/admin/mcp-logs/delete-preview",
+        json={
+            "mode": "filter",
+            "filter": {"tenant_id": "tenant-a", "connection_id": "conn-a"},
+        },
+    )
+
+    assert preview.status_code == 200
+    assert captured["preview"].filters.connection_id == "conn-a"
+    assert api._decode_confirmation(preview.json()["confirm_token"])["spec"]["filter"] == {
+        "connection_id": "conn-a",
+        "tenant_id": "tenant-a",
+    }
+    response = authed_client.request(
+        "DELETE",
+        "/admin/mcp-logs",
+        json={
+            "mode": "filter",
+            "filter": {"tenant_id": "tenant-a", "connection_id": "conn-a"},
+            "confirm_token": preview.json()["confirm_token"],
+        },
+    )
+    assert response.status_code == 200
+    assert captured["execute"] == captured["preview"]
 
 
 @pytest.mark.parametrize(

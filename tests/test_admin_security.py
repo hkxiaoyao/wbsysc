@@ -3,6 +3,8 @@ from types import SimpleNamespace
 import pytest
 from fastapi import FastAPI, HTTPException, Response
 from fastapi.testclient import TestClient
+from starlette.applications import Starlette
+from starlette.routing import Mount
 
 from app import admin
 from app import auth as auth_module
@@ -72,6 +74,49 @@ def test_bearer_auth_success_emits_tenant_event_without_token(monkeypatch):
     assert events[0].result_status == "ok"
     for sensitive in ("valid-token", "corp-secret", "contact-secret"):
         assert sensitive not in repr(events[0])
+
+
+def test_connection_auth_binds_context_to_path_and_audits_only_resolved_connection(monkeypatch):
+    events = []
+    connection = auth_module.ConnectionCtx(
+        tenant_id="tenant-a",
+        connection_id="conn-a",
+        connector_key="wecom",
+        data_mode="stored",
+        public_config={"schema_name": "tenant_a"},
+        config_version=4,
+    )
+
+    class Resolver:
+        def resolve(self, connection_id, token):
+            if (connection_id, token) == ("conn-a", "valid-token"):
+                return connection
+            return None
+
+        def resolve_legacy(self, token):  # pragma: no cover - dynamic mount only
+            return None
+
+    protected = FastAPI()
+    protected.add_middleware(auth_module.BearerTokenMiddleware, resolver=Resolver())
+
+    @protected.get("/")
+    def context_view():
+        ctx = auth_module.current_ctx()
+        return {"tenant": ctx.tenant_id, "connection": ctx.connection_id}
+
+    app = Starlette(routes=[Mount("/mcp/{connection_id}", app=protected)])
+    monkeypatch.setattr(auth_module, "write_event", events.append)
+    monkeypatch.setattr(auth_module, "_auth_write_limiter", auth_module.AuthWriteLimiter())
+
+    client = TestClient(app)
+    rejected = client.get("/mcp/conn-b/", headers={"Authorization": "Bearer valid-token"})
+    accepted = client.get("/mcp/conn-a/", headers={"Authorization": "Bearer valid-token"})
+
+    assert rejected.status_code == 401
+    assert accepted.json() == {"tenant": "tenant-a", "connection": "conn-a"}
+    assert events[0].target == ""
+    assert events[1].target == "conn-a"
+    assert "valid-token" not in repr(events)
 
 
 def test_auth_event_hashes_mcp_session_id_fallback(monkeypatch):
@@ -645,3 +690,51 @@ def test_direct_tenant_cannot_run_sync_diagnosis(monkeypatch):
         admin.sync_diagnose("tenant-a", request)
 
     assert exc.value.status_code == 409
+
+
+def test_connection_credential_error_does_not_leak_secret(monkeypatch, caplog):
+    from app import admin_connections
+    from app.connections.models import ConnectionRecord
+    from app.connectors.contracts import ConnectorSpec
+
+    leaked = "credential-secret-in-database-error"
+    record = ConnectionRecord(
+        connection_id="conn-a",
+        tenant_id="tenant-a",
+        connector_key="sample",
+        display_name="Sample",
+        status="active",
+        data_mode="direct",
+        public_config={},
+        config_version=1,
+    )
+    monkeypatch.setattr(admin_connections.store, "get_connection", lambda *args: record)
+    monkeypatch.setattr(
+        admin_connections.store,
+        "replace_credentials",
+        lambda *args: (_ for _ in ()).throw(RuntimeError(leaked)),
+    )
+    monkeypatch.setattr(
+        admin_connections,
+        "_spec",
+        lambda request, key: ConnectorSpec(
+            connector_key="sample",
+            tools=(),
+            credential_schema={"type": "object"},
+            config_schema={"type": "object"},
+        ),
+    )
+    monkeypatch.setattr(admin, "_require_auth", lambda request: None)
+    test_app = FastAPI()
+    test_app.include_router(admin_connections.router)
+
+    with caplog.at_level("WARNING", logger="app.admin_connections"):
+        response = TestClient(test_app, raise_server_exceptions=False).put(
+            "/admin/tenants/tenant-a/connections/conn-a/credentials",
+            json={"credentials": {"api_key": "request-secret"}},
+        )
+
+    assert response.status_code == 400
+    assert response.json() == {"detail": "connection mutation failed"}
+    assert leaked not in caplog.text
+    assert "request-secret" not in caplog.text

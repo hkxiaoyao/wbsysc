@@ -1,0 +1,12 @@
+{
+  "id": "multi-provider-mcp-platform",
+  "title": "将企业微信 MCP 网关改造为多第三方连接器平台",
+  "status": "completed",
+  "complexity": "L+",
+  "risk": "high",
+  "domain": "architecture",
+  "currentPhase": "completed",
+  "nextAction": "归档任务并推送 codex/multi-provider-mcp-platform",
+  "createdAt": "2026-07-15T00:00:00+08:00",
+  "branch": "codex/multi-provider-mcp-platform"
+}

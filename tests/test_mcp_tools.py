@@ -5,6 +5,7 @@ import pytest
 
 from app import mcp_audit, mcp_server
 from app.auth import TenantCtx, _ctx
+from app.connectors import wecom as wecom_connector
 
 
 EXPECTED_TOOL_SIGNATURES = {
@@ -66,6 +67,52 @@ def test_real_data_tool_docstrings_describe_stored_and_direct_modes():
         assert "direct" in doc, name
 
 
+def test_legacy_tool_adapter_delegates_to_the_wecom_connector(
+    monkeypatch, use_tenant_ctx
+):
+    use_tenant_ctx()
+    calls = []
+
+    def execute_sync(context, tool_key, args):
+        calls.append((context, tool_key, args))
+        from app.connectors.contracts import ExecutionResult
+
+        return ExecutionResult.ok(
+            {"tenant": context.tenant_id, "source": "wecom", "records": []}
+        )
+
+    monkeypatch.setattr(mcp_server._legacy_connector, "execute_sync", execute_sync)
+    monkeypatch.setattr(mcp_server, "_audit", lambda *values: None)
+
+    result = json.loads(mcp_server.wecom_list_reports(1, 2, 10))
+
+    assert result == {"tenant": "tenant-a", "source": "wecom", "records": []}
+    assert [(context.tenant_id, tool_key, args) for context, tool_key, args in calls] == [
+        (
+            "tenant-a",
+            "reports.list",
+            {"starttime": 1, "endtime": 2, "limit": 10},
+        )
+    ]
+
+
+@pytest.mark.asyncio
+async def test_legacy_fastmcp_tool_runs_inside_its_event_loop(
+    monkeypatch,
+):
+    token = _ctx.set(tenant_ctx())
+    try:
+        monkeypatch.setattr(mcp_server, "_use_mock", lambda: True)
+        monkeypatch.setattr(mcp_server, "_audit", lambda *values: None)
+
+        tool = mcp_server.mcp._tool_manager._tools["wecom_list_reports"]  # noqa: SLF001
+        result = await tool.run({"starttime": 1, "endtime": 2, "limit": 10})
+    finally:
+        _ctx.reset(token)
+
+    assert json.loads(result)["source"] == "mock"
+
+
 @pytest.mark.parametrize(
     ("tool_name", "accessor_name", "args"),
     [
@@ -93,13 +140,19 @@ def test_real_tools_delegate_once_to_data_access(
         }
 
     monkeypatch.setattr(mcp_server, "_use_mock", lambda: False)
-    monkeypatch.setattr(mcp_server.data_access, accessor_name, accessor)
+    monkeypatch.setattr(wecom_connector.data_access, accessor_name, accessor)
     monkeypatch.setattr(mcp_server, "_audit", lambda *values: None)
 
     result = json.loads(getattr(mcp_server, tool_name)(*args))
 
     assert result["source"] == "wecom"
-    assert calls == [(context, *args)]
+    assert len(calls) == 1
+    access_context, *access_args = calls[0]
+    assert access_context.tenant_id == context.tenant_id
+    assert access_context.data_mode == context.data_mode
+    assert access_context.public_config["schema_name"] == context.schema_name
+    assert access_context.credentials["wecom_app_secret"] == context.secret
+    assert tuple(access_args) == args
 
 
 @pytest.mark.parametrize(
@@ -120,7 +173,7 @@ def test_mock_tools_bypass_data_access(
     monkeypatch.setattr(mcp_server, "_use_mock", lambda: True)
     monkeypatch.setattr(mcp_server, "write_event", events.append)
     monkeypatch.setattr(
-        mcp_server.data_access,
+        wecom_connector.data_access,
         accessor_name,
         lambda *values: (_ for _ in ()).throw(
             AssertionError("mock tools must not call data access")
@@ -159,7 +212,7 @@ def test_list_limits_remain_bounded_through_data_access(
         return []
 
     monkeypatch.setattr(mcp_server, "_use_mock", lambda: False)
-    monkeypatch.setattr(mcp_server.data_access.db, query_name, query)
+    monkeypatch.setattr(wecom_connector.data_access.db, query_name, query)
     monkeypatch.setattr(mcp_server, "_audit", lambda *values: None)
 
     getattr(mcp_server, tool_name)(1, 2, requested)
@@ -177,12 +230,12 @@ def test_direct_accessor_failure_redacts_secrets_and_does_not_fall_back(
     )
     monkeypatch.setattr(mcp_server, "_use_mock", lambda: False)
     monkeypatch.setattr(
-        mcp_server.data_access,
+        wecom_connector.data_access,
         "list_reports",
         lambda *values: (_ for _ in ()).throw(RuntimeError(sensitive_error)),
     )
     monkeypatch.setattr(
-        mcp_server.data_access.db,
+        wecom_connector.data_access.db,
         "query_reports_by_window",
         lambda *values: (_ for _ in ()).throw(
             AssertionError("direct failure must not read cached rows")
@@ -190,7 +243,7 @@ def test_direct_accessor_failure_redacts_secrets_and_does_not_fall_back(
     )
     monkeypatch.setattr(mcp_server, "_audit", lambda *values: None)
 
-    with caplog.at_level("WARNING", logger="app.mcp_server"):
+    with caplog.at_level("WARNING", logger="app.connectors.wecom"):
         response = mcp_server.wecom_list_reports(1, 2, 10)
 
     assert json.loads(response) == {
@@ -199,7 +252,7 @@ def test_direct_accessor_failure_redacts_secrets_and_does_not_fall_back(
         "errcode": 502,
         "errmsg": "数据访问失败",
     }
-    assert "MCP data access failed tool=wecom_list_reports: RuntimeError" in caplog.text
+    assert "WeCom data access failed type=RuntimeError" in caplog.text
     for secret in ("corp-secret", "token-value", "db-password"):
         assert secret not in response
         assert secret not in caplog.text
@@ -216,7 +269,7 @@ def test_public_wecom_failure_returns_controlled_error_and_audits_error(
     audits = []
     monkeypatch.setattr(mcp_server, "_use_mock", lambda: False)
     monkeypatch.setattr(
-        mcp_server.data_access,
+        wecom_connector.data_access,
         "sync_reports_window",
         lambda *args, **kwargs: (_ for _ in ()).throw(RuntimeError(sensitive)),
     )
@@ -286,7 +339,7 @@ def test_stored_success_and_not_found_keep_database_source(
     use_tenant_ctx("stored")
     monkeypatch.setattr(mcp_server, "_use_mock", lambda: False)
     monkeypatch.setattr(
-        mcp_server.data_access, "get_report", lambda *values: accessor_result
+        wecom_connector.data_access, "get_report", lambda *values: accessor_result
     )
     monkeypatch.setattr(mcp_server, "_audit", lambda *values: None)
 
@@ -302,7 +355,7 @@ def test_stored_accessor_exception_keeps_safe_database_source(
     use_tenant_ctx("stored")
     monkeypatch.setattr(mcp_server, "_use_mock", lambda: False)
     monkeypatch.setattr(
-        mcp_server.data_access,
+        wecom_connector.data_access,
         "get_report",
         lambda *values: (_ for _ in ()).throw(RuntimeError("secret=db-secret")),
     )
@@ -355,7 +408,7 @@ def test_real_result_selects_expected_audit_status(
     audits = []
     monkeypatch.setattr(mcp_server, "_use_mock", lambda: False)
     monkeypatch.setattr(
-        mcp_server.data_access, "list_reports", lambda *values: accessor_result
+        wecom_connector.data_access, "list_reports", lambda *values: accessor_result
     )
     monkeypatch.setattr(mcp_server, "write_event", audits.append)
 
@@ -380,7 +433,7 @@ def test_audit_failure_logs_warning_without_changing_tool_result(
     }
     monkeypatch.setattr(mcp_server, "_use_mock", lambda: False)
     monkeypatch.setattr(
-        mcp_server.data_access, "list_reports", lambda *values: expected
+        wecom_connector.data_access, "list_reports", lambda *values: expected
     )
     writer = mcp_audit.AuditEventWriter(
         insert=lambda event: (_ for _ in ()).throw(

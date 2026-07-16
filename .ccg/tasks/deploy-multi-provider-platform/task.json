@@ -1,0 +1,12 @@
+{
+  "id": "deploy-multi-provider-platform",
+  "title": "合并并部署多第三方 MCP 平台到生产服务器",
+  "status": "in_progress",
+  "complexity": "M",
+  "risk": "high",
+  "domain": "devops",
+  "currentPhase": "implementation",
+  "nextAction": "创建并合并 GitHub PR，等待 main 镜像构建",
+  "createdAt": "2026-07-16T00:00:00+08:00",
+  "branch": "codex/multi-provider-mcp-platform"
+}

@@ -6,25 +6,18 @@ MCP Server - 暴露给 workbuddy 的 tools（多租户版）
 """
 from __future__ import annotations
 
-import json
 import logging
-import time
 
 from urllib.parse import urlparse
 
 from mcp.server.fastmcp import FastMCP
 from mcp.server.transport_security import TransportSecuritySettings
 
-from . import data_access
-from .auth import current_ctx, require_tenant
+from .auth import current_ctx, current_ctx as _legacy_current_ctx
 from .config import get_settings
+from .connectors.wecom import LegacyWeComAdapter, WeComConnector
 from .mcp_audit import current_request_metadata, safe_summary, write_event
 from .mcp_log_models import McpLogEvent
-from .wecom.mock import (
-    MOCK_APPROVAL_LIST,
-    MOCK_REPORT_LIST,
-    MOCK_SMARTTABLE_RECORDS,
-)
 
 logger = logging.getLogger(__name__)
 
@@ -116,10 +109,6 @@ def _use_mock() -> bool:
     return get_settings().wecom_use_mock
 
 
-def _ok(data) -> str:
-    return json.dumps(data, ensure_ascii=False, default=str)
-
-
 def _audit(tool, target, params, status, cost):
     try:
         ctx = current_ctx()
@@ -142,53 +131,33 @@ def _audit(tool, target, params, status, cost):
         logger.warning("MCP tool audit failed type=%s", type(exc).__name__)
 
 
-def _run_mock(tool, target, params, started_at, result):
-    status = (
-        "partial"
-        if result.get("partial_count")
-        else ("error" if result.get("errcode") else "ok")
+_legacy_connector = WeComConnector(mock_enabled=lambda: _use_mock())
+_legacy_adapter = LegacyWeComAdapter(
+    _legacy_connector,
+    legacy_context_provider=lambda: _legacy_current_ctx(),
+    audit=lambda tool, target, params, status, cost: _audit(
+        tool, target, params, status, cost
+    ),
+)
+
+
+def _legacy_execute(
+    tool_key: str,
+    args: dict,
+    *,
+    target: str = "",
+    params: str = "",
+) -> str:
+    return _legacy_adapter.execute(
+        tool_key,
+        args,
+        target=target,
+        params=params,
     )
-    _audit(tool, target, params, status, int((time.time() - started_at) * 1000))
-    return _ok(result)
 
 
-def _run_real(tool, target, params, started_at, call):
-    ctx = current_ctx()
-    try:
-        result = call(ctx)
-        status = (
-            "partial"
-            if result.get("partial_count")
-            else ("error" if result.get("errcode") else "ok")
-        )
-    except data_access.PublicDataAccessError as exc:
-        logger.warning(
-            "MCP data access failed tool=%s: %s", tool, type(exc).__name__
-        )
-        result = {
-            "tenant": ctx.tenant_id,
-            "source": exc.source,
-            "errcode": exc.errcode,
-            "errmsg": exc.public_message,
-        }
-        status = "error"
-    except Exception as exc:
-        logger.warning(
-            "MCP data access failed tool=%s: %s", tool, type(exc).__name__
-        )
-        result = {
-            "tenant": ctx.tenant_id,
-            "source": "wecom" if ctx.data_mode == "direct" else "db",
-            "errcode": 502,
-            "errmsg": "数据访问失败",
-        }
-        status = "error"
-    _audit(tool, target, params, status, int((time.time() - started_at) * 1000))
-    return _ok(result)
-
-
-# ============= 汇报类 =============
-@mcp.tool()
+# The old synchronous functions remain only as a public FastMCP compatibility
+# adapter.  Tool resolution and data access now live in WeComConnector.
 def wecom_list_reports(starttime: int, endtime: int, limit: int = 100) -> str:
     """列出企业微信汇报记录。
 
@@ -197,82 +166,42 @@ def wecom_list_reports(starttime: int, endtime: int, limit: int = 100) -> str:
     Args:
         starttime/endtime: Unix 秒; limit: ≤100
     """
-    t0 = time.time()
-    tenant = require_tenant()
-
-    if _use_mock():
-        return _run_mock(
-            "wecom_list_reports", "", f"{starttime}-{endtime}#{limit}", t0,
-            {"tenant": tenant, "source": "mock", "count": len(MOCK_REPORT_LIST),
-             "records": MOCK_REPORT_LIST},
-        )
-
-    return _run_real(
-        "wecom_list_reports", "", f"{starttime}-{endtime}#{limit}", t0,
-        lambda ctx: data_access.list_reports(ctx, starttime, endtime, limit),
+    return _legacy_execute(
+        "reports.list",
+        {"starttime": starttime, "endtime": endtime, "limit": limit},
+        params=f"{starttime}-{endtime}#{limit}",
     )
 
 
-@mcp.tool()
 def wecom_get_report(journaluuid: str) -> str:
     """获取汇报详情；stored 读租户 schema，direct 实时请求企业微信。"""
-    t0 = time.time()
-    tenant = require_tenant()
-
-    if _use_mock():
-        from .wecom.mock import MOCK_REPORT_DETAIL
-        return _run_mock(
-            "wecom_get_report", journaluuid, journaluuid, t0,
-            MOCK_REPORT_DETAIL.get(journaluuid, {"errcode": 404, "errmsg": "不存在"}),
-        )
-
-    return _run_real(
-        "wecom_get_report", journaluuid, journaluuid, t0,
-        lambda ctx: data_access.get_report(ctx, journaluuid),
+    return _legacy_execute(
+        "reports.get",
+        {"journaluuid": journaluuid},
+        target=journaluuid,
+        params=journaluuid,
     )
 
 
-# ============= 审批类 =============
-@mcp.tool()
 def wecom_list_approvals(starttime: int, endtime: int, limit: int = 100) -> str:
     """列出审批记录；stored 读租户 schema，direct 实时请求企业微信。"""
-    t0 = time.time()
-    tenant = require_tenant()
-
-    if _use_mock():
-        return _run_mock(
-            "wecom_list_approvals", "", f"{starttime}-{endtime}#{limit}", t0,
-            {"tenant": tenant, "source": "mock", "count": len(MOCK_APPROVAL_LIST),
-             "records": MOCK_APPROVAL_LIST},
-        )
-
-    return _run_real(
-        "wecom_list_approvals", "", f"{starttime}-{endtime}#{limit}", t0,
-        lambda ctx: data_access.list_approvals(ctx, starttime, endtime, limit),
+    return _legacy_execute(
+        "approvals.list",
+        {"starttime": starttime, "endtime": endtime, "limit": limit},
+        params=f"{starttime}-{endtime}#{limit}",
     )
 
 
-@mcp.tool()
 def wecom_get_approval_detail(sp_no: str) -> str:
     """获取审批详情；stored 读租户 schema，direct 实时请求企业微信。"""
-    t0 = time.time()
-    tenant = require_tenant()
-
-    if _use_mock():
-        from .wecom.mock import MOCK_APPROVAL_DETAIL
-        return _run_mock(
-            "wecom_get_approval_detail", sp_no, sp_no, t0,
-            MOCK_APPROVAL_DETAIL.get(sp_no, {"errcode": 404, "errmsg": "不存在"}),
-        )
-
-    return _run_real(
-        "wecom_get_approval_detail", sp_no, sp_no, t0,
-        lambda ctx: data_access.get_approval(ctx, sp_no),
+    return _legacy_execute(
+        "approvals.get",
+        {"sp_no": sp_no},
+        target=sp_no,
+        params=sp_no,
     )
 
 
-# ============= 打卡类 =============
-@mcp.tool()
 def wecom_list_checkins(starttime: int, endtime: int, limit: int = 100) -> str:
     """列出企业微信打卡记录。
 
@@ -283,33 +212,32 @@ def wecom_list_checkins(starttime: int, endtime: int, limit: int = 100) -> str:
     Returns:
         JSON: { records: [...], count }
     """
-    t0 = time.time()
-    tenant = require_tenant()
-
-    if _use_mock():
-        return _run_mock(
-            "wecom_list_checkins", "", f"{starttime}-{endtime}#{limit}", t0,
-            {"tenant": tenant, "source": "mock", "count": 0, "records": []},
-        )
-
-    return _run_real(
-        "wecom_list_checkins", "", f"{starttime}-{endtime}#{limit}", t0,
-        lambda ctx: data_access.list_checkins(ctx, starttime, endtime, limit),
+    return _legacy_execute(
+        "checkins.list",
+        {"starttime": starttime, "endtime": endtime, "limit": limit},
+        params=f"{starttime}-{endtime}#{limit}",
     )
 
 
-# ============= 智能表格类（一期搁置）=============
-@mcp.tool()
 def wecom_list_smart_table_records(docid: str, sheet_id: str, limit: int = 1000) -> str:
     """查询智能表格记录（一期暂搁置：企微docid限制）"""
-    t0 = time.time()
-    tenant = require_tenant()
-    return _run_mock(
-        "wecom_list_smart_table_records", f"{docid}/{sheet_id}",
-        f"{docid}#{sheet_id}#{limit}", t0,
-        {"tenant": tenant, "source": "mock", "note": "智能表格读取一期暂搁置",
-         "records": MOCK_SMARTTABLE_RECORDS[:limit]},
+    return _legacy_execute(
+        "smart_tables.records.list",
+        {"docid": docid, "sheet_id": sheet_id, "limit": limit},
+        target=f"{docid}/{sheet_id}",
+        params=f"{docid}#{sheet_id}#{limit}",
     )
+
+
+for _legacy_tool in (
+    wecom_list_reports,
+    wecom_get_report,
+    wecom_list_approvals,
+    wecom_get_approval_detail,
+    wecom_list_checkins,
+    wecom_list_smart_table_records,
+):
+    mcp.tool()(_legacy_tool)
 
 
 def list_tool_names():

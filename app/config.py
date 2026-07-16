@@ -2,6 +2,7 @@
 企微数据中转 MCP Gateway - 配置中心
 基于 pydantic-settings，所有敏感值走 .env，禁止硬编码
 """
+
 from __future__ import annotations
 
 from functools import lru_cache
@@ -13,6 +14,14 @@ from sqlalchemy.engine import URL
 
 
 EXAMPLE_PASSWORDS = {"CHANGE_ME", "<强密码，与开发库不同>", "<强密码，登录管理后台用>"}
+EXAMPLE_MCP_TOKEN_HMAC_KEYS = {
+    "CHANGE_ME",
+    "<强随机串>",
+    "<独立强随机串>",
+    "MCP_TOKEN_HMAC_KEY",
+    "<MCP_TOKEN_HMAC_KEY>",
+    "PoC_DEFAULT_KEY_DO_NOT_USE_IN_PRODUCTION_32bytes!",
+}
 
 
 class Settings(BaseSettings):
@@ -24,6 +33,7 @@ class Settings(BaseSettings):
     # 本地开发兜底：若 .env 文件存在且可读，手动加载（容器内只走环境变量）
     try:
         from dotenv import dotenv_values as _dv
+
         _env_vals = _dv(".env")
         if _env_vals:
             for _k, _v in _env_vals.items():
@@ -37,6 +47,8 @@ class Settings(BaseSettings):
     app_host: str = "0.0.0.0"
     app_port: int = 8000
     log_level: str = "INFO"
+    # Reviewed, preinstalled connector entry-point names (comma-separated).
+    connector_allowlist: str = ""
 
     # MySQL（一期单实例多 schema）
     db_host: str = "127.0.0.1"
@@ -49,6 +61,10 @@ class Settings(BaseSettings):
     # MCP 鉴权：PoC 用环境变量映射 token->租户标识
     # 格式 "tokenA:tenantA,tokenB:tenantB"
     mcp_tokens: str = ""
+    # Connection-platform MCP token HMAC key. This is intentionally distinct
+    # from CREDENTIAL_KEY so a credential-key compromise cannot be used to
+    # validate bearer tokens.
+    mcp_token_hmac_key: str = ""
     mcp_base_url: str = "http://localhost:8000"
     # MCP DNS 重绑定保护允许的 Host（逗号分隔）。空=关闭 Host 校验（适合反代+Bearer）
     # 例: wbsysc.hacka.cn,mcp.example.com
@@ -67,7 +83,7 @@ class Settings(BaseSettings):
 
     # 管理后台密码（单密码登录，session token 鉴权）
     admin_password: str = ""
-    admin_session_ttl_min: int = 480   # session 有效期(分钟), 默认 8 小时
+    admin_session_ttl_min: int = 480  # session 有效期(分钟), 默认 8 小时
 
     # 同步间隔（分钟）
     sync_interval_report_min: int = 30
@@ -80,12 +96,18 @@ class Settings(BaseSettings):
             return self
         errors = []
         credential_key = self.credential_key.strip()
-        if (
-            credential_key == "<强随机串>"
-            or len(credential_key.encode("utf-8")) < 32
-        ):
+        if credential_key == "<强随机串>" or len(credential_key.encode("utf-8")) < 32:
             errors.append(
                 "CREDENTIAL_KEY must be a non-example value of at least 32 UTF-8 bytes in production"
+            )
+        mcp_token_hmac_key = self.mcp_token_hmac_key.strip()
+        if (
+            mcp_token_hmac_key in EXAMPLE_MCP_TOKEN_HMAC_KEYS
+            or len(mcp_token_hmac_key.encode("utf-8")) < 32
+            or mcp_token_hmac_key == credential_key
+        ):
+            errors.append(
+                "MCP_TOKEN_HMAC_KEY must be a distinct, non-example value of at least 32 UTF-8 bytes in production"
             )
         if not self.admin_password or self.admin_password in EXAMPLE_PASSWORDS:
             errors.append("ADMIN_PASSWORD must be a non-example value in production")

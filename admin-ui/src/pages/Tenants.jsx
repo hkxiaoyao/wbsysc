@@ -36,6 +36,7 @@ import {
   UploadOutlined,
 } from '@ant-design/icons'
 import api from '../api.js'
+import Connections from './Connections.jsx'
 import { EMPTY_FILTERS, filterTenants, getDirectModeReason, getTenantStats } from './tenantsView.js'
 import './Tenants.css'
 
@@ -61,7 +62,7 @@ function buildMcpConfig(row) {
   }
 }
 
-export default function Tenants({ onViewLogs = () => {} }) {
+export default function Tenants({ onViewLogs = () => {}, onViewConnections = () => {}, onViewConnectionLogs = () => {} }) {
   const [data, setData] = useState([])
   const [loading, setLoading] = useState(false)
   const [loadError, setLoadError] = useState('')
@@ -72,6 +73,7 @@ export default function Tenants({ onViewLogs = () => {} }) {
   const [editing, setEditing] = useState(null)
   const [saving, setSaving] = useState(false)
   const [mcpLoadingTenant, setMcpLoadingTenant] = useState(null)
+  const [connectionTenant, setConnectionTenant] = useState(null)
   const [mcpModal, setMcpModal] = useState({ open: false, title: '', text: '' })
   const [domainModal, setDomainModal] = useState({
     open: false, tenant: null, domain: '', fileList: [], uploading: false, info: null,
@@ -441,6 +443,7 @@ export default function Tenants({ onViewLogs = () => {} }) {
 
     return {
       items: [
+        { key: 'connections', icon: <GlobalOutlined />, label: '连接实例' },
         { key: 'mcp', icon: <CopyOutlined />, label: 'MCP 配置' },
         { key: 'domain', icon: <GlobalOutlined />, label: '可信域名' },
         { type: 'divider' },
@@ -458,6 +461,7 @@ export default function Tenants({ onViewLogs = () => {} }) {
         { key: 'delete', icon: <DeleteOutlined />, label: '删除租户', danger: true },
       ],
       onClick: ({ key }) => {
+        if (key === 'connections') setConnectionTenant(row)
         if (key === 'mcp') openMcpConfig(row)
         if (key === 'domain') openDomain(row)
         if (key === 'logs') onViewLogs(row.tenant_id)
@@ -565,6 +569,22 @@ export default function Tenants({ onViewLogs = () => {} }) {
     <>
       {modalContextHolder}
       {messageContextHolder}
+      <Drawer
+        rootClassName="tenant-connection-drawer"
+        title={connectionTenant ? `连接实例 · ${connectionTenant.display_name || connectionTenant.tenant_id}` : '连接实例'}
+        open={Boolean(connectionTenant)}
+        onClose={() => setConnectionTenant(null)}
+        width={screens.lg ? 1100 : screens.sm ? '94vw' : '100vw'}
+        extra={connectionTenant && <Button onClick={() => onViewConnections(connectionTenant.tenant_id)}>进入全屏连接中心</Button>}
+      >
+        {connectionTenant && (
+          <Connections
+            embedded
+            tenantId={connectionTenant.tenant_id}
+            onViewLogs={onViewConnectionLogs}
+          />
+        )}
+      </Drawer>
       <main className="tenant-workbench">
         <header className="tenant-heading">
           <div>

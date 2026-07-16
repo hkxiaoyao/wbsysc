@@ -84,6 +84,18 @@ def test_models_are_immutable_and_filters_validate_ranges():
         LogFilters(from_time=datetime.now(timezone.utc))
 
 
+def test_server_resolved_auth_and_protocol_targets_populate_only_connection_dimension():
+    auth = McpLogEvent(category="auth", target="conn-a")
+    protocol = McpLogEvent(category="protocol", target="conn-b")
+    anonymous = McpLogEvent(category="auth")
+
+    assert auth.connection_id == "conn-a"
+    assert protocol.connection_id == "conn-b"
+    assert anonymous.connection_id is None
+    assert anonymous.connector_key is None
+    assert anonymous.tool_key is None
+
+
 @pytest.mark.parametrize(
     ("kwargs", "message"),
     [
@@ -96,6 +108,14 @@ def test_models_are_immutable_and_filters_validate_ranges():
 def test_log_filters_reject_invalid_values(kwargs, message):
     with pytest.raises(ValueError, match=message):
         LogFilters(**kwargs)
+
+
+@pytest.mark.parametrize("field", ["connection_id", "connector_key", "tool_key"])
+def test_connection_dimensions_reject_credential_bearing_labels(field):
+    with pytest.raises(ValueError, match=field):
+        McpLogEvent(**{field: "token=top-secret"})
+    with pytest.raises(ValueError, match=field):
+        LogFilters(**{field: "token=top-secret"})
 
 
 def test_delete_spec_requires_fields_for_selected_mode():
@@ -115,6 +135,10 @@ def test_ensure_central_log_tables_executes_mysql57_ddl(monkeypatch):
     sql = "\n".join(statement for statement, _ in connection.statements)
     assert "CREATE TABLE IF NOT EXISTS `mcp_call_log`" in sql
     assert "DATETIME(6)" in sql
+    assert "`connection_id` VARCHAR(64) NULL" in sql
+    assert "`connector_key` VARCHAR(64) NULL" in sql
+    assert "`tool_key` VARCHAR(128) NULL" in sql
+    assert "idx_mcp_log_connection_created" in sql
     assert "UNIQUE KEY `uk_mcp_log_legacy` (`legacy_schema`, `legacy_id`)" in sql
     assert "CREATE TABLE IF NOT EXISTS `gateway_setting`" in sql
     assert "ADD COLUMN IF NOT EXISTS" not in sql
@@ -137,6 +161,47 @@ def test_insert_event_uses_bound_parameters(monkeypatch):
     assert params["tenant_id"] == "tenant-a"
     assert params["params_summary"] == "safe summary"
     assert params["created_at"] == datetime(2026, 7, 14, 8, 0)
+
+
+def test_connection_dimensions_are_bound_and_filter_logs_without_crossing_connections(
+    monkeypatch,
+):
+    conn_a_log = {
+        "id": 7,
+        "tenant_id": "tenant-a",
+        "connection_id": "conn-a",
+        "connector_key": "wecom",
+        "tool_key": "reports.list",
+    }
+    connection = install_engine(
+        monkeypatch,
+        Result(),
+        Result(scalar_value=1),
+        Result(rows=[conn_a_log]),
+    )
+    event = McpLogEvent(
+        tenant_id="tenant-a",
+        connection_id="conn-a",
+        connector_key="wecom",
+        tool_key="reports.list",
+        category="tool",
+        event_name="wecom_list_reports",
+    )
+
+    store.insert_event(event)
+    result = store.list_logs(
+        LogFilters(tenant_id="tenant-a", connection_id="conn-a"),
+        page=1,
+        page_size=20,
+    )
+
+    insert_sql, insert_params = connection.statements[0]
+    count_sql, count_params = connection.statements[1]
+    assert ":connection_id" in insert_sql and "conn-a" not in insert_sql
+    assert insert_params["connection_id"] == "conn-a"
+    assert result["items"] == [conn_a_log]
+    assert "connection_id = :connection_id" in count_sql
+    assert count_params["connection_id"] == "conn-a"
 
 
 def test_list_logs_escapes_like_metacharacters_and_paginates(monkeypatch):
@@ -309,17 +374,27 @@ def test_legacy_migration_is_bounded_mapped_and_marks_completion(monkeypatch):
 
     sql = "\n".join(statement for statement, _ in connection.statements)
     assert "INTERVAL 90 DAY" in sql
-    assert "INSERT IGNORE" in sql
+    assert "INSERT INTO mcp_call_log" in sql
     assert "`wbd_abc`.`audit_log`" in sql
     assert "legacy_schema" in sql and "legacy_id" in sql
+    assert "connection_instance" in sql
+    assert "connection_id, connector_key, tool_key" in sql
+    # MySQL 5.7 accepts unqualified target-column references in the duplicate
+    # update clause; qualifying the target table is not portable there.
+    assert "mcp_call_log.connection_id" not in sql
     assert "SELECT tenant_id, schema_name, created_at FROM tenant_config" in sql
     assert "created_at >= :tenant_created_at" in sql
-    migration_params = [params for statement, params in connection.statements if "INSERT IGNORE" in statement]
+    migration_params = [
+        params
+        for statement, params in connection.statements
+        if "INSERT INTO mcp_call_log" in statement
+    ]
     assert migration_params == [
         {
             "tenant_id": "tenant-real",
             "legacy_schema": "wbd_abc",
             "tenant_created_at": tenant_created_at,
+            "default_connection_id": "5b609fcb-0609-5321-bcef-67cc5bc03fef",
         },
     ]
     marker_index, (marker_sql, marker_params) = next(
@@ -330,12 +405,12 @@ def test_legacy_migration_is_bounded_mapped_and_marks_completion(monkeypatch):
     migration_index = next(
         index
         for index, (statement, _) in enumerate(connection.statements)
-        if "INSERT IGNORE" in statement
+        if "INSERT INTO mcp_call_log" in statement
     )
     assert migration_index < marker_index
     assert "ON DUPLICATE KEY UPDATE" in marker_sql
     assert marker_params == {
-        "setting_key": "mcp_log_legacy_migration_v1",
+        "setting_key": "mcp_log_legacy_migration_v2",
         "setting_value": "completed",
     }
 
@@ -348,7 +423,7 @@ def test_legacy_migration_existing_marker_skips_tenant_scan(monkeypatch):
     assert len(connection.statements) == 1
     marker_sql, marker_params = connection.statements[0]
     assert "SELECT setting_value FROM gateway_setting" in marker_sql
-    assert marker_params["setting_key"] == "mcp_log_legacy_migration_v1"
+    assert marker_params["setting_key"] == "mcp_log_legacy_migration_v2"
     assert "tenant_config" not in marker_sql
 
 
@@ -366,7 +441,7 @@ def test_legacy_migration_noncompleted_marker_is_retried_and_overwritten(monkeyp
 
     sql = "\n".join(statement for statement, _ in connection.statements)
     assert "SELECT tenant_id, schema_name, created_at FROM tenant_config" in sql
-    assert "INSERT IGNORE INTO mcp_call_log" in sql
+    assert "INSERT INTO mcp_call_log" in sql
     marker_params = next(
         params
         for statement, params in connection.statements
@@ -411,7 +486,7 @@ def test_legacy_migration_does_not_mark_completion_after_tenant_failure(monkeypa
     migrations = [
         statement
         for statement, _ in connection.statements
-        if "INSERT IGNORE INTO mcp_call_log" in statement
+        if "INSERT INTO mcp_call_log" in statement
     ]
     marker_writes = [
         statement
@@ -435,7 +510,7 @@ def test_legacy_migration_skips_rows_before_current_schema_owner(monkeypatch):
     store.migrate_legacy_logs(days=90)
 
     migration_sql, params = next(
-        entry for entry in connection.statements if "INSERT IGNORE" in entry[0]
+        entry for entry in connection.statements if "INSERT INTO mcp_call_log" in entry[0]
     )
     assert "created_at >= UTC_TIMESTAMP() - INTERVAL 90 DAY" in migration_sql
     assert "created_at >= :tenant_created_at" in migration_sql
@@ -467,7 +542,7 @@ def test_legacy_migration_invalid_schema_blocks_marker_until_config_is_fixed(
     migrations = [
         statement
         for statement, _ in connection.statements
-        if "INSERT IGNORE INTO mcp_call_log" in statement
+        if "INSERT INTO mcp_call_log" in statement
     ]
     marker_writes = [
         statement

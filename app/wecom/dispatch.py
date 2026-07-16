@@ -11,6 +11,7 @@ import time
 from typing import Iterator
 
 from .. import db
+from ..connectors.contracts import ConnectionContext
 from ..tenant import get_all_tenants, _TenantCtx
 from .approval_sync import fetch_approval_detail, sync_approvals_window
 from .checkin_sync import fetch_checkin_records_with_stats
@@ -24,7 +25,7 @@ FULL_WINDOW_DAYS = 180
 MAX_DETAIL_PER_RUN = 500
 MIN_WINDOW_SECONDS = 60
 
-# userid 缓存：tenant_id -> (userids, expire_at)，避免每次同步都拉通讯录
+# userid 缓存：租户或连接身份 -> (userids, expire_at)，避免每次同步都拉通讯录
 _userid_cache: dict = {}
 _USERID_CACHE_TTL = 600   # 10分钟
 
@@ -48,11 +49,15 @@ def _bounded_windows(
     yield from _bounded_windows(fetch, midpoint, endtime, limit)
 
 
-def _resolve_checkin_userids(t: _TenantCtx) -> list:
+def _resolve_checkin_userids(t: _TenantCtx, cache_key: str | None = None) -> list:
     """解析打卡用 useridlist：优先自动拉通讯录，失败回退手动配"""
     import time as _t
     now = _t.time()
-    cached = _userid_cache.get(t.tenant_id)
+    # Tenant sync retains its historical tenant-scoped cache.  Connection sync
+    # supplies a connection identity because distinct connections may share a
+    # tenant but use different contact credentials.
+    resolved_cache_key = ("connection", cache_key) if cache_key else t.tenant_id
+    cached = _userid_cache.get(resolved_cache_key)
     if cached and now < cached[1]:
         return cached[0]
 
@@ -60,7 +65,7 @@ def _resolve_checkin_userids(t: _TenantCtx) -> list:
     if t.contact_secret:
         try:
             uids = fetch_all_userids(t.corpid, t.contact_secret)
-            _userid_cache[t.tenant_id] = (uids, now + _USERID_CACHE_TTL)
+            _userid_cache[resolved_cache_key] = (uids, now + _USERID_CACHE_TTL)
             logger.info("租户 %s 自动拉取userid=%s人", t.tenant_id, len(uids))
             return uids
         except Exception as e:
@@ -70,7 +75,13 @@ def _resolve_checkin_userids(t: _TenantCtx) -> list:
     return t.checkin_userids
 
 
-def _window(schema: str, data_source: str, lookback_days: int, force: bool = False) -> tuple[int, int]:
+def _window(
+    schema: str,
+    data_source: str,
+    lookback_days: int,
+    force: bool = False,
+    cursor_key: str = "",
+) -> tuple[int, int]:
     """计算同步时间窗。force=True 时忽略游标，强制从 now-lookback 拉起。
 
     endtime 向后放宽 1 小时，避免服务器时钟偏慢漏掉刚提交的单据。
@@ -80,7 +91,7 @@ def _window(schema: str, data_source: str, lookback_days: int, force: bool = Fal
     if force:
         starttime = now - max(1, lookback_days) * 86400
         return starttime, endtime
-    last = db.get_cursor(schema, data_source, "")
+    last = db.get_cursor(schema, data_source, cursor_key)
     starttime = int(last) if (last and last.isdigit()) else now - lookback_days * 86400
     # 增量时再向前回拨 1 天，降低「刚提交却落在游标缝」的漏数
     starttime = min(starttime, now) - 86400
@@ -89,22 +100,39 @@ def _window(schema: str, data_source: str, lookback_days: int, force: bool = Fal
     return starttime, endtime
 
 
-def reset_cursors(schema: str, lookback_days: int, modules: set | None = None) -> dict:
+def reset_cursors(
+    schema: str,
+    lookback_days: int,
+    modules: set | None = None,
+    cursor_key: str = "",
+) -> dict:
     """把指定模块游标回拨到 now-lookback_days，返回新游标值。"""
     now = int(time.time())
     start = now - max(1, min(int(lookback_days), FULL_WINDOW_DAYS)) * 86400
     targets = modules or {"report", "approval", "checkin"}
     for ds in ("report", "approval", "checkin"):
         if ds in targets:
-            db.save_cursor(schema, ds, "", str(start))
+            db.save_cursor(schema, ds, cursor_key, str(start))
     logger.info("schema=%s 游标已回拨 lookback_days=%s start=%s modules=%s",
                 schema, lookback_days, start, sorted(targets))
     return {"start": start, "lookback_days": lookback_days, "modules": sorted(targets)}
 
 
-def _sync_one_checkin(t: _TenantCtx, lookback_days: int, force: bool = False) -> dict:
+def _sync_one_checkin(
+    t: _TenantCtx,
+    lookback_days: int,
+    force: bool = False,
+    cursor_key: str = "",
+    userid_cache_key: str | None = None,
+) -> dict:
     """打卡同步：需租户配置了 checkin_userids / contact_secret"""
-    starttime, endtime = _window(t.schema_name, "checkin", lookback_days, force=force)
+    starttime, endtime = _window(
+        t.schema_name,
+        "checkin",
+        lookback_days,
+        force=force,
+        cursor_key=cursor_key,
+    )
     # 打卡接口 endtime 不宜超过当前过多，收回 now
     endtime = min(endtime, int(time.time()))
     stats = {
@@ -125,7 +153,7 @@ def _sync_one_checkin(t: _TenantCtx, lookback_days: int, force: bool = False) ->
         logger.warning("租户 %s 启用打卡但既无通讯录secret也无checkin_userids，跳过", t.tenant_id)
         return {**stats, "error": "no userid source (需配contact_secret或checkin_userids)"}
 
-    userids = _resolve_checkin_userids(t)
+    userids = _resolve_checkin_userids(t, cache_key=userid_cache_key)
     if not userids:
         return {**stats, "error": "userid list 为空"}
 
@@ -157,7 +185,7 @@ def _sync_one_checkin(t: _TenantCtx, lookback_days: int, force: bool = False) ->
                 stats["err"] += 1
                 stats["write_err"] += 1
     if stats["partial_count"] == 0 and stats["write_err"] == 0:
-        db.save_cursor(t.schema_name, "checkin", "", str(int(time.time())))
+        db.save_cursor(t.schema_name, "checkin", cursor_key, str(int(time.time())))
     logger.info("打卡 tenant=%s pulled=%s stored=%s err=%s window=[%s,%s]",
                 t.tenant_id, stats["pulled"], stats["stored"], stats["err"],
                 starttime, endtime)
@@ -173,8 +201,27 @@ def _detail_ok_report(info: dict) -> bool:
     return True
 
 
-def _sync_one_report(t: _TenantCtx, lookback_days: int, force: bool = False) -> dict:
-    starttime, endtime = _window(t.schema_name, "report", lookback_days, force=force)
+def _without_internal_detail_error(info: object) -> object:
+    """Keep connection-scoped detail records free of legacy exception text."""
+    if not isinstance(info, dict):
+        return info
+    return {key: value for key, value in info.items() if key != "_partial_error"}
+
+
+def _sync_one_report(
+    t: _TenantCtx,
+    lookback_days: int,
+    force: bool = False,
+    cursor_key: str = "",
+    safe_errors: bool = False,
+) -> dict:
+    starttime, endtime = _window(
+        t.schema_name,
+        "report",
+        lookback_days,
+        force=force,
+        cursor_key=cursor_key,
+    )
     stats = {
         "pulled": 0,
         "stored": 0,
@@ -199,13 +246,20 @@ def _sync_one_report(t: _TenantCtx, lookback_days: int, force: bool = False) -> 
                     info = fetch_report_detail(t.corpid, t.secret, ju)
                     if not _detail_ok_report(info if isinstance(info, dict) else {}):
                         # 详情失败也不丢单号：用列表 uuid 写最小记录，避免「企微3条库只有2条」
-                        logger.warning(
-                            "汇报详情异常仍落最小记录 ju=%s keys=%s errcode=%s errmsg=%s",
-                            ju[:16],
-                            list(info.keys())[:12] if isinstance(info, dict) else type(info).__name__,
-                            (info or {}).get("errcode") if isinstance(info, dict) else None,
-                            (info or {}).get("errmsg") if isinstance(info, dict) else None,
-                        )
+                        if safe_errors:
+                            logger.warning(
+                                "connection report detail unavailable ju=%s errcode=%s",
+                                ju[:16],
+                                (info or {}).get("errcode") if isinstance(info, dict) else None,
+                            )
+                        else:
+                            logger.warning(
+                                "汇报详情异常仍落最小记录 ju=%s keys=%s errcode=%s errmsg=%s",
+                                ju[:16],
+                                list(info.keys())[:12] if isinstance(info, dict) else type(info).__name__,
+                                (info or {}).get("errcode") if isinstance(info, dict) else None,
+                                (info or {}).get("errmsg") if isinstance(info, dict) else None,
+                            )
                         info = {
                             "journaluuid": ju,
                             "journal_uuid": ju,
@@ -226,7 +280,14 @@ def _sync_one_report(t: _TenantCtx, lookback_days: int, force: bool = False) -> 
                         if isinstance(sub, str):
                             info = {**info, "submitter": {"userid": sub}}
                 except Exception as e:
-                    logger.warning("汇报详情拉取失败 %s: %s", ju[:16], e)
+                    if safe_errors:
+                        logger.warning(
+                            "connection report detail failed ju=%s type=%s",
+                            ju[:16],
+                            type(e).__name__,
+                        )
+                    else:
+                        logger.warning("汇报详情拉取失败 %s: %s", ju[:16], e)
                     stats["err"] += 1
                     info = {
                         "journaluuid": ju,
@@ -236,8 +297,11 @@ def _sync_one_report(t: _TenantCtx, lookback_days: int, force: bool = False) -> 
                         "report_time": 0,
                         "submitter": {},
                         "_partial": True,
-                        "_partial_error": str(e),
                     }
+                    if not safe_errors:
+                        info["_partial_error"] = str(e)
+                if safe_errors:
+                    info = _without_internal_detail_error(info)
                 try:
                     db.upsert_report(
                         t.schema_name,
@@ -247,22 +311,48 @@ def _sync_one_report(t: _TenantCtx, lookback_days: int, force: bool = False) -> 
                     )
                     stats["stored"] += 1
                 except Exception as e:
-                    logger.warning("汇报落库失败 %s: %s", ju[:16], e)
+                    if safe_errors:
+                        logger.warning(
+                            "connection report storage failed ju=%s type=%s",
+                            ju[:16],
+                            type(e).__name__,
+                        )
+                    else:
+                        logger.warning("汇报落库失败 %s: %s", ju[:16], e)
                     stats["write_err"] += 1
     except Exception as e:
+        if safe_errors:
+            logger.error(
+                "connection report sync failed tenant=%s type=%s",
+                t.tenant_id,
+                type(e).__name__,
+            )
+            return {"error": "sync_failed", **stats}
         logger.error("汇报拉取失败 tenant=%s: %s", t.tenant_id, e)
         return {"error": str(e), **stats}
     # 游标存真实 now，不用放宽后的 endtime，避免下次窗异常
     if stats["write_err"] == 0:
-        db.save_cursor(t.schema_name, "report", "", str(int(time.time())))
+        db.save_cursor(t.schema_name, "report", cursor_key, str(int(time.time())))
     logger.info("汇报 tenant=%s pulled=%s stored=%s err=%s window=[%s,%s]",
                 t.tenant_id, stats["pulled"], stats["stored"], stats["err"],
                 starttime, endtime)
     return stats
 
 
-def _sync_one_approval(t: _TenantCtx, lookback_days: int, force: bool = False) -> dict:
-    starttime, endtime = _window(t.schema_name, "approval", lookback_days, force=force)
+def _sync_one_approval(
+    t: _TenantCtx,
+    lookback_days: int,
+    force: bool = False,
+    cursor_key: str = "",
+    safe_errors: bool = False,
+) -> dict:
+    starttime, endtime = _window(
+        t.schema_name,
+        "approval",
+        lookback_days,
+        force=force,
+        cursor_key=cursor_key,
+    )
     stats = {
         "pulled": 0,
         "stored": 0,
@@ -286,12 +376,19 @@ def _sync_one_approval(t: _TenantCtx, lookback_days: int, force: bool = False) -
                 try:
                     info = fetch_approval_detail(t.corpid, t.secret, sp)
                     if not isinstance(info, dict) or info.get("errcode") not in (None, 0):
-                        logger.warning(
-                            "审批详情异常仍落最小记录 sp=%s errcode=%s errmsg=%s",
-                            sp,
-                            (info or {}).get("errcode") if isinstance(info, dict) else None,
-                            (info or {}).get("errmsg") if isinstance(info, dict) else None,
-                        )
+                        if safe_errors:
+                            logger.warning(
+                                "connection approval detail unavailable sp=%s errcode=%s",
+                                sp,
+                                (info or {}).get("errcode") if isinstance(info, dict) else None,
+                            )
+                        else:
+                            logger.warning(
+                                "审批详情异常仍落最小记录 sp=%s errcode=%s errmsg=%s",
+                                sp,
+                                (info or {}).get("errcode") if isinstance(info, dict) else None,
+                                (info or {}).get("errmsg") if isinstance(info, dict) else None,
+                            )
                         info = {"sp_no": sp, "sp_name": "", "sp_status": 0, "template_id": "",
                                 "apply_time": 0, "applyer": {}, "_partial": True}
                         stats["err"] += 1
@@ -301,7 +398,14 @@ def _sync_one_approval(t: _TenantCtx, lookback_days: int, force: bool = False) -
                     if isinstance(applyer, str):
                         info = {**info, "applyer": {"userid": applyer}}
                 except Exception as e:
-                    logger.warning("审批详情拉取失败 %s: %s", sp, e)
+                    if safe_errors:
+                        logger.warning(
+                            "connection approval detail failed sp=%s type=%s",
+                            sp,
+                            type(e).__name__,
+                        )
+                    else:
+                        logger.warning("审批详情拉取失败 %s: %s", sp, e)
                     stats["err"] += 1
                     info = {
                         "sp_no": sp,
@@ -311,8 +415,11 @@ def _sync_one_approval(t: _TenantCtx, lookback_days: int, force: bool = False) -
                         "apply_time": 0,
                         "applyer": {},
                         "_partial": True,
-                        "_partial_error": str(e),
                     }
+                    if not safe_errors:
+                        info["_partial_error"] = str(e)
+                if safe_errors:
+                    info = _without_internal_detail_error(info)
                 try:
                     db.upsert_approval(
                         t.schema_name,
@@ -322,13 +429,27 @@ def _sync_one_approval(t: _TenantCtx, lookback_days: int, force: bool = False) -
                     )
                     stats["stored"] += 1
                 except Exception as e:
-                    logger.warning("审批落库失败 %s: %s", sp, e)
+                    if safe_errors:
+                        logger.warning(
+                            "connection approval storage failed sp=%s type=%s",
+                            sp,
+                            type(e).__name__,
+                        )
+                    else:
+                        logger.warning("审批落库失败 %s: %s", sp, e)
                     stats["write_err"] += 1
     except Exception as e:
+        if safe_errors:
+            logger.error(
+                "connection approval sync failed tenant=%s type=%s",
+                t.tenant_id,
+                type(e).__name__,
+            )
+            return {"error": "sync_failed", **stats}
         logger.error("审批拉取失败 tenant=%s: %s", t.tenant_id, e)
         return {"error": str(e), **stats}
     if stats["write_err"] == 0:
-        db.save_cursor(t.schema_name, "approval", "", str(int(time.time())))
+        db.save_cursor(t.schema_name, "approval", cursor_key, str(int(time.time())))
     logger.info("审批 tenant=%s pulled=%s stored=%s err=%s window=[%s,%s]",
                 t.tenant_id, stats["pulled"], stats["stored"], stats["err"],
                 starttime, endtime)
@@ -376,6 +497,156 @@ def diagnose_report_pull(t: _TenantCtx, lookback_days: int = 30) -> dict:
         "lookback_days": lookback_days,
         "resp_keys": sorted(list(resp.keys()))[:20],
     }
+
+
+def _connection_string(context: ConnectionContext, key: str, default: str = "") -> str:
+    value = context.public_config.get(key, default)
+    return value if isinstance(value, str) else default
+
+
+def _connection_userids(context: ConnectionContext) -> list[str]:
+    value = context.public_config.get("checkin_userids", [])
+    if isinstance(value, str):
+        return [item.strip() for item in value.split(",") if item.strip()]
+    if isinstance(value, (list, tuple, set)):
+        return [item for item in value if isinstance(item, str) and item]
+    return []
+
+
+def _connection_modules(context: ConnectionContext) -> set[str]:
+    value = context.public_config.get("enabled_modules", ())
+    if isinstance(value, str):
+        return {item.strip() for item in value.split(",") if item.strip()}
+    if isinstance(value, (list, tuple, set)):
+        return {item for item in value if isinstance(item, str) and item}
+    return {"report", "approval", "checkin"}
+
+
+def _tenant_context_for_connection(context: ConnectionContext) -> _TenantCtx:
+    """Adapt a connection's safe config and in-memory credentials for sync."""
+    interval = context.public_config.get("sync_interval_min", 30)
+    try:
+        sync_interval_min = int(interval)
+    except (TypeError, ValueError):
+        sync_interval_min = 30
+    return _TenantCtx(
+        tenant_id=context.tenant_id,
+        corpid=_connection_string(context, "corpid"),
+        secret=(
+            context.credentials.get("wecom_app_secret")
+            or context.credentials.get("secret")
+            or ""
+        ),
+        schema_name=_connection_string(context, "schema_name"),
+        sync_interval_min=max(1, sync_interval_min),
+        enabled_modules=_connection_modules(context),
+        checkin_userids=_connection_userids(context),
+        contact_secret=(
+            context.credentials.get("wecom_contact_secret")
+            or context.credentials.get("contact_secret")
+            or ""
+        ),
+        # Hybrid synchronizes the existing stored copy.  The old tenant type
+        # only knows stored/direct, so the adapter deliberately maps it here.
+        data_mode="direct" if context.data_mode == "direct" else "stored",
+    )
+
+
+def _safe_connection_sync_result(result: object) -> dict:
+    """Return only summary metrics from a legacy sync implementation."""
+    if not isinstance(result, dict):
+        return {"error": "sync_failed"}
+    safe = {
+        key: value
+        for key, value in result.items()
+        if key
+        in {
+            "pulled",
+            "stored",
+            "err",
+            "write_err",
+            "partial_count",
+            "starttime",
+            "endtime",
+            "busy",
+            "skipped",
+        }
+        and isinstance(value, (str, int, float, bool))
+    }
+    if result.get("error"):
+        safe["error"] = "sync_failed"
+    return safe
+
+
+def run_sync_connection(
+    context: ConnectionContext,
+    resource_key: str,
+    lookback_days: int = BACKFILL_DAYS,
+    force: bool = False,
+) -> dict:
+    """Synchronize exactly one resource with a connection-scoped cursor.
+
+    Existing WeCom records remain in the legacy tenant schema.  ``filter_key``
+    on its established ``sync_cursor`` table is now the connection ID, so two
+    connections sharing a tenant never advance one another's cursor.
+    """
+    if not isinstance(context, ConnectionContext):
+        raise TypeError("context must be a ConnectionContext")
+    connection_id = context.connection_id
+    if not isinstance(connection_id, str) or not connection_id.strip():
+        raise ValueError("connection_id is required")
+    resource_aliases = {
+        "report": ("report", _sync_one_report),
+        "reports": ("report", _sync_one_report),
+        "approval": ("approval", _sync_one_approval),
+        "approvals": ("approval", _sync_one_approval),
+        "checkin": ("checkin", _sync_one_checkin),
+        "checkins": ("checkin", _sync_one_checkin),
+    }
+    selected = resource_aliases.get(resource_key)
+    if selected is None:
+        return {"error": "unsupported_resource"}
+    if context.data_mode == "direct":
+        return {"skipped": "direct_mode"}
+
+    _resource, sync_resource = selected
+    tenant_context = _tenant_context_for_connection(context)
+    if not tenant_context.schema_name:
+        return {"error": "missing_schema"}
+    try:
+        with db.connection_sync_lock(
+            tenant_context.schema_name,
+            connection_id,
+            timeout=0,
+        ) as acquired:
+            if not acquired:
+                logger.warning("connection sync busy")
+                return {"busy": True}
+            sync_kwargs = {
+                "force": force,
+                "cursor_key": connection_id,
+            }
+            if _resource == "checkin":
+                result = sync_resource(
+                    tenant_context,
+                    lookback_days,
+                    **sync_kwargs,
+                    userid_cache_key=connection_id,
+                )
+            else:
+                result = sync_resource(
+                    tenant_context,
+                    lookback_days,
+                    **sync_kwargs,
+                    safe_errors=True,
+                )
+            return _safe_connection_sync_result(
+                result
+            )
+    except Exception as exc:
+        # A sync result must not surface raw third-party/API exception text.
+        logger.warning("connection sync failed type=%s", type(exc).__name__)
+        return {"error": "sync_failed"}
 
 
 def run_sync_tenant(

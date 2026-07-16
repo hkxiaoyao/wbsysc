@@ -83,6 +83,7 @@ def test_runtime_migration_repairs_all_required_tenant_columns(monkeypatch):
 def test_startup_migrations_upgrade_center_before_tenant_schemas(monkeypatch):
     events = []
     from app import mcp_log_store
+    from app.connections import store as connection_store
 
     monkeypatch.setattr(
         db, "ensure_central_columns", lambda: events.append("center"), raising=False
@@ -96,6 +97,17 @@ def test_startup_migrations_upgrade_center_before_tenant_schemas(monkeypatch):
         mcp_log_store,
         "migrate_legacy_logs",
         lambda days=90: events.append(f"legacy:{days}"),
+    )
+    monkeypatch.setattr(
+        connection_store,
+        "ensure_connection_tables",
+        lambda: events.append("connection_tables"),
+    )
+    monkeypatch.setattr(
+        connection_store,
+        "migrate_legacy_wecom_connections",
+        lambda: events.append("connection_backfill"),
+        raising=False,
     )
     monkeypatch.setattr(
         db,
@@ -112,6 +124,8 @@ def test_startup_migrations_upgrade_center_before_tenant_schemas(monkeypatch):
     assert events == [
         "center",
         "log_tables",
+        "connection_tables",
+        "connection_backfill",
         "enumerate",
         "wbd_a",
         "wbd_b",
@@ -119,12 +133,49 @@ def test_startup_migrations_upgrade_center_before_tenant_schemas(monkeypatch):
     ]
 
 
+def test_startup_orders_connection_tables_before_legacy_wecom_backfill(monkeypatch):
+    events = []
+    from app.connections import store as connection_store
+    from app import mcp_log_store
+
+    monkeypatch.setattr(db, "ensure_central_columns", lambda: events.append("center"))
+    monkeypatch.setattr(
+        mcp_log_store, "ensure_central_log_tables", lambda: events.append("log_tables")
+    )
+    monkeypatch.setattr(
+        connection_store,
+        "ensure_connection_tables",
+        lambda: events.append("connection_tables"),
+    )
+    monkeypatch.setattr(
+        connection_store,
+        "migrate_legacy_wecom_connections",
+        lambda: events.append("connection_backfill"),
+    )
+    monkeypatch.setattr(db, "get_tenant_schema_names", lambda: events.append("enumerate") or [])
+    monkeypatch.setattr(mcp_log_store, "migrate_legacy_logs", lambda days=90: events.append("legacy_logs"))
+
+    db.run_startup_migrations()
+
+    assert events.index("connection_tables") < events.index("connection_backfill")
+    assert events.index("log_tables") < events.index("connection_tables")
+    assert events.index("connection_backfill") < events.index("enumerate")
+
+
 def test_startup_migration_failure_propagates(monkeypatch):
     from app import mcp_log_store
+    from app.connections import store as connection_store
 
     monkeypatch.setattr(db, "ensure_central_columns", lambda: None, raising=False)
     monkeypatch.setattr(mcp_log_store, "ensure_central_log_tables", lambda: None)
     monkeypatch.setattr(mcp_log_store, "migrate_legacy_logs", lambda days=90: None)
+    monkeypatch.setattr(connection_store, "ensure_connection_tables", lambda: None)
+    monkeypatch.setattr(
+        connection_store,
+        "migrate_legacy_wecom_connections",
+        lambda: None,
+        raising=False,
+    )
     monkeypatch.setattr(
         db, "get_tenant_schema_names", lambda: ["wbd_a"], raising=False
     )
@@ -212,3 +263,23 @@ def test_new_database_init_contains_checkin_table_matching_runtime_ddl():
     ):
         assert column in sql
         assert column in runtime
+
+
+def test_connection_platform_sql_matches_runtime_mysql57_tables():
+    sql = (ROOT / "sql" / "006_connection_platform.sql").read_text(encoding="utf-8")
+    lower = sql.lower()
+
+    for table in (
+        "connection_instance",
+        "connection_credential",
+        "connection_token",
+        "connection_tool_policy",
+        "connection_sync_state",
+        "declarative_spec_revision",
+        "declarative_spec_operation",
+    ):
+        assert f"create table if not exists `{table}`" in lower
+    assert "unique key `uk_connection_token_hmac` (`token_hmac`)" in lower
+    assert "add column if not exists" not in lower
+    assert "`public_config_json` text" in lower
+    assert "`created_at` datetime" in lower

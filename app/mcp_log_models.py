@@ -3,6 +3,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass, field
 from datetime import datetime
+import re
 from typing import Literal
 
 
@@ -12,6 +13,10 @@ DeleteMode = Literal["ids", "filter", "before_date", "all"]
 
 _CATEGORIES = frozenset(("tool", "protocol", "auth"))
 _STATUSES = frozenset(("ok", "partial", "error", "denied"))
+_DIMENSION_IDENTIFIER_RE = re.compile(r"[A-Za-z0-9][A-Za-z0-9_.:-]*\Z")
+_SENSITIVE_DIMENSION_PARTS = frozenset(
+    {"authorization", "cookie", "credential", "password", "secret", "token"}
+)
 
 
 def _validate_string(name: str, value: str, maximum: int) -> None:
@@ -19,6 +24,27 @@ def _validate_string(name: str, value: str, maximum: int) -> None:
         raise TypeError(f"{name} must be a string")
     if len(value) > maximum:
         raise ValueError(f"{name} must be at most {maximum} characters")
+
+
+def _validate_optional_string(name: str, value: str | None, maximum: int) -> None:
+    if value is None:
+        return
+    _validate_string(name, value, maximum)
+
+
+def _validate_dimension(name: str, value: str | None, maximum: int) -> None:
+    _validate_optional_string(name, value, maximum)
+    if value is None:
+        return
+    if (
+        _DIMENSION_IDENTIFIER_RE.fullmatch(value) is None
+        or any(
+            part in _SENSITIVE_DIMENSION_PARTS
+            for part in re.split(r"[^a-z0-9]+", value.lower())
+            if part
+        )
+    ):
+        raise ValueError(f"{name} must be a safe identifier")
 
 
 def _validate_utc_naive(name: str, value: datetime | None) -> None:
@@ -33,6 +59,9 @@ def _validate_utc_naive(name: str, value: datetime | None) -> None:
 @dataclass(frozen=True)
 class McpLogEvent:
     tenant_id: str = ""
+    connection_id: str | None = None
+    connector_key: str | None = None
+    tool_key: str | None = None
     category: LogCategory = "protocol"
     event_name: str = "mcp_http_request"
     target: str = ""
@@ -48,6 +77,16 @@ class McpLogEvent:
     created_at: datetime | None = None
 
     def __post_init__(self) -> None:
+        # Existing auth/protocol instrumentation deliberately records a target
+        # only after server-side connection resolution.  Promote that established
+        # safe value into the new dimension while keeping anonymous events NULL.
+        if (
+            self.connection_id is None
+            and self.category in {"auth", "protocol"}
+            and isinstance(self.target, str)
+            and 0 < len(self.target) <= 64
+        ):
+            object.__setattr__(self, "connection_id", self.target)
         if self.category not in _CATEGORIES:
             raise ValueError("category must be tool, protocol, or auth")
         if self.result_status not in _STATUSES:
@@ -64,6 +103,12 @@ class McpLogEvent:
             ("http_method", 16),
         ):
             _validate_string(name, getattr(self, name), maximum)
+        for name, maximum in (
+            ("connection_id", 64),
+            ("connector_key", 64),
+            ("tool_key", 128),
+        ):
+            _validate_dimension(name, getattr(self, name), maximum)
         if isinstance(self.cost_ms, bool) or not isinstance(self.cost_ms, int):
             raise TypeError("cost_ms must be an integer")
         if self.cost_ms < 0:
@@ -78,6 +123,9 @@ class McpLogEvent:
 @dataclass(frozen=True)
 class LogFilters:
     tenant_id: str | None = None
+    connection_id: str | None = None
+    connector_key: str | None = None
+    tool_key: str | None = None
     category: LogCategory | Literal[""] = ""
     event_name: str = ""
     status: LogStatus | Literal[""] = ""
@@ -96,6 +144,12 @@ class LogFilters:
             raise ValueError("status must be ok, partial, error, or denied")
         if self.tenant_id is not None:
             _validate_string("tenant_id", self.tenant_id, 64)
+        for name, maximum in (
+            ("connection_id", 64),
+            ("connector_key", 64),
+            ("tool_key", 128),
+        ):
+            _validate_dimension(name, getattr(self, name), maximum)
         for name, maximum in (
             ("event_name", 96),
             ("q", 100),
