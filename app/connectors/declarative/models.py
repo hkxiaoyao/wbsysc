@@ -123,7 +123,11 @@ def _frozen_mapping(value: Mapping[str, Any] | None) -> Mapping[str, Any]:
         return MappingProxyType({})
     if not isinstance(value, Mapping):
         raise SpecValidationError("mapping must be an object")
-    return MappingProxyType(dict(value))
+    assert_safe_declaration_value(value)
+    frozen = _freeze_json_value(value)
+    if not isinstance(frozen, Mapping):  # pragma: no cover - guarded above
+        raise SpecValidationError("mapping must be an object")
+    return frozen
 
 
 def _json_size(value: Any) -> int:
@@ -213,6 +217,33 @@ def assert_safe_declaration_value(
             assert_safe_declaration_value(child, depth=depth + 1, counter=counter)
         return
     raise SpecValidationError("specification contains unsupported values")
+
+
+def _freeze_json_value(value: Any) -> Any:
+    """Detach and recursively freeze a previously validated JSON-like value."""
+    if isinstance(value, Mapping):
+        return MappingProxyType(
+            {key: _freeze_json_value(child) for key, child in value.items()}
+        )
+    if isinstance(value, (list, tuple)):
+        return tuple(_freeze_json_value(child) for child in value)
+    return value
+
+
+def _plain_json_value(value: Any) -> Any:
+    """Return a detached plain-JSON copy without invoking custom copy hooks."""
+    assert_safe_declaration_value(value)
+
+    def convert(child: Any) -> Any:
+        if isinstance(child, Mapping):
+            return {key: convert(nested) for key, nested in child.items()}
+        if isinstance(child, (list, tuple)):
+            return [convert(nested) for nested in child]
+        return child
+
+    plain = convert(value)
+    _assert_bounded_json_value(plain)
+    return plain
 
 
 def _stored_object(
@@ -509,7 +540,7 @@ def _validate_input_value(value: Any, schema: Mapping[str, Any]) -> None:
     if schema_type == "object":
         properties = schema.get("properties")
         required = schema.get("required", ())
-        if not isinstance(properties, Mapping) or not isinstance(required, list):
+        if not isinstance(properties, Mapping) or not isinstance(required, (list, tuple)):
             raise SpecValidationError("invalid declared input schema")
         if any(not isinstance(key, str) or key not in properties for key in value):
             raise SpecValidationError("undeclared object input")
@@ -644,7 +675,10 @@ class DeclarativeOperation:
 
     @property
     def input_schema(self) -> dict[str, Any]:
-        properties = {mapping.arg_name: dict(mapping.schema) for mapping in self.input_mappings}
+        properties = {
+            mapping.arg_name: _plain_json_value(mapping.schema)
+            for mapping in self.input_mappings
+        }
         required = [mapping.arg_name for mapping in self.input_mappings if mapping.required]
         schema: dict[str, Any] = {
             "type": "object",
@@ -863,7 +897,7 @@ class DeclarativeRevision:
                 "location": mapping.location,
                 "target": mapping.target,
                 "required": mapping.required,
-                "schema": dict(mapping.schema),
+                "schema": _plain_json_value(mapping.schema),
             }
 
         def operation_document(operation: DeclarativeOperation) -> dict[str, Any]:
@@ -918,17 +952,20 @@ class DeclarativeRevision:
             else {
                 "resource_key": self.sync_spec.resource_key,
                 "primary_key_pointer": self.sync_spec.primary_key_pointer,
-                "field_mappings": dict(self.sync_spec.field_mappings),
+                "field_mappings": _plain_json_value(self.sync_spec.field_mappings),
                 "operation_key": self.sync_spec.operation_key,
             }
         )
-        return {
+        document = {
             "base_url": self.base_url,
             "allowed_hosts": list(self.allowed_hosts),
             "auth_scheme": auth_scheme,
             "sync_spec": sync_spec,
             "operations": [operation_document(operation) for operation in self.operations],
         }
+        assert_safe_declaration_value(document)
+        _assert_bounded_json_value(document)
+        return document
 
     @classmethod
     def from_storage_document(

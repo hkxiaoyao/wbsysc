@@ -236,6 +236,96 @@ def test_programmatic_mapping_rejects_nested_template_markers() -> None:
         )
 
 
+def _revision_with_nested_programmatic_schema(
+    schema: dict[str, object],
+) -> DeclarativeRevision:
+    operation = DeclarativeOperation(
+        tool_key="users.create",
+        mcp_name="users.create",
+        description="Create user",
+        method="POST",
+        path="/users",
+        input_mappings=(
+            InputMapping(
+                arg_name="payload",
+                location="body",
+                target="payload",
+                required=True,
+                schema=schema,
+            ),
+        ),
+        output_mappings=(OutputMapping(name="id", pointer="/id"),),
+        operation_kind="write",
+        explicit_write_enabled=True,
+        base_url="https://api.example.com",
+    )
+    return validate_revision(
+        DeclarativeRevision(
+            base_url="https://api.example.com",
+            allowed_hosts=("api.example.com",),
+            operations=(operation,),
+        )
+    )
+
+
+def _nested_schema() -> dict[str, object]:
+    return {
+        "type": "object",
+        "properties": {
+            "name": {
+                "type": "string",
+                "enum": ["safe-name"],
+            }
+        },
+    }
+
+
+def test_validated_revision_detaches_and_recursively_freezes_caller_schema() -> None:
+    original = _nested_schema()
+    revision = _revision_with_nested_programmatic_schema(original)
+
+    original["properties"]["name"]["enum"][0] = "${danger}"  # type: ignore[index]
+    retained = revision.operation_for("users.create").input_mappings[0].schema
+
+    assert retained["properties"]["name"]["enum"] == ("safe-name",)  # type: ignore[index]
+    with pytest.raises(TypeError):
+        retained["properties"]["name"] = {"type": "number"}  # type: ignore[index]
+    with pytest.raises(TypeError):
+        retained["properties"]["name"]["enum"][0] = "changed"  # type: ignore[index]
+
+
+def test_mutating_nested_manifest_schema_cannot_change_live_revision() -> None:
+    revision = _revision_with_nested_programmatic_schema(_nested_schema())
+    manifest = revision.connector_spec()
+    manifest_schema = manifest.tools[0].input_schema
+
+    manifest_schema["properties"]["payload"]["properties"]["name"]["enum"].append(  # type: ignore[index,union-attr]
+        "${danger}"
+    )
+
+    later = revision.connector_spec().tools[0].input_schema
+    assert later["properties"]["payload"]["properties"]["name"]["enum"] == [  # type: ignore[index]
+        "safe-name"
+    ]
+    assert "${danger}" not in json.dumps(later)
+
+
+def test_mutating_nested_storage_document_cannot_change_later_serialization() -> None:
+    revision = _revision_with_nested_programmatic_schema(_nested_schema())
+    stored = revision.storage_document()
+    stored_schema = stored["operations"][0]["input_mappings"][0]["schema"]
+
+    stored_schema["properties"]["name"]["enum"].append("${danger}")
+    stored["operations"].append({"description": "${danger}"})
+
+    later = revision.storage_document()
+    assert later["operations"][0]["input_mappings"][0]["schema"]["properties"][
+        "name"
+    ]["enum"] == ["safe-name"]
+    assert len(later["operations"]) == 1
+    assert "${danger}" not in json.dumps(later)
+
+
 def test_import_allows_stored_only_for_a_validated_read_sync_mapping() -> None:
     document = _document()
     document["x-sync-spec"] = {
