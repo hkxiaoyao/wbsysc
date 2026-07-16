@@ -1,12 +1,12 @@
 {
   "id": "deploy-multi-provider-platform",
   "title": "合并并部署多第三方 MCP 平台到生产服务器",
-  "status": "in_progress",
+  "status": "completed",
   "complexity": "M",
   "risk": "high",
   "domain": "devops",
-  "currentPhase": "implementation",
-  "nextAction": "修复 MySQL 5.7 旧日志迁移列歧义，复审后重新部署",
+  "currentPhase": "completed",
+  "nextAction": "归档部署任务",
   "createdAt": "2026-07-16T00:00:00+08:00",
   "branch": "codex/multi-provider-mcp-platform"
 }
