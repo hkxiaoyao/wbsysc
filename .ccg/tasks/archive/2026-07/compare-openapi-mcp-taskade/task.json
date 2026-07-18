@@ -1,0 +1,12 @@
+{
+  "id": "compare-openapi-mcp-taskade",
+  "title": "对比 openapi-mcp-generator、Taskade MCP 与本项目思路",
+  "status": "completed",
+  "complexity": "M",
+  "risk": "low",
+  "domain": "architecture",
+  "currentPhase": "completed",
+  "nextAction": "已完成，归档任务",
+  "createdAt": "2026-07-18T00:00:00+08:00",
+  "branch": "main"
+}
