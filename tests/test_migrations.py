@@ -349,6 +349,33 @@ def test_mcp_service_sql_has_alias_snapshot_and_tenant_uniqueness_constraints():
     assert "add column if not exists" not in lower
 
 
+def test_tenant_identity_boundary_migration_is_mysql57_idempotent_and_non_destructive():
+    sql = (ROOT / "sql" / "009_tenant_identity_boundary.sql").read_text(
+        encoding="utf-8"
+    )
+    lower = " ".join(sql.lower().split())
+
+    for column in (
+        "corpid",
+        "secret_encrypted",
+        "mcp_token",
+        "schema_name",
+        "sync_interval_min",
+        "enabled_modules",
+        "trusted_domain",
+        "data_mode",
+    ):
+        assert f"column_name = '{column}'" in lower
+        assert f"modify column `{column}`" in lower
+    assert "is_nullable = 'no'" in lower
+    assert "add column if not exists" not in lower
+    assert "drop column" not in lower
+    assert "drop index" not in lower
+    assert "delete from" not in lower
+    assert "update `tenant_config`" not in lower
+    assert "call `migrate_tenant_identity_boundary`()" in lower
+
+
 def test_startup_creates_mcp_service_tables_after_connection_tables(monkeypatch):
     events = []
     from app import mcp_log_store

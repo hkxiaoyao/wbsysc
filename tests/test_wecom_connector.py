@@ -47,6 +47,31 @@ def test_wecom_connector_manifest_preserves_public_tool_names():
     assert spec.tool("wecom_list_reports").tool_key == "reports.list"
 
 
+def test_wecom_connector_manifest_owns_wecom_configuration_and_credentials():
+    spec = WeComConnector().spec()
+
+    assert spec.config_schema["required"] == ["corpid", "schema_name"]
+    assert set(spec.config_schema["properties"]) >= {
+        "corpid",
+        "schema_name",
+        "enabled_modules",
+        "sync_interval_min",
+        "checkin_userids",
+        "trusted_domain",
+    }
+    assert spec.config_schema["properties"]["enabled_modules"]["type"] == "array"
+    assert spec.config_schema["properties"]["sync_interval_min"] == {
+        "type": "integer",
+        "minimum": 1,
+        "maximum": 1440,
+    }
+    assert spec.credential_schema["required"] == ["wecom_app_secret"]
+    assert set(spec.credential_schema["properties"]) == {
+        "wecom_app_secret",
+        "wecom_contact_secret",
+    }
+
+
 @pytest.mark.asyncio
 @pytest.mark.parametrize(
     ("tool_key", "args", "accessor_name", "expected"),

@@ -5,6 +5,55 @@ function cleanText(value) {
   return String(value ?? '').trim()
 }
 
+const DEFAULT_WECOM_MODULES = Object.freeze(['report', 'approval', 'checkin'])
+
+function normalizedStringList(value) {
+  const entries = Array.isArray(value) ? value : String(value ?? '').split(/[\s,，]+/)
+  return [...new Set(entries.map(cleanText).filter(Boolean))]
+}
+
+export function wecomConfigFormValues(publicConfig = {}) {
+  const config = publicConfig && typeof publicConfig === 'object' && !Array.isArray(publicConfig)
+    ? publicConfig
+    : {}
+  const interval = Number(config.sync_interval_min)
+  const hasConfiguredModules = Array.isArray(config.enabled_modules)
+    || cleanText(config.enabled_modules) !== ''
+  return {
+    corpid: cleanText(config.corpid),
+    enabled_modules: hasConfiguredModules
+      ? normalizedStringList(config.enabled_modules)
+      : [...DEFAULT_WECOM_MODULES],
+    sync_interval_min: Number.isInteger(interval) && interval > 0 ? interval : 30,
+    checkin_userids: normalizedStringList(config.checkin_userids).join('\n'),
+    trusted_domain: cleanText(config.trusted_domain),
+  }
+}
+
+export function buildWecomPublicConfig(values = {}, currentConfig = {}) {
+  const config = {
+    corpid: cleanText(values.corpid),
+    enabled_modules: normalizedStringList(values.enabled_modules),
+    sync_interval_min: Number(values.sync_interval_min),
+    checkin_userids: normalizedStringList(values.checkin_userids),
+    trusted_domain: cleanText(values.trusted_domain),
+  }
+  const schemaName = cleanText(currentConfig?.schema_name)
+  if (schemaName) config.schema_name = schemaName
+  return config
+}
+
+export function emptyWecomCredentialFields() {
+  return { wecom_app_secret: '', wecom_contact_secret: '' }
+}
+
+export function buildWecomCredentials(values = {}) {
+  return {
+    wecom_app_secret: String(values.wecom_app_secret ?? ''),
+    wecom_contact_secret: String(values.wecom_contact_secret ?? ''),
+  }
+}
+
 export function connectionCollectionEndpoint(scope = 'admin', tenantId = '') {
   if (scope === 'tenant') return '/tenant/connections'
   return `/admin/tenants/${encodeURIComponent(cleanText(tenantId))}/connections`

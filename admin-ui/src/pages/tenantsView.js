@@ -1,6 +1,5 @@
 export const EMPTY_FILTERS = Object.freeze({
   query: '',
-  dataMode: 'all',
   enabled: 'all',
 })
 
@@ -20,6 +19,21 @@ function encodedTenantId(tenantId) {
 export function buildTenantLoginPatch(value) {
   if (value === undefined || value === null || value === '') return {}
   return { tenant_password: requireString(value, 'password') }
+}
+
+export function buildTenantIdentityPayload(values, { editing = false } = {}) {
+  if (!values || Array.isArray(values) || typeof values !== 'object') {
+    throw new TypeError('tenant values must be an object')
+  }
+  const payload = {
+    display_name: typeof values.display_name === 'string' ? values.display_name : '',
+    enabled: Boolean(values.enabled),
+  }
+  if (editing) return payload
+  payload.tenant_id = requireString(values.tenant_id, 'tenant id')
+  const password = requireString(values.tenant_password, 'password')
+  if (password === '') throw new Error('password is required')
+  return { ...payload, tenant_password: password }
 }
 
 export function buildTenantPasswordReset(value) {
@@ -108,25 +122,19 @@ export function createTenantRequestGeneration() {
 export function getTenantStats(items = []) {
   return items.reduce((stats, row) => {
     stats.total += 1
-    if (row.enabled) stats.running += 1
-    if (row.data_mode === 'direct') stats.direct += 1
-    if (!row.enabled || !row.has_secret) stats.attention += 1
+    if (row.enabled) stats.enabled += 1
+    else stats.disabled += 1
     return stats
-  }, { total: 0, running: 0, direct: 0, attention: 0 })
+  }, { total: 0, enabled: 0, disabled: 0 })
 }
 
 export function filterTenants(items = [], filters = EMPTY_FILTERS) {
   const query = normalized(filters.query)
   return items.filter((row) => {
-    const matchesQuery = !query || [row.display_name, row.tenant_id, row.corpid]
+    const matchesQuery = !query || [row.display_name, row.tenant_id]
       .some((value) => normalized(value).includes(query))
-    const matchesMode = filters.dataMode === 'all' || row.data_mode === filters.dataMode
     const matchesEnabled = filters.enabled === 'all'
       || (filters.enabled === 'enabled' ? Boolean(row.enabled) : !row.enabled)
-    return matchesQuery && matchesMode && matchesEnabled
+    return matchesQuery && matchesEnabled
   })
-}
-
-export function getDirectModeReason(row) {
-  return row?.data_mode === 'direct' ? '直连模式实时调用企微 API，无需同步' : ''
 }

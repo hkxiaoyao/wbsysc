@@ -30,6 +30,72 @@ from app.connectors.declarative.models import (
 from app.connectors.declarative.validator import import_openapi_revision
 
 
+def test_wecom_public_config_gets_connection_owned_schema():
+    connection_id = "connection-a"
+
+    config = admin_connections._connection_public_config(
+        "wecom",
+        connection_id,
+        {
+            "corpid": "ww123",
+            "enabled_modules": ["report"],
+            "trusted_domain": "mcp.example.com",
+        },
+    )
+
+    assert config == {
+        "corpid": "ww123",
+        "enabled_modules": ["report"],
+        "trusted_domain": "mcp.example.com",
+        "schema_name": admin_connections._wecom_schema_name(connection_id),
+    }
+
+
+def test_wecom_public_config_rebinds_unverified_existing_schema():
+    config = admin_connections._connection_public_config(
+        "wecom",
+        "connection-a",
+        {
+            "corpid": "ww456",
+            "schema_name": "attacker_selected",
+            "legacy_source": "tenant_config",
+        },
+        tenant_id="tenant-a",
+        current={"schema_name": "wbd_existing"},
+    )
+
+    assert config == {
+        "corpid": "ww456",
+        "schema_name": admin_connections._wecom_schema_name("connection-a"),
+    }
+
+
+def test_wecom_public_config_preserves_verified_legacy_schema():
+    tenant_id = "tenant-a"
+    connection_id = admin_connections._legacy_wecom_connection_id(tenant_id)
+
+    config = admin_connections._connection_public_config(
+        "wecom",
+        connection_id,
+        {
+            "corpid": "ww456",
+            "schema_name": "ignored",
+            "legacy_source": "tenant_config",
+        },
+        tenant_id=tenant_id,
+        current={
+            "schema_name": "wbd_existing",
+            "legacy_source": "tenant_config",
+        },
+    )
+
+    assert config == {
+        "corpid": "ww456",
+        "schema_name": "wbd_existing",
+        "legacy_source": "tenant_config",
+    }
+
+
 class _Connector:
     def spec(self):
         return ConnectorSpec(

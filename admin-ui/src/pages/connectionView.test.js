@@ -2,6 +2,8 @@ import test from 'node:test'
 import assert from 'node:assert/strict'
 import {
   buildConnectionMcpConfig,
+  buildWecomCredentials,
+  buildWecomPublicConfig,
   apiClientEndpoint,
   canEnableWriteTool,
   closeTokenModal,
@@ -10,6 +12,7 @@ import {
   createConnectionMutationSequence,
   createRequestSequence,
   createWizardState,
+  emptyWecomCredentialFields,
   hasExplicitPolicies,
   invalidateWizardState,
   isActiveDeclarativeConfigReadOnly,
@@ -20,8 +23,61 @@ import {
   safeServerError,
   serializeConnectionLocation,
   setExplicitToolPolicy,
+  wecomConfigFormValues,
   wizardRevisionIdentity,
 } from './connectionView.js'
+
+test('WeCom friendly fields map to the public connection config', () => {
+  assert.deepEqual(buildWecomPublicConfig({
+    corpid: ' corp-a ',
+    enabled_modules: ['report', 'checkin', 'report'],
+    sync_interval_min: 45,
+    checkin_userids: 'user-a, user-b\nuser-a',
+    trusted_domain: ' mcp.example.com ',
+  }), {
+    corpid: 'corp-a',
+    enabled_modules: ['report', 'checkin'],
+    sync_interval_min: 45,
+    checkin_userids: ['user-a', 'user-b'],
+    trusted_domain: 'mcp.example.com',
+  })
+})
+
+test('WeCom config editing preserves the backend-owned schema name', () => {
+  const formValues = wecomConfigFormValues({
+    corpid: 'corp-a',
+    schema_name: 'wbd_existing',
+    enabled_modules: 'report,approval',
+    sync_interval_min: 60,
+    checkin_userids: ['user-a', 'user-b'],
+    trusted_domain: 'mcp.example.com',
+  })
+  assert.deepEqual(formValues, {
+    corpid: 'corp-a',
+    enabled_modules: ['report', 'approval'],
+    sync_interval_min: 60,
+    checkin_userids: 'user-a\nuser-b',
+    trusted_domain: 'mcp.example.com',
+  })
+  assert.equal(
+    buildWecomPublicConfig(formValues, { schema_name: 'wbd_existing' }).schema_name,
+    'wbd_existing',
+  )
+})
+
+test('WeCom credentials use named write-only fields and reset to empty values', () => {
+  assert.deepEqual(buildWecomCredentials({
+    wecom_app_secret: 'app-secret',
+    wecom_contact_secret: 'contact-secret',
+  }), {
+    wecom_app_secret: 'app-secret',
+    wecom_contact_secret: 'contact-secret',
+  })
+  assert.deepEqual(emptyWecomCredentialFields(), {
+    wecom_app_secret: '',
+    wecom_contact_secret: '',
+  })
+})
 
 test('tenant connection endpoints never use admin tenant routes', () => {
   assert.equal(connectionCollectionEndpoint('tenant', ''), '/tenant/connections')

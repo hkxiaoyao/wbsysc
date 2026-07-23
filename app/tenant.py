@@ -53,12 +53,22 @@ def _load_all() -> Dict[str, _TenantCtx]:
                          enabled_modules, checkin_userids,
                          contact_secret_encrypted,
                          IFNULL(data_mode, 'stored') AS data_mode
-                  FROM tenant_config WHERE enabled=1""")
+                  FROM tenant_config
+                  WHERE enabled=1
+                    AND corpid IS NOT NULL AND corpid <> ''
+                    AND secret_encrypted IS NOT NULL
+                    AND mcp_token IS NOT NULL AND mcp_token <> ''
+                    AND schema_name IS NOT NULL AND schema_name <> ''""")
     legacy_sql = text("""SELECT tenant_id, corpid, secret_encrypted, mcp_token,
                                 schema_name, sync_interval_min,
                                 enabled_modules, checkin_userids,
                                 contact_secret_encrypted
-                         FROM tenant_config WHERE enabled=1""")
+                         FROM tenant_config
+                         WHERE enabled=1
+                           AND corpid IS NOT NULL AND corpid <> ''
+                           AND secret_encrypted IS NOT NULL
+                           AND mcp_token IS NOT NULL AND mcp_token <> ''
+                           AND schema_name IS NOT NULL AND schema_name <> ''""")
     out: Dict[str, _TenantCtx] = {}
     with get_engine().connect() as conn:
         try:

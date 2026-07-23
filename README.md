@@ -10,11 +10,11 @@
 - **连接级隔离**：一个租户可创建多个连接，每个连接独立鉴权、策略、缓存和日志
 - **兼容迁移**：旧 `/mcp` 在兼容期映射到默认企微连接，新客户端使用 `/mcp/{connection_id}`
 - **三类数据读取**：审批、汇报、打卡（智能表格一期搁置：见下方说明）
-- **多租户物理隔离**：每客户独立 MySQL schema（`wbd_{corpid_hash}`），凭证 AES 加密
-- **租户级功能开关**：每客户可选 `report`/`approval`/`checkin` 模块组合
+- **连接级数据隔离**：每个存储型企业微信连接使用后端分配的 MySQL schema，凭证 AES 加密
+- **连接级同步策略**：每个企业微信连接独立选择 `report`/`approval`/`checkin` 模块与同步间隔
 - **打卡自动拉通讯录**：配通讯录同步 secret → 自动调 `user/list_id` 拉全员 userid
 - **增量同步**：游标驱动 + 断点续传 + 幂等 UPSERT + APScheduler 定时
-- **管理后台**：React + Ant Design，租户 CRUD、模块开关、手动同步、单密码登录
+- **双管理后台**：平台管理租户身份；租户使用 ID/密码登录并管理自己的连接、MCP 服务与调用日志
 - **CI/CD**：GitHub Actions 自动构建镜像推 GHCR，服务器 `docker pull` 免本机编译
 - **生产就绪**：Dockerfile + Nginx/HTTPS + systemd + 健康检查 + 日志轮转
 
@@ -27,11 +27,12 @@
 │   打卡 checkin/getcheckindata                            │
 │   通讯录 user/list_id                                    │
 └──────────────────────────────────────────────────────────┘
-        │  ① 同步层（APScheduler 按租户调度，游标增量）
+        │  ① 同步层（APScheduler 按连接调度，游标增量）
         ▼
 ┌─ MySQL（多租户分 schema 物理隔离）────────────────────────┐
-│  中心库 websysc: tenant_config (secret AES加密)          │
-│  各租户 wbd_{hash}: wecom_report/approval/checkin +     │
+│  中心库 websysc: tenant_config / connection_instance +  │
+│                  connection_credential / token / log     │
+│  各连接 wbd_{hash}: wecom_report/approval/checkin +     │
 │                     sync_cursor + audit_log              │
 └──────────────────────────────────────────────────────────┘
         │  ② MCP Gateway 暴露层（Streamable HTTP）
@@ -44,14 +45,14 @@
 ```
 
 - **生产 transport**：HTTP (Streamable HTTP)，路径 `/mcp`
-- **鉴权**：MCP 用 Bearer Token（每租户独立，token→租户强绑定，不信任客户端 tenant_id）；管理后台用单密码 session
+- **鉴权**：MCP 用连接/服务 Bearer Token；平台后台使用管理员会话；租户后台使用租户 ID + 密码会话
 - **同步策略**：一期定时轮询（增量游标），预留 Webhook 位，不引 MQ
 
 ### 数据读取模式
 
-每个租户可选择 `stored` 或 `direct`。`stored` 定时把业务数据同步到租户 MySQL schema，MCP 查询本地表。`direct` 在每次 MCP 调用时请求企微 API，不写入审批、汇报或打卡业务表，也不参加后台同步。
+每个连接实例可选择 `stored` 或 `direct`。`stored` 定时把业务数据同步到该连接的 MySQL schema，MCP 查询本地表。`direct` 在每次 MCP 调用时请求企微 API，不写入审批、汇报或打卡业务表，也不参加后台同步。
 
-两种模式都在 MySQL 保存租户配置、加密凭证、MCP Token 和审计日志。直连请求失败时会返回企微错误，不读取历史缓存。现有租户升级后保持 `stored`。
+两种模式都在 MySQL 保存连接配置、加密凭证、连接 MCP Token 和审计日志。直连请求失败时会返回企微错误，不读取历史缓存。现有租户级企业微信配置会兼容回填为默认连接并保持 `stored`。
 
 直连模式查询大时间窗口时，会从最新时间分段开始遍历企微列表分页，并为返回的单号逐条请求详情，API 调用成本较高。生产调用建议缩小时间窗口并设置较小的 `limit`。
 
@@ -67,16 +68,13 @@ docker pull ghcr.io/hkxiaoyao/wbsysc:latest
 docker compose up -d
 curl http://localhost:8001/health        # 同时核对 mcp_service_enabled 布尔值
 
-# 接入第一个租户
-docker compose exec wbsysc python -m app.tenant_init \
-  --tenant-id tenant_id_here --corpid corpid_here --secret app_secret_here \
-  --token $(openssl rand -hex 24) --contact-secret contact_secret_here \
-  --modules report,approval,checkin --display "测试客户1"
+# 接入第一个租户：先在平台后台创建租户 ID、名称和登录密码；
+# 再由平台管理员或该租户登录租户后台创建企业微信连接实例。
 ```
 
 ### 生产升级（先迁移再切换）
 
-推荐执行 `bash deploy/server_deploy.sh`：脚本先校验三个生产密钥，再用独立迁移账户和宿主 `mysql` CLI 严格执行 `004` → `005` → `006` → `007` → `008`；任一迁移失败都会在拉取/启动前终止。随后脚本强制以 `MCP_SERVICE_ENABLED=false` 重建并验证健康，仅在原请求值为 `true` 时二次重建启用。启用检查失败会恢复 `false`、重建并验证关闭态后非零退出，且保留 `008` 数据。
+推荐执行 `bash deploy/server_deploy.sh`：脚本先校验三个生产密钥，再用独立迁移账户和宿主 `mysql` CLI 严格执行 `004` → `005` → `006` → `007` → `008` → `009`；任一迁移失败都会在拉取/启动前终止。随后脚本强制以 `MCP_SERVICE_ENABLED=false` 重建并验证健康，仅在原请求值为 `true` 时二次重建启用。启用检查失败会恢复 `false`、重建并验证关闭态后非零退出，且保留迁移数据。
 
 ```bash
 git pull
@@ -85,7 +83,7 @@ read -rsp "DB_MIGRATION_PASSWORD: " DB_MIGRATION_PASSWORD && export DB_MIGRATION
 bash deploy/server_deploy.sh
 ```
 
-需要手动升级时，顺序必须是“备份数据库 → `004` → `005` → `006` → `007` → `008` → 关闭态重建/健康检查 → 经批准启用并再次重建”。`008` 依赖 `005` 与 `006`。密码通过 `MYSQL_PWD` 环境变量传递：
+需要手动升级时，顺序必须是“备份数据库 → `004` → `005` → `006` → `007` → `008` → `009` → 关闭态重建/健康检查 → 经批准启用并再次重建”。`008` 依赖 `005` 与 `006`；`009` 让租户身份记录不再要求旧企业微信字段，同时不删除旧数据。密码通过 `MYSQL_PWD` 环境变量传递：
 
 ```bash
 DB_MIGRATION_HOST=127.0.0.1
@@ -103,6 +101,8 @@ mysql --protocol=TCP --host="$DB_MIGRATION_HOST" --port="$DB_PORT" \
   --user="$DB_MIGRATION_USER" "$DB_NAME" < sql/007_tenant_auth.sql
 mysql --protocol=TCP --host="$DB_MIGRATION_HOST" --port="$DB_PORT" \
   --user="$DB_MIGRATION_USER" "$DB_NAME" < sql/008_mcp_service.sql
+mysql --protocol=TCP --host="$DB_MIGRATION_HOST" --port="$DB_PORT" \
+  --user="$DB_MIGRATION_USER" "$DB_NAME" < sql/009_tenant_identity_boundary.sql
 unset MYSQL_PWD
 docker pull ghcr.io/hkxiaoyao/wbsysc:latest
 # 先写 MCP_SERVICE_ENABLED=false，再 docker compose up -d --force-recreate 并核对 health
@@ -138,7 +138,7 @@ python tests/test_smoke_client.py
 | `WECOM_USE_MOCK` | `true`=脱敏 mock；生产必须为 `false` 并配置租户凭证 | 生产必填 |
 | `SYNC_INTERVAL_*_MIN` | 同步间隔（report/approval/smarttable） | - |
 
-> 租户企微凭证（corpid/secret）**不进 .env**，通过管理后台或 `tenant_init` 写入 `tenant_config`（AES 加密）。
+> 企业微信凭证（CorpID、应用 Secret、通讯录 Secret）**不进 `.env`，也不属于租户资料**；它们通过连接实例页面写入 `connection_instance` / `connection_credential`，Secret 使用 AES 加密。
 >
 > 生产启动必须同时设置 `WECOM_USE_MOCK=false`、三个两两不同的密钥、`ADMIN_PASSWORD` 和 `DB_PASSWORD`；缺失、密钥少于 32 个 UTF-8 字节或使用示例值时应用会拒绝启动。
 
@@ -177,40 +177,30 @@ python tests/test_smoke_client.py
 | API | 说明 |
 |-----|------|
 | `POST /admin/login` | 密码登录 → session token（Cookie + Bearer 双支持） |
-| `GET /admin/tenants` | 列出租户（secret 不回传明文） |
-| `POST /admin/tenants` | 新增租户（自动建 schema） |
-| `PUT /admin/tenants/{id}` | 编辑租户（密钥留空=不改） |
-| `DELETE /admin/tenants/{id}` | 删除租户配置 |
-| `POST /admin/tenants/{id}/sync` | 手动触发该租户同步 |
+| `GET /admin/tenants` | 列出租户身份与登录状态 |
+| `POST /admin/tenants` | 新增租户身份并设置必填初始密码 |
+| `PUT /admin/tenants/{id}` | 编辑租户名称、状态或显式重置密码 |
+| `DELETE /admin/tenants/{id}` | 删除无连接/服务保留历史的租户身份 |
+| `/admin/tenants/{id}/connections` | 管理该租户的连接实例、凭据、同步策略与连接 Token |
 
-创建租户时可选设置初始密码；管理员可重置密码或启用/禁用登录，但后台从不读取、回填既有密码。重置密码、租户自行改密或禁用登录都会撤销该租户现有会话。服务功能仅在 `MCP_SERVICE_ENABLED=true` 的重启后开放；此时可信连接器注册完成后会幂等回填默认服务和工具绑定，不复制连接 Token。改回 `false` 并重建会关闭服务路由、租户服务 UI/API 和服务运行时，同时保留旧 MCP 入口、管理员清理能力及 `008` 数据。
+创建租户时必须设置初始密码；管理员可重置密码或启用/禁用登录，但后台从不读取、回填既有密码。租户登录后管理自己的连接实例、MCP 服务与调用日志。重置密码、租户自行改密或禁用登录都会撤销该租户现有会话。服务功能仅在 `MCP_SERVICE_ENABLED=true` 的重启后开放；此时可信连接器注册完成后会幂等回填默认服务和工具绑定，不复制连接 Token。
 
 前端开发：`cd admin-ui && pnpm install && pnpm dev`（:5178 跨域代理后端）；`pnpm build` 产出 `app/static/dist`。
 
 ## 🏢 多租户
 
-**物理 schema 隔离**：每租户独立 `wbd_{corpid_md5}` schema，凭证 AES-Fernet 加密存中心库。
+**身份与连接分离**：租户记录只保存名称、ID、登录账户与状态；企业微信连接实例保存 CorpID、数据模式、同步模块/间隔、可信域名以及加密凭据。新存储型连接的 schema 由后端分配；旧租户 schema 在兼容期由默认连接继续引用。
 
-```bash
-# 接入新租户（自动建schema+5张表+刷缓存）
-python -m app.tenant_init \
-  --tenant-id tenant_id_here --corpid corpid_here --secret app_secret_here \
-  --token $(openssl rand -hex 24) \
-  --modules report,approval,checkin \
-  --contact-secret contact_secret_here # 可选：通讯录同步 secret
-  --checkin-userids "userid_here"      # 可选：手动配置 userid
-```
+**模块开关**：在企业微信连接实例中选择 `report`/`approval`/`checkin`。
 
-**模块开关** `--modules`：可选 `report`/`approval`/`checkin` 任意组合。
+**打卡 userid**：连接实例可配置通讯录 Secret 自动拉取，或填写用户 ID。
 
-**打卡 userid**（二选一）：自动优先（`--contact-secret` 调 list_id 拉全员，10分钟缓存），失败回退手动配置。
-
-**隔离保证**：token→租户→schema 服务端强绑定，SQL 带 schema 前缀防连接池竞态，审计日志按租户物理分离。
+**隔离保证**：Token → 租户 → 连接 → schema 由服务端绑定，SQL 带 schema 前缀防连接池竞态，审计日志记录租户、服务与连接维度。
 
 ## 🔄 同步任务
 
-- APScheduler 启动立即首同步 + 周期遍历所有启用租户
-- 增量游标存各租户 `sync_cursor`，断点续传
+- APScheduler 启动立即首同步 + 周期遍历所有可同步连接
+- 增量游标存各连接 schema 的 `sync_cursor`，断点续传
 - 线程池执行不阻塞 MCP 事件循环
 - 单租户/单条失败不中断整体；`MAX_DETAIL_PER_RUN=500` 防爆
 - 打卡逐人拉取 + 容错：越权人员(301021)静默跳过不影响他人

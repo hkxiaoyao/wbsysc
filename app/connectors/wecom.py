@@ -322,20 +322,51 @@ class WeComConnector:
             config_schema={
                 "type": "object",
                 "properties": {
-                    "corpid": {"type": "string"},
-                    "schema_name": {"type": "string"},
+                    "corpid": {"type": "string", "minLength": 1, "maxLength": 64},
+                    "schema_name": {
+                        "type": "string",
+                        "pattern": r"^wbd_[0-9A-Za-z_]+$",
+                    },
+                    "enabled_modules": {
+                        "type": "array",
+                        "items": {
+                            "type": "string",
+                            "enum": ["report", "approval", "checkin"],
+                        },
+                        "uniqueItems": True,
+                    },
+                    "sync_interval_min": {
+                        "type": "integer",
+                        "minimum": 1,
+                        "maximum": 1440,
+                    },
                     "checkin_userids": {
                         "type": "array",
                         "items": {"type": "string"},
                     },
+                    "trusted_domain": {"type": "string", "maxLength": 255},
+                    "legacy_source": {"type": "string", "readOnly": True},
                 },
+                "required": ["corpid", "schema_name"],
+                "additionalProperties": False,
             },
             credential_schema={
                 "type": "object",
                 "properties": {
-                    "wecom_app_secret": {"type": "string", "writeOnly": True},
-                    "wecom_contact_secret": {"type": "string", "writeOnly": True},
+                    "wecom_app_secret": {
+                        "type": "string",
+                        "minLength": 1,
+                        "maxLength": 2048,
+                        "writeOnly": True,
+                    },
+                    "wecom_contact_secret": {
+                        "type": "string",
+                        "maxLength": 2048,
+                        "writeOnly": True,
+                    },
                 },
+                "required": ["wecom_app_secret"],
+                "additionalProperties": False,
             },
         )
 

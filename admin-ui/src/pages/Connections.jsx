@@ -1,6 +1,6 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
 import {
-  Alert, Button, Drawer, Empty, Form, Grid, Input, Modal, Select, Space, Switch, Table, Tabs, Tag, Typography, message,
+  Alert, Button, Drawer, Empty, Form, Grid, Input, InputNumber, Modal, Select, Space, Switch, Table, Tabs, Tag, Typography, message,
 } from 'antd'
 import {
   ApiOutlined, CopyOutlined, FileSearchOutlined, PlusOutlined, ReloadOutlined,
@@ -9,10 +9,11 @@ import {
 import defaultApi from '../api.js'
 import DeclarativeSpecWizard from './DeclarativeSpecWizard.jsx'
 import {
-  buildConnectionMcpConfig, canEnableWriteTool, closeTokenModal, safeServerError,
+  buildConnectionMcpConfig, buildWecomCredentials, buildWecomPublicConfig,
+  canEnableWriteTool, closeTokenModal, emptyWecomCredentialFields, safeServerError,
   apiClientEndpoint, connectionCollectionEndpoint, connectionResourceEndpoint,
   createConnectionMutationSequence, createRequestSequence, isActiveDeclarativeConfigReadOnly, selectActiveTokenHint,
-  setExplicitToolPolicy,
+  setExplicitToolPolicy, wecomConfigFormValues,
 } from './connectionView.js'
 import { CONNECTOR_CARDS, connectorCard } from './servicesView.js'
 import './Connections.css'
@@ -25,6 +26,11 @@ const STATUS_META = {
   error: { label: '异常', color: 'error' },
 }
 const DATA_MODE = { direct: '直连', stored: '存储', hybrid: '混合' }
+const WECOM_MODULE_OPTIONS = [
+  { value: 'report', label: '汇报' },
+  { value: 'approval', label: '审批' },
+  { value: 'checkin', label: '打卡' },
+]
 
 function parseObject(text, label) {
   try {
@@ -56,6 +62,8 @@ export default function Connections({ scope = 'admin', apiClient = defaultApi, t
   const [selectedConnector, setSelectedConnector] = useState('wecom')
   const [credentialsText, setCredentialsText] = useState('{}')
   const [configText, setConfigText] = useState('{}')
+  const [wecomConfig, setWecomConfig] = useState(() => wecomConfigFormValues())
+  const [wecomCredentials, setWecomCredentials] = useState(emptyWecomCredentialFields)
   const [tokenLabel, setTokenLabel] = useState('')
   const [activeTab, setActiveTab] = useState('config')
   const [tokenModal, setTokenModal] = useState(closeTokenModal)
@@ -163,6 +171,8 @@ export default function Connections({ scope = 'admin', apiClient = defaultApi, t
     setTokens([])
     setCredentialsText('{}')
     setConfigText('{}')
+    setWecomConfig(wecomConfigFormValues())
+    setWecomCredentials(emptyWecomCredentialFields())
     setTokenLabel('')
     setTokenModal(closeTokenModal())
   }, [tenantId])
@@ -201,6 +211,8 @@ export default function Connections({ scope = 'admin', apiClient = defaultApi, t
     setTools([])
     setTokens([])
     setConfigText(JSON.stringify(row.public_config || {}, null, 2))
+    setWecomConfig(wecomConfigFormValues(row.public_config))
+    setWecomCredentials(emptyWecomCredentialFields())
     setCredentialsText('{}')
     setTokenLabel('')
     setDrawerBusy('detail')
@@ -215,6 +227,7 @@ export default function Connections({ scope = 'admin', apiClient = defaultApi, t
       setTokens(detailResponse.data?.tokens || [])
       setTools(toolResponse.data?.items || [])
       setConfigText(JSON.stringify(next.public_config || {}, null, 2))
+      setWecomConfig(wecomConfigFormValues(next.public_config))
     } catch (error) {
       if (isDetailCurrent(requestId, row.connection_id, controller)) messageApi.error(safeServerError(error, '连接详情加载失败'))
     } finally {
@@ -232,6 +245,8 @@ export default function Connections({ scope = 'admin', apiClient = defaultApi, t
     setTokens([])
     setCredentialsText('{}')
     setConfigText('{}')
+    setWecomConfig(wecomConfigFormValues())
+    setWecomCredentials(emptyWecomCredentialFields())
     setTokenLabel('')
     setTokenModal(closeTokenModal())
     openedInitialConnection.current = ''
@@ -266,6 +281,8 @@ export default function Connections({ scope = 'admin', apiClient = defaultApi, t
     setTokens([])
     setCredentialsText('{}')
     setConfigText('{}')
+    setWecomConfig(wecomConfigFormValues())
+    setWecomCredentials(emptyWecomCredentialFields())
     setTokenLabel('')
     setTokenModal(closeTokenModal())
     setActiveTab('config')
@@ -289,6 +306,7 @@ export default function Connections({ scope = 'admin', apiClient = defaultApi, t
     setTokens(detailResponse.data?.tokens || [])
     setTools(toolResponse.data?.items || [])
     setConfigText(JSON.stringify(next.public_config || {}, null, 2))
+    setWecomConfig(wecomConfigFormValues(next.public_config))
   }
 
   const closeCreate = () => {
@@ -313,13 +331,14 @@ export default function Connections({ scope = 'admin', apiClient = defaultApi, t
       const connectorKey = connectorCard(selectedConnector)?.key
       if (!connectorKey) throw new Error('请选择连接器')
       const declarative = connectorKey === 'http_declarative'
+      const wecom = connectorKey === 'wecom'
       const response = await apiClient.post(apiClientEndpoint(apiClient, connectionCollectionEndpoint(scope, values.tenant_id)), {
         connector_key: connectorKey,
         display_name: values.display_name.trim(),
         data_mode: values.data_mode,
         status: declarative ? 'draft' : 'active',
-        public_config: declarative ? {} : parseObject(values.public_config, '公开配置'),
-        credentials: declarative ? {} : parseObject(values.credentials, '凭据'),
+        public_config: declarative ? {} : wecom ? buildWecomPublicConfig(values) : parseObject(values.public_config, '公开配置'),
+        credentials: declarative ? {} : wecom ? buildWecomCredentials(values) : parseObject(values.credentials, '凭据'),
       }, { signal: controller.signal })
       if (!isCurrent()) return
       const connection = response.data.connection
@@ -347,7 +366,12 @@ export default function Connections({ scope = 'admin', apiClient = defaultApi, t
     const { ticket, controller } = beginDrawerMutation(connection.connection_id)
     setDrawerBusy('config')
     try {
-      const publicConfig = parseObject(configText, '公开配置')
+      if (connection.connector_key === 'wecom' && !wecomConfig.corpid.trim()) {
+        throw new Error('请输入企业微信 CorpID')
+      }
+      const publicConfig = connection.connector_key === 'wecom'
+        ? buildWecomPublicConfig(wecomConfig, connection.public_config)
+        : parseObject(configText, '公开配置')
       const response = await apiClient.put(apiClientEndpoint(apiClient, connectionResourceEndpoint(scope, connection.connection_id)), {
         display_name: connection.display_name,
         data_mode: connection.data_mode,
@@ -356,6 +380,9 @@ export default function Connections({ scope = 'admin', apiClient = defaultApi, t
       }, { signal: controller.signal })
       if (!isDrawerMutationCurrent(ticket, controller)) return
       setDetail(response.data.connection)
+      if (connection.connector_key === 'wecom') {
+        setWecomConfig(wecomConfigFormValues(response.data.connection?.public_config))
+      }
       messageApi.success('连接配置已保存')
       load()
     } catch (error) {
@@ -371,12 +398,18 @@ export default function Connections({ scope = 'admin', apiClient = defaultApi, t
     const { ticket, controller } = beginDrawerMutation(connection.connection_id)
     setDrawerBusy('credentials')
     try {
-      const credentials = parseObject(credentialsText, '新凭据')
+      if (connection.connector_key === 'wecom' && !wecomCredentials.wecom_app_secret) {
+        throw new Error('请输入企业微信应用 Secret')
+      }
+      const credentials = connection.connector_key === 'wecom'
+        ? buildWecomCredentials(wecomCredentials)
+        : parseObject(credentialsText, '新凭据')
       await apiClient.put(apiClientEndpoint(apiClient, connectionResourceEndpoint(scope, connection.connection_id, 'credentials')), {
         credentials,
       }, { signal: controller.signal })
       if (!isDrawerMutationCurrent(ticket, controller)) return
       setCredentialsText('{}')
+      setWecomCredentials(emptyWecomCredentialFields())
       messageApi.success('凭据已替换，输入内容已清除')
     } catch (error) {
       if (isDrawerMutationCurrent(ticket, controller)) messageApi.error(error.message || safeServerError(error, '替换凭据失败'))
@@ -502,12 +535,45 @@ export default function Connections({ scope = 'admin', apiClient = defaultApi, t
   ]
 
   const configReadOnly = isActiveDeclarativeConfigReadOnly(detail || {})
+  const wecomDetail = detail?.connector_key === 'wecom'
   const tabs = detail ? [
     {
-      key: 'config', label: '配置', children: <div className="connection-editor"><Alert type={configReadOnly ? 'warning' : 'info'} showIcon message={configReadOnly ? '活动声明式连接的配置只读' : '公开配置不会包含凭据或 Token'} description={configReadOnly ? '先停用连接，再使用声明式向导创建并发布待激活修订。通用配置保存不会被调用。' : undefined} /><label>连接名称<Input aria-label="连接名称" disabled={configReadOnly} value={detail.display_name} onChange={(event) => setDetail((current) => ({ ...current, display_name: event.target.value }))} /></label><label>数据模式<Select aria-label="连接数据模式" disabled={configReadOnly} value={detail.data_mode} options={Object.entries(DATA_MODE).map(([value, label]) => ({ value, label }))} onChange={(data_mode) => setDetail((current) => ({ ...current, data_mode }))} /></label><label>公开配置（JSON）<Input.TextArea aria-label="连接公开配置 JSON" disabled={configReadOnly} rows={9} value={configText} onChange={(event) => setConfigText(event.target.value)} /></label><Button type="primary" disabled={configReadOnly} loading={drawerBusy === 'config'} onClick={saveConfig}>保存配置</Button></div>,
+      key: 'config',
+      label: '配置',
+      children: (
+        <div className="connection-editor">
+          <Alert type={configReadOnly ? 'warning' : 'info'} showIcon message={configReadOnly ? '活动声明式连接的配置只读' : '公开配置不会包含凭据或 Token'} description={configReadOnly ? '先停用连接，再使用声明式向导创建并发布待激活修订。通用配置保存不会被调用。' : undefined} />
+          <label>连接名称<Input aria-label="连接名称" disabled={configReadOnly} value={detail.display_name} onChange={(event) => setDetail((current) => ({ ...current, display_name: event.target.value }))} /></label>
+          <label>数据模式<Select aria-label="连接数据模式" disabled={configReadOnly} value={detail.data_mode} options={Object.entries(DATA_MODE).map(([value, label]) => ({ value, label }))} onChange={(data_mode) => setDetail((current) => ({ ...current, data_mode }))} /></label>
+          {wecomDetail ? (
+            <>
+              <label>CorpID<Input aria-label="企业微信 CorpID" value={wecomConfig.corpid} onChange={(event) => setWecomConfig((current) => ({ ...current, corpid: event.target.value }))} /></label>
+              {detail.public_config?.schema_name && <label>数据 Schema（后端管理）<Input aria-label="企业微信数据 Schema" readOnly value={detail.public_config.schema_name} /></label>}
+              <label>同步模块<Select aria-label="企业微信同步模块" mode="multiple" value={wecomConfig.enabled_modules} options={WECOM_MODULE_OPTIONS} onChange={(enabled_modules) => setWecomConfig((current) => ({ ...current, enabled_modules }))} /></label>
+              <label>同步间隔（分钟）<InputNumber aria-label="企业微信同步间隔" min={1} max={1440} precision={0} style={{ width: '100%' }} value={wecomConfig.sync_interval_min} onChange={(sync_interval_min) => setWecomConfig((current) => ({ ...current, sync_interval_min }))} /></label>
+              <label>打卡用户 ID<Input.TextArea aria-label="企业微信打卡用户 ID" rows={4} value={wecomConfig.checkin_userids} placeholder="每行一个用户 ID，也支持逗号分隔" onChange={(event) => setWecomConfig((current) => ({ ...current, checkin_userids: event.target.value }))} /></label>
+              <label>可信域名<Input aria-label="企业微信可信域名" maxLength={255} value={wecomConfig.trusted_domain} placeholder="例如 mcp.example.com" onChange={(event) => setWecomConfig((current) => ({ ...current, trusted_domain: event.target.value }))} /></label>
+            </>
+          ) : <label>公开配置（JSON）<Input.TextArea aria-label="连接公开配置 JSON" disabled={configReadOnly} rows={9} value={configText} onChange={(event) => setConfigText(event.target.value)} /></label>}
+          <Button type="primary" disabled={configReadOnly} loading={drawerBusy === 'config'} onClick={saveConfig}>保存配置</Button>
+        </div>
+      ),
     },
     {
-      key: 'credentials', label: '凭据', children: <div className="connection-editor"><Alert type="warning" showIcon message="只输入一组完整的新凭据" description="现有值永不返回浏览器。保存或关闭工作台后，输入内容会立即清除。" /><Input.TextArea aria-label="新连接凭据 JSON" rows={8} value={credentialsText} onChange={(event) => setCredentialsText(event.target.value)} placeholder='{"api_key":"new value"}' /><Button type="primary" loading={drawerBusy === 'credentials'} onClick={saveCredentials}>替换凭据并清除输入</Button></div>,
+      key: 'credentials',
+      label: '凭据',
+      children: (
+        <div className="connection-editor">
+          <Alert type="warning" showIcon message="只输入一组完整的新凭据" description="现有值永不返回浏览器。保存或关闭工作台后，输入内容会立即清除。" />
+          {wecomDetail ? (
+            <>
+              <label>应用 Secret<Input.Password aria-label="企业微信应用 Secret" autoComplete="new-password" value={wecomCredentials.wecom_app_secret} onChange={(event) => setWecomCredentials((current) => ({ ...current, wecom_app_secret: event.target.value }))} /></label>
+              <label>通讯录 Secret（可选）<Input.Password aria-label="企业微信通讯录 Secret" autoComplete="new-password" value={wecomCredentials.wecom_contact_secret} onChange={(event) => setWecomCredentials((current) => ({ ...current, wecom_contact_secret: event.target.value }))} /></label>
+            </>
+          ) : <Input.TextArea aria-label="新连接凭据 JSON" rows={8} value={credentialsText} onChange={(event) => setCredentialsText(event.target.value)} placeholder='{"api_key":"new value"}' />}
+          <Button type="primary" loading={drawerBusy === 'credentials'} onClick={saveCredentials}>替换凭据并清除输入</Button>
+        </div>
+      ),
     },
     {
       key: 'tokens', label: `Token · ${tokens.length}`, children: <div className="connection-editor"><Alert type="info" showIcon message="Token 原文只在签发后显示一次" /><Input aria-label="Token 用途标签" maxLength={128} value={tokenLabel} placeholder="用途标签（可选）" onChange={(event) => setTokenLabel(event.target.value)} /><Space><Button loading={drawerBusy === 'token'} onClick={() => issueToken(false)}>签发新 Token</Button><Button danger loading={drawerBusy === 'token'} onClick={() => issueToken(true)}>轮换并撤销旧 Token</Button></Space><div className="connection-token-list">{tokens.map((token) => { const revoked = Boolean(token.revoked_at || token.revoked === true || token.status === 'revoked'); return <div key={token.token_id}><Text code>{token.prefix || token.token_prefix || 'token'}</Text><Text type="secondary">{token.label || token.token_label || '未命名'}</Text>{revoked ? <Tag>已撤销{token.revoked_at ? ` · ${new Date(token.revoked_at).toLocaleString('zh-CN')}` : ''}</Tag> : <Button danger type="link" size="small" onClick={() => revokeToken(token)}>撤销</Button>}</div> })}</div></div>,
@@ -546,11 +612,11 @@ export default function Connections({ scope = 'admin', apiClient = defaultApi, t
       </section>
 
       <Drawer rootClassName="connection-drawer" title={detail ? `${detail.display_name} · 连接工作台` : '连接工作台'} open={Boolean(detail)} onClose={closeDetail} width={screens.lg ? 960 : screens.sm ? '92vw' : '100vw'} loading={drawerBusy === 'detail'} extra={detail && <Tag color={(STATUS_META[detail.status] || STATUS_META.disabled).color}>{(STATUS_META[detail.status] || STATUS_META.disabled).label}</Tag>}>
-        {detail && <><div className="connection-drawer-rail"><span><ApiOutlined /> {detail.connector_key}</span><span>{DATA_MODE[detail.data_mode] || detail.data_mode}</span><Text code>{endpoint(detail.connection_id)}</Text></div><Tabs activeKey={activeTab} items={tabs} onChange={(key) => { setActiveTab(key); if (key !== 'credentials') setCredentialsText('{}') }} /></>}
+        {detail && <><div className="connection-drawer-rail"><span><ApiOutlined /> {detail.connector_key}</span><span>{DATA_MODE[detail.data_mode] || detail.data_mode}</span><Text code>{endpoint(detail.connection_id)}</Text></div><Tabs activeKey={activeTab} items={tabs} onChange={(key) => { setActiveTab(key); if (key !== 'credentials') { setCredentialsText('{}'); setWecomCredentials(emptyWecomCredentialFields()) } }} /></>}
       </Drawer>
 
       <Modal title="新建连接实例" open={createOpen} onCancel={closeCreate} onOk={create} confirmLoading={createBusy} okText="创建连接" cancelText="取消" width={620}>
-        <Form form={form} layout="vertical" initialValues={{ tenant_id: tenantId || scopeTenant || undefined, data_mode: 'direct', public_config: '{}', credentials: '{}' }}>
+        <Form form={form} layout="vertical" initialValues={{ tenant_id: tenantId || scopeTenant || undefined, data_mode: 'direct', public_config: '{}', credentials: '{}', enabled_modules: ['report', 'approval', 'checkin'], sync_interval_min: 30 }}>
           {!tenantScope && <Form.Item name="tenant_id" label="租户" rules={[{ required: true, message: '请选择租户' }]}><Select disabled={Boolean(tenantId)} showSearch optionFilterProp="label" options={tenants.map((tenant) => ({ value: tenant.tenant_id, label: tenant.display_name ? `${tenant.display_name} · ${tenant.tenant_id}` : tenant.tenant_id }))} /></Form.Item>}
           <Form.Item name="display_name" label="连接名称" rules={[{ required: true, whitespace: true, max: 128 }]}><Input placeholder="例如 华东企微生产连接" /></Form.Item>
           <Form.Item label="连接器" required>
@@ -570,7 +636,22 @@ export default function Connections({ scope = 'admin', apiClient = defaultApi, t
             </div>
           </Form.Item>
           <Form.Item name="data_mode" label="数据模式" rules={[{ required: true }]}><Select aria-label="新连接数据模式" options={Object.entries(DATA_MODE).map(([value, label]) => ({ value, label }))} /></Form.Item>
-          {selectedConnector === 'http_declarative' ? <Alert type="info" showIcon message="连接将以草稿创建" description="创建后进入声明式向导导入 JSON/YAML；这里不会接受代码、模板或预置凭据。" /> : <><Form.Item name="public_config" label="公开配置（JSON 对象）"><Input.TextArea aria-label="新连接公开配置 JSON" rows={5} /></Form.Item><Form.Item name="credentials" label="初始凭据（JSON 对象）"><Input.TextArea aria-label="新连接初始凭据 JSON" rows={5} /></Form.Item></>}
+          {selectedConnector === 'http_declarative' ? (
+            <Alert type="info" showIcon message="连接将以草稿创建" description="创建后进入声明式向导导入 JSON/YAML；这里不会接受代码、模板或预置凭据。" />
+          ) : selectedConnector === 'wecom' ? (
+            <>
+              <Alert type="info" showIcon message="企业微信配置使用独立字段" description="数据 Schema 由后端创建；MCP Token 将在创建成功后单独显示一次。" />
+              <Form.Item name="corpid" label="CorpID" rules={[{ required: true, whitespace: true, message: '请输入企业微信 CorpID' }]}><Input aria-label="新连接企业微信 CorpID" maxLength={64} /></Form.Item>
+              <Form.Item name="enabled_modules" label="同步模块" rules={[{ required: true, message: '请选择至少一个同步模块' }]}><Select aria-label="新连接企业微信同步模块" mode="multiple" options={WECOM_MODULE_OPTIONS} /></Form.Item>
+              <Form.Item name="sync_interval_min" label="同步间隔（分钟）" rules={[{ required: true }]}><InputNumber aria-label="新连接企业微信同步间隔" min={1} max={1440} precision={0} style={{ width: '100%' }} /></Form.Item>
+              <Form.Item name="checkin_userids" label="打卡用户 ID（可选）" extra="每行一个用户 ID，也支持逗号分隔"><Input.TextArea aria-label="新连接企业微信打卡用户 ID" rows={3} /></Form.Item>
+              <Form.Item name="trusted_domain" label="可信域名（可选）"><Input aria-label="新连接企业微信可信域名" maxLength={255} placeholder="例如 mcp.example.com" /></Form.Item>
+              <Form.Item name="wecom_app_secret" label="应用 Secret" rules={[{ required: true, message: '请输入企业微信应用 Secret' }]}><Input.Password aria-label="新连接企业微信应用 Secret" autoComplete="new-password" /></Form.Item>
+              <Form.Item name="wecom_contact_secret" label="通讯录 Secret（可选）"><Input.Password aria-label="新连接企业微信通讯录 Secret" autoComplete="new-password" /></Form.Item>
+            </>
+          ) : (
+            <><Form.Item name="public_config" label="公开配置（JSON 对象）"><Input.TextArea aria-label="新连接公开配置 JSON" rows={5} /></Form.Item><Form.Item name="credentials" label="初始凭据（JSON 对象）"><Input.TextArea aria-label="新连接初始凭据 JSON" rows={5} /></Form.Item></>
+          )}
         </Form>
       </Modal>
 

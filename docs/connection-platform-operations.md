@@ -115,7 +115,7 @@ CONNECTOR_ALLOWLIST=reviewed-connector-name
 
 ## 租户密码与会话
 
-- 创建租户时可选设置初始密码；未填写时不创建登录账户，后台只显示 `has_login_account=false`/无状态，不读取既有密码。
+- 创建租户时必须设置初始密码，并在同一事务中创建登录账户；后台不读取既有密码。
 - 管理员可通过 `PUT /admin/tenants/{tenant_id}/login-password` 设置或重置密码；成功后账户为可登录状态并撤销该租户全部已有会话，用户须重新登录。
 - `PUT /admin/tenants/{tenant_id}/login-status` 只接受明确的启用/禁用状态；禁用会撤销全部租户会话。普通租户资料编辑不得意外重新启用已禁用登录。
 - 租户自行修改密码同样撤销全部会话并清除当前 Cookie。工单、日志和浏览器状态中都不得保存密码或密码派生提示。

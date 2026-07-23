@@ -1,0 +1,12 @@
+{
+  "id": "separate-tenant-connection-boundary",
+  "title": "收敛租户身份模型并把企业微信配置迁移到连接实例",
+  "status": "completed",
+  "complexity": "L+",
+  "risk": "high",
+  "domain": "architecture",
+  "currentPhase": "completed",
+  "nextAction": "归档并提交部署",
+  "createdAt": "2026-07-23T05:36:57Z",
+  "branch": "main"
+}

@@ -5,12 +5,27 @@ from types import SimpleNamespace
 import pytest
 from fastapi import FastAPI, HTTPException, Response
 from fastapi.testclient import TestClient
+from pydantic import ValidationError
 from starlette.applications import Starlette
 from starlette.routing import Mount
 
 from app import admin
 from app import auth as auth_module
 from app import tenant as tenant_module
+
+
+def _legacy_tenant_body(**overrides):
+    """Adapter for historical direct-call tests; HTTP contracts use strict models."""
+    values = {
+        "tenant_id": "tenant-a",
+        "display_name": "",
+        "enabled": True,
+        "tenant_password": None,
+    }
+    values.update(overrides)
+    if isinstance(values["tenant_password"], str):
+        values["tenant_password"] = admin.SecretStr(values["tenant_password"])
+    return SimpleNamespace(**values)
 
 
 def _same_origin_request():
@@ -61,9 +76,6 @@ class _AtomicConnection:
             self.state["config"] = {
                 "tenant_id": params["t"],
                 "display_name": params["dn"],
-                "secret": params["se"],
-                "contact_secret": params["cs"],
-                "mcp_token": params["mt"],
                 "enabled": bool(params["en"]),
             }
         elif sql.lstrip().startswith("UPDATE tenant_config SET"):
@@ -461,62 +473,32 @@ def test_auth_rate_limit_warning_is_emitted_once_per_active_bucket(
     assert caplog.text.count("MCP auth audit rate limit reached") == 1
 
 
-def test_tenant_item_redacts_token(monkeypatch):
-    monkeypatch.setattr(admin, "get_verify_by_tenant", lambda tenant_id: None)
-    row = (
-        "tenant-a", "客户A", "ww123", "secret-token-1234", "wbd_123", 30,
-        "report", "", 0, 1, 1, "created", "updated", "", "direct",
-    )
-    item = admin._tenant_item(row)
-    assert "mcp_token" not in item
-    assert item["has_mcp_token"] is True
-    assert item["mcp_token_hint"] == "1234"
-    assert item["data_mode"] == "direct"
-
-
-def test_tenant_item_exposes_only_non_secret_login_metadata(monkeypatch):
-    monkeypatch.setattr(admin, "get_verify_by_tenant", lambda tenant_id: None)
-    row = (
-        "tenant-a", "客户A", "ww123", "secret-token-1234", "wbd_123", 30,
-        "report", "", 0, 1, 1, "created", "updated", "", "direct",
-        1, "disabled",
-    )
+def test_tenant_item_exposes_only_identity_and_login_metadata():
+    row = ("tenant-a", "客户A", 1, "created", "updated", 1, "disabled")
 
     item = admin._tenant_item(row)
 
+    assert set(item) == {
+        "tenant_id",
+        "display_name",
+        "enabled",
+        "created_at",
+        "updated_at",
+        "has_login_account",
+        "login_status",
+    }
     assert item["has_login_account"] is True
     assert item["login_status"] == "disabled"
-    assert "password" not in " ".join(item).lower()
-    assert "hash" not in " ".join(item).lower()
+    assert item["enabled"] is True
 
 
-def test_tenant_item_reports_no_login_account_without_inventing_status(monkeypatch):
-    monkeypatch.setattr(admin, "get_verify_by_tenant", lambda tenant_id: None)
-    row = (
-        "tenant-a", "客户A", "ww123", "secret-token-1234", "wbd_123", 30,
-        "report", "", 0, 1, 1, "created", "updated", "", "stored",
-        0, None,
-    )
+def test_tenant_item_reports_no_login_account_without_inventing_status():
+    row = ("tenant-a", "客户A", 1, "created", "updated", 0, "active")
 
     item = admin._tenant_item(row)
 
     assert item["has_login_account"] is False
     assert item["login_status"] is None
-
-
-@pytest.mark.parametrize("legacy_token", ["a", "abcd"])
-def test_tenant_item_masks_complete_legacy_short_token(monkeypatch, legacy_token):
-    monkeypatch.setattr(admin, "get_verify_by_tenant", lambda tenant_id: None)
-    row = (
-        "tenant-a", "客户A", "ww123", legacy_token, "wbd_123", 30,
-        "report", "", 0, 1, 1, "created", "updated", "", "stored",
-    )
-
-    item = admin._tenant_item(row)
-
-    assert item["has_mcp_token"] is True
-    assert item["mcp_token_hint"] == "****"
-    assert item["mcp_token_hint"] != legacy_token
 
 
 def test_direct_tenant_cannot_trigger_sync(monkeypatch):
@@ -749,7 +731,63 @@ def test_tenant_login_mutation_checks_auth_before_origin(monkeypatch):
     assert events == []
 
 
-def test_create_tenant_requires_mcp_token(monkeypatch):
+def test_tenant_identity_models_reject_legacy_connection_fields():
+    legacy_fields = {
+        "corpid": "ww123",
+        "secret": "secret",
+        "contact_secret": "contact-secret",
+        "mcp_token": "token-1234567890",
+        "schema_name": "wbd_legacy",
+        "data_mode": "direct",
+        "sync_interval_min": 10,
+        "enabled_modules": "report",
+        "checkin_userids": "alice",
+        "trusted_domain": "example.com",
+    }
+
+    for field, value in legacy_fields.items():
+        with pytest.raises(ValidationError):
+            admin.TenantCreate(
+                tenant_id="tenant-a",
+                tenant_password="Initial-Secure-123",
+                **{field: value},
+            )
+        with pytest.raises(ValidationError):
+            admin.TenantUpdate(**{field: value})
+
+
+def test_tenant_identity_models_accept_only_identity_fields():
+    created = admin.TenantCreate(
+        tenant_id="tenant-a",
+        display_name="客户 A",
+        tenant_password="Initial-Secure-123",
+        enabled=True,
+    )
+    updated = admin.TenantUpdate(
+        display_name="客户 A+",
+        tenant_password="Replacement-Secure-456",
+        enabled=False,
+    )
+
+    assert set(created.model_dump()) == {
+        "tenant_id",
+        "display_name",
+        "tenant_password",
+        "enabled",
+    }
+    assert set(updated.model_dump()) == {
+        "display_name",
+        "tenant_password",
+        "enabled",
+    }
+
+
+def test_tenant_create_requires_password():
+    with pytest.raises(ValidationError):
+        admin.TenantCreate(tenant_id="tenant-a")
+
+
+def test_create_tenant_does_not_require_legacy_connection_fields(monkeypatch):
     class Connection:
         def __enter__(self):
             return self
@@ -767,24 +805,18 @@ def test_create_tenant_requires_mcp_token(monkeypatch):
     monkeypatch.setattr(admin, "_require_auth", lambda request: None)
     monkeypatch.setattr(admin, "ensure_domain_tables", lambda: None)
     monkeypatch.setattr(admin, "get_engine", lambda: Engine())
-    monkeypatch.setattr(admin, "encrypt_secret", lambda value: f"enc:{value}")
-    monkeypatch.setattr(admin, "ensure_schema", lambda schema: None)
     monkeypatch.setattr(admin, "reload_tenants", lambda: None)
-    body = admin.TenantUpsert(
+    body = admin.TenantCreate(
         tenant_id="tenant-a",
-        corpid="ww123",
-        secret="app-secret",
-        mcp_token="",
+        display_name="客户 A",
+        tenant_password="Initial-Secure-123",
     )
-    request = SimpleNamespace(cookies={}, headers={})
+    request = _same_origin_request()
 
-    with pytest.raises(HTTPException) as exc:
-        admin.create_tenant(body, request)
-
-    assert exc.value.status_code == 400
+    assert admin.create_tenant(body, request) == {"ok": True}
 
 
-def test_create_tenant_rejects_short_mcp_token(monkeypatch):
+def test_create_tenant_ignores_no_connection_token_because_contract_forbids_it(monkeypatch):
     class Connection:
         def __enter__(self):
             return self
@@ -802,20 +834,15 @@ def test_create_tenant_rejects_short_mcp_token(monkeypatch):
     monkeypatch.setattr(admin, "_require_auth", lambda request: None)
     monkeypatch.setattr(admin, "ensure_domain_tables", lambda: None)
     monkeypatch.setattr(admin, "get_engine", lambda: Engine())
-    monkeypatch.setattr(admin, "encrypt_secret", lambda value: f"enc:{value}")
-    monkeypatch.setattr(admin, "ensure_schema", lambda schema: None)
     monkeypatch.setattr(admin, "reload_tenants", lambda: None)
-    body = admin.TenantUpsert(
+    body = admin.TenantCreate(
         tenant_id="tenant-a",
-        corpid="ww123",
-        secret="app-secret",
-        mcp_token="too-short",
+        tenant_password="Initial-Secure-123",
     )
 
-    with pytest.raises(HTTPException) as exc:
-        admin.create_tenant(body, SimpleNamespace(cookies={}, headers={}))
-
-    assert exc.value.status_code == 400
+    assert admin.create_tenant(
+        body, _same_origin_request()
+    ) == {"ok": True}
 
 
 @pytest.mark.parametrize(
@@ -829,8 +856,8 @@ def test_mcp_token_validation_rejects_surrounding_whitespace(token):
     assert exc.value.status_code == 400
 
 
-def test_create_tenant_writes_data_mode(monkeypatch):
-    executed = {}
+def test_create_tenant_writes_only_identity_columns(monkeypatch):
+    executed = []
 
     class Connection:
         def __enter__(self):
@@ -840,8 +867,7 @@ def test_create_tenant_writes_data_mode(monkeypatch):
             return False
 
         def execute(self, statement, values):
-            executed["sql"] = str(statement)
-            executed["values"] = values
+            executed.append((str(statement), dict(values)))
 
     class Engine:
         def begin(self):
@@ -850,24 +876,26 @@ def test_create_tenant_writes_data_mode(monkeypatch):
     monkeypatch.setattr(admin, "_require_auth", lambda request: None)
     monkeypatch.setattr(admin, "ensure_domain_tables", lambda: None)
     monkeypatch.setattr(admin, "get_engine", lambda: Engine())
-    monkeypatch.setattr(admin, "encrypt_secret", lambda value: f"enc:{value}")
-    monkeypatch.setattr(admin, "ensure_schema", lambda schema: None)
     monkeypatch.setattr(admin, "reload_tenants", lambda: None)
-    body = admin.TenantUpsert(
+    body = admin.TenantCreate(
         tenant_id="tenant-a",
-        corpid="ww123",
-        secret="app-secret",
-        mcp_token="token-1234567890",
-        data_mode="direct",
+        display_name="客户 A",
+        tenant_password="Initial-Secure-123",
     )
 
-    admin.create_tenant(body, SimpleNamespace(cookies={}, headers={}))
+    admin.create_tenant(body, _same_origin_request())
 
-    assert "data_mode" in executed["sql"]
-    assert executed["values"]["dm"] == "direct"
+    insert_sql, insert_values = next(
+        (sql, values)
+        for sql, values in executed
+        if str(sql).lstrip().startswith("INSERT INTO tenant_config")
+    )
+    normalized_sql = " ".join(insert_sql.split())
+    assert "(tenant_id, display_name, enabled)" in normalized_sql
+    assert set(insert_values) == {"t", "dn", "en"}
 
 
-def test_create_tenant_provisions_optional_login_password(monkeypatch):
+def test_create_tenant_provisions_required_login_password(monkeypatch):
     accounts = []
 
     class Connection:
@@ -887,8 +915,6 @@ def test_create_tenant_provisions_optional_login_password(monkeypatch):
     monkeypatch.setattr(admin, "_require_auth", lambda request: None)
     monkeypatch.setattr(admin, "ensure_domain_tables", lambda: None)
     monkeypatch.setattr(admin, "get_engine", lambda: Engine())
-    monkeypatch.setattr(admin, "encrypt_secret", lambda value: f"enc:{value}")
-    monkeypatch.setattr(admin, "ensure_schema", lambda schema: None)
     monkeypatch.setattr(admin, "reload_tenants", lambda: None)
     monkeypatch.setattr(
         admin.tenant_auth_store,
@@ -897,7 +923,7 @@ def test_create_tenant_provisions_optional_login_password(monkeypatch):
             (tenant_id, password, status)
         ),
     )
-    body = admin.TenantUpsert(
+    body = _legacy_tenant_body(
         tenant_id="tenant-a",
         corpid="ww123",
         secret="app-secret",
@@ -932,8 +958,7 @@ def test_create_tenant_validates_login_password_before_database_write(monkeypatc
     monkeypatch.setattr(admin, "_require_auth", lambda request: None)
     monkeypatch.setattr(admin, "ensure_domain_tables", lambda: None)
     monkeypatch.setattr(admin, "get_engine", lambda: Engine())
-    monkeypatch.setattr(admin, "encrypt_secret", lambda value: f"enc:{value}")
-    body = admin.TenantUpsert(
+    body = _legacy_tenant_body(
         tenant_id="tenant-a",
         corpid="ww123",
         secret="app-secret",
@@ -962,7 +987,7 @@ def test_password_bearing_tenant_create_rejects_unsafe_origin_before_writes(
     events = []
     monkeypatch.setattr(admin, "_require_auth", lambda request: None)
     monkeypatch.setattr(admin, "ensure_domain_tables", lambda: events.append("write"))
-    body = admin.TenantUpsert(
+    body = _legacy_tenant_body(
         tenant_id="tenant-a",
         corpid="ww123",
         secret="app-secret",
@@ -988,7 +1013,6 @@ def test_create_with_password_rolls_back_config_when_account_write_fails(monkeyp
     monkeypatch.setattr(admin, "_require_auth", lambda request: None)
     monkeypatch.setattr(admin, "ensure_domain_tables", lambda: None)
     monkeypatch.setattr(admin, "get_engine", lambda: engine)
-    monkeypatch.setattr(admin, "encrypt_secret", lambda value: f"enc:{value}")
 
     def fail_account_write(tenant_id, password, status="active", *, conn=None):
         assert conn is engine.transactions[-1]
@@ -996,7 +1020,7 @@ def test_create_with_password_rolls_back_config_when_account_write_fails(monkeyp
         raise RuntimeError("injected account failure")
 
     monkeypatch.setattr(admin.tenant_auth_store, "upsert_account", fail_account_write)
-    body = admin.TenantUpsert(
+    body = _legacy_tenant_body(
         tenant_id="tenant-a",
         corpid="ww123",
         secret="app-secret",
@@ -1010,7 +1034,7 @@ def test_create_with_password_rolls_back_config_when_account_write_fails(monkeyp
     assert state == {}
 
 
-def test_create_schema_failure_keeps_atomic_config_and_account_for_safe_retry(
+def test_create_tenant_does_not_provision_legacy_schema(
     monkeypatch,
 ):
     state = {}
@@ -1018,7 +1042,6 @@ def test_create_schema_failure_keeps_atomic_config_and_account_for_safe_retry(
     monkeypatch.setattr(admin, "_require_auth", lambda request: None)
     monkeypatch.setattr(admin, "ensure_domain_tables", lambda: None)
     monkeypatch.setattr(admin, "get_engine", lambda: engine)
-    monkeypatch.setattr(admin, "encrypt_secret", lambda value: f"enc:{value}")
     monkeypatch.setattr(admin, "reload_tenants", lambda: None)
 
     def write_account(tenant_id, password, status="active", *, conn=None):
@@ -1026,25 +1049,20 @@ def test_create_schema_failure_keeps_atomic_config_and_account_for_safe_retry(
         state["account"] = {"tenant_id": tenant_id, "status": status}
 
     monkeypatch.setattr(admin.tenant_auth_store, "upsert_account", write_account)
-    monkeypatch.setattr(
-        admin,
-        "ensure_schema",
-        lambda schema: (_ for _ in ()).throw(RuntimeError("schema unavailable")),
-    )
-    body = admin.TenantUpsert(
+    body = admin.TenantCreate(
         tenant_id="tenant-a",
-        corpid="ww123",
-        secret="app-secret",
-        mcp_token="token-1234567890",
         tenant_password="Initial-Secure-123",
     )
 
-    with pytest.raises(RuntimeError, match="schema unavailable"):
-        admin.create_tenant(body, _same_origin_request())
+    assert admin.create_tenant(body, _same_origin_request()) == {"ok": True}
 
     assert state["config"]["tenant_id"] == "tenant-a"
     assert state["account"] == {"tenant_id": "tenant-a", "status": "active"}
-    assert all("DROP" not in sql.upper() for tx in engine.transactions for sql, _ in tx.statements)
+    assert all(
+        "SCHEMA" not in sql.upper()
+        for tx in engine.transactions
+        for sql, _ in tx.statements
+    )
 
 
 def test_create_tenant_rejects_reuse_when_retained_child_history_exists(monkeypatch):
@@ -1069,16 +1087,16 @@ def test_create_tenant_rejects_reuse_when_retained_child_history_exists(monkeypa
     monkeypatch.setattr(admin, "_require_auth", lambda request: None)
     monkeypatch.setattr(admin, "ensure_domain_tables", lambda: None)
     monkeypatch.setattr(admin, "get_engine", lambda: Engine())
-    monkeypatch.setattr(admin, "encrypt_secret", lambda value: f"enc:{value}")
-    body = admin.TenantUpsert(
+    body = _legacy_tenant_body(
         tenant_id="tenant-a",
         corpid="ww123",
         secret="app-secret",
         mcp_token="token-1234567890",
+        tenant_password="Initial-Secure-123",
     )
 
     with pytest.raises(HTTPException) as exc:
-        admin.create_tenant(body, SimpleNamespace(cookies={}, headers={}))
+        admin.create_tenant(body, _same_origin_request())
 
     assert exc.value.status_code == 409
 
@@ -1105,18 +1123,17 @@ def test_create_tenant_locks_exact_absent_tenant_before_ordered_history(monkeypa
     monkeypatch.setattr(admin, "_require_auth", lambda request: None)
     monkeypatch.setattr(admin, "ensure_domain_tables", lambda: None)
     monkeypatch.setattr(admin, "get_engine", lambda: Engine())
-    monkeypatch.setattr(admin, "encrypt_secret", lambda value: f"enc:{value}")
-    monkeypatch.setattr(admin, "ensure_schema", lambda schema: None)
     monkeypatch.setattr(admin, "reload_tenants", lambda: None)
-    body = admin.TenantUpsert(
+    body = _legacy_tenant_body(
         tenant_id="tenant-a",
         corpid="ww123",
         secret="app-secret",
         mcp_token="token-1234567890",
+        tenant_password="Initial-Secure-123",
     )
 
     assert admin.create_tenant(
-        body, SimpleNamespace(cookies={}, headers={})
+        body, _same_origin_request()
     )["ok"] is True
 
     assert "FROM tenant_config" in statements[0][0]
@@ -1182,7 +1199,6 @@ def test_update_tenant_synchronizes_login_password_and_disabled_status(monkeypat
     monkeypatch.setattr(admin, "_require_auth", lambda request: None)
     monkeypatch.setattr(admin, "ensure_domain_tables", lambda: None)
     monkeypatch.setattr(admin, "get_engine", lambda: Engine())
-    monkeypatch.setattr(admin, "ensure_schema", lambda schema: None)
     monkeypatch.setattr(admin, "reload_tenants", lambda: None)
     monkeypatch.setattr(
         admin.tenant_auth_store,
@@ -1191,7 +1207,7 @@ def test_update_tenant_synchronizes_login_password_and_disabled_status(monkeypat
             (tenant_id, password, status)
         ),
     )
-    body = admin.TenantUpsert(
+    body = _legacy_tenant_body(
         tenant_id="tenant-a",
         corpid="ww123",
         tenant_password="Replacement-Secure-456",
@@ -1219,7 +1235,7 @@ def test_password_bearing_tenant_update_rejects_unsafe_origin_before_writes(
     events = []
     monkeypatch.setattr(admin, "_require_auth", lambda request: None)
     monkeypatch.setattr(admin, "ensure_domain_tables", lambda: events.append("write"))
-    body = admin.TenantUpsert(
+    body = _legacy_tenant_body(
         tenant_id="tenant-a",
         corpid="ww123",
         tenant_password="Replacement-Secure-456",
@@ -1264,7 +1280,7 @@ def test_update_with_password_rolls_back_config_when_account_write_fails(monkeyp
         raise RuntimeError("injected account failure")
 
     monkeypatch.setattr(admin.tenant_auth_store, "upsert_account", fail_account_write)
-    body = admin.TenantUpsert(
+    body = _legacy_tenant_body(
         tenant_id="tenant-a",
         corpid="ww123",
         display_name="After",
@@ -1305,7 +1321,7 @@ def test_disable_failure_rolls_back_config_status_and_session_revocation(monkeyp
     monkeypatch.setattr(
         admin.tenant_auth_store, "set_account_status", fail_after_status_and_revoke
     )
-    body = admin.TenantUpsert(tenant_id="tenant-a", corpid="ww123", enabled=False)
+    body = _legacy_tenant_body(tenant_id="tenant-a", corpid="ww123", enabled=False)
 
     with pytest.raises(RuntimeError, match="injected revoke failure"):
         admin.update_tenant(
@@ -1332,7 +1348,6 @@ def test_failed_disable_then_retry_and_enable_cannot_revive_old_session(monkeypa
     monkeypatch.setattr(admin, "_require_auth", lambda request: None)
     monkeypatch.setattr(admin, "ensure_domain_tables", lambda: None)
     monkeypatch.setattr(admin, "get_engine", lambda: engine)
-    monkeypatch.setattr(admin, "ensure_schema", lambda schema: None)
     monkeypatch.setattr(admin, "reload_tenants", lambda: None)
     attempts = 0
 
@@ -1352,7 +1367,7 @@ def test_failed_disable_then_retry_and_enable_cannot_revive_old_session(monkeypa
     with pytest.raises(RuntimeError, match="injected first disable failure"):
         admin.update_tenant(
             "tenant-a",
-            admin.TenantUpsert(tenant_id="tenant-a", corpid="ww123", enabled=False),
+            _legacy_tenant_body(tenant_id="tenant-a", corpid="ww123", enabled=False),
             SimpleNamespace(cookies={}, headers={}),
         )
     assert state["config"]["enabled"] is True
@@ -1361,12 +1376,12 @@ def test_failed_disable_then_retry_and_enable_cannot_revive_old_session(monkeypa
 
     admin.update_tenant(
         "tenant-a",
-        admin.TenantUpsert(tenant_id="tenant-a", corpid="ww123", enabled=False),
+        _legacy_tenant_body(tenant_id="tenant-a", corpid="ww123", enabled=False),
         SimpleNamespace(cookies={}, headers={}),
     )
     admin.update_tenant(
         "tenant-a",
-        admin.TenantUpsert(tenant_id="tenant-a", corpid="ww123", enabled=True),
+        _legacy_tenant_body(tenant_id="tenant-a", corpid="ww123", enabled=True),
         SimpleNamespace(cookies={}, headers={}),
     )
 
@@ -1404,14 +1419,13 @@ def test_disabling_tenant_forces_login_disabled_and_revokes_sessions(monkeypatch
     monkeypatch.setattr(admin, "_require_auth", lambda request: None)
     monkeypatch.setattr(admin, "ensure_domain_tables", lambda: None)
     monkeypatch.setattr(admin, "get_engine", lambda: Engine())
-    monkeypatch.setattr(admin, "ensure_schema", lambda schema: None)
     monkeypatch.setattr(admin, "reload_tenants", lambda: None)
     monkeypatch.setattr(
         admin.tenant_auth_store,
         "set_account_status",
         lambda tenant_id, status, conn=None: events.append((tenant_id, status)) or True,
     )
-    body = admin.TenantUpsert(tenant_id="tenant-a", corpid="ww123", enabled=False)
+    body = _legacy_tenant_body(tenant_id="tenant-a", corpid="ww123", enabled=False)
 
     admin.update_tenant(
         "tenant-a", body, SimpleNamespace(cookies={}, headers={})
@@ -1440,25 +1454,25 @@ def test_create_tenant_redacts_database_error_details(monkeypatch, caplog):
     monkeypatch.setattr(admin, "_require_auth", lambda request: None)
     monkeypatch.setattr(admin, "ensure_domain_tables", lambda: None)
     monkeypatch.setattr(admin, "get_engine", lambda: Engine())
-    monkeypatch.setattr(admin, "encrypt_secret", lambda value: f"enc:{value}")
-    body = admin.TenantUpsert(
+    body = _legacy_tenant_body(
         tenant_id="tenant-a",
         corpid="ww123",
         secret="app-secret",
         mcp_token="token-1234567890",
+        tenant_password="Initial-Secure-123",
     )
 
     with pytest.raises(HTTPException) as exc:
-        admin.create_tenant(body, SimpleNamespace(cookies={}, headers={}))
+        admin.create_tenant(body, _same_origin_request())
 
     assert exc.value.status_code == 400
-    assert exc.value.detail == "写入失败，可能租户 ID、企业 ID 或 MCP Token 重复"
+    assert exc.value.detail == "写入失败，可能租户 ID 重复"
     assert leaked not in exc.value.detail
     assert leaked not in caplog.text
     assert "RuntimeError" in caplog.text
 
 
-def test_update_tenant_keeps_existing_token_when_blank(monkeypatch):
+def test_update_tenant_does_not_write_legacy_connection_fields(monkeypatch):
     executed = {}
     account_statuses = []
 
@@ -1491,14 +1505,13 @@ def test_update_tenant_keeps_existing_token_when_blank(monkeypatch):
     monkeypatch.setattr(admin, "_require_auth", lambda request: None)
     monkeypatch.setattr(admin, "ensure_domain_tables", lambda: None)
     monkeypatch.setattr(admin, "get_engine", lambda: Engine())
-    monkeypatch.setattr(admin, "ensure_schema", lambda schema: None)
     monkeypatch.setattr(admin, "reload_tenants", lambda: None)
     monkeypatch.setattr(
         admin.tenant_auth_store,
         "set_account_status",
         lambda tenant_id, status: account_statuses.append((tenant_id, status)),
     )
-    body = admin.TenantUpsert(
+    body = _legacy_tenant_body(
         tenant_id="tenant-a",
         corpid="ww123",
         mcp_token="",
@@ -1507,62 +1520,19 @@ def test_update_tenant_keeps_existing_token_when_blank(monkeypatch):
 
     admin.update_tenant("tenant-a", body, SimpleNamespace(cookies={}, headers={}))
 
-    assert executed["values"]["mt"] == "existing-token"
     assert account_statuses == []
-    assert executed["values"]["dm"] == "direct"
-    assert "data_mode=:dm" in executed["sql"]
+    assert set(executed["values"]) == {"t", "dn", "en"}
+    assert "data_mode" not in executed["sql"]
+    assert "mcp_token" not in executed["sql"]
 
 
-def test_update_tenant_rejects_short_replacement_token(monkeypatch):
-    class Result:
-        def fetchone(self):
-            return ("encrypted-secret", "encrypted-contact", "existing-legacy-token")
-
-    class Connection:
-        def __enter__(self):
-            return self
-
-        def __exit__(self, exc_type, exc, traceback):
-            return False
-
-        def execute(self, statement, values):
-            if str(statement).lstrip().startswith("SELECT"):
-                return Result()
-            return SimpleNamespace()
-
-    class Engine:
-        def connect(self):
-            return Connection()
-
-        def begin(self):
-            return Connection()
-
-    monkeypatch.setattr(admin, "_require_auth", lambda request: None)
-    monkeypatch.setattr(admin, "ensure_domain_tables", lambda: None)
-    monkeypatch.setattr(admin, "get_engine", lambda: Engine())
-    monkeypatch.setattr(admin, "ensure_schema", lambda schema: None)
-    monkeypatch.setattr(admin, "reload_tenants", lambda: None)
-    body = admin.TenantUpsert(
-        tenant_id="tenant-a",
-        corpid="ww123",
-        mcp_token="too-short",
-    )
-
-    with pytest.raises(HTTPException) as exc:
-        admin.update_tenant("tenant-a", body, SimpleNamespace(cookies={}, headers={}))
-
-    assert exc.value.status_code == 400
+def test_update_tenant_contract_rejects_connection_token():
+    with pytest.raises(ValidationError):
+        admin.TenantUpdate(mcp_token="too-short")
 
 
-def test_tenant_list_falls_back_only_for_missing_data_mode_column(monkeypatch, caplog):
+def test_tenant_list_query_has_no_legacy_connection_columns(monkeypatch):
     calls = []
-
-    class UnknownDataModeColumn(Exception):
-        def __init__(self):
-            super().__init__("statement failed")
-            self.orig = SimpleNamespace(
-                args=(1054, "Unknown column 'data_mode' in 'field list'")
-            )
 
     class Result:
         def __init__(self, rows):
@@ -1580,11 +1550,8 @@ def test_tenant_list_falls_back_only_for_missing_data_mode_column(monkeypatch, c
 
         def execute(self, statement):
             calls.append(str(statement))
-            if len(calls) == 1:
-                raise UnknownDataModeColumn()
             return Result([(
-                "tenant-a", "客户A", "ww123", "legacy-token-1234", "wbd_123", 30,
-                "report", "", 0, 1, 1, "created", "updated",
+                "tenant-a", "客户A", 1, "created", "updated", 1, "disabled",
             )])
 
     class Engine:
@@ -1594,14 +1561,14 @@ def test_tenant_list_falls_back_only_for_missing_data_mode_column(monkeypatch, c
     monkeypatch.setattr(admin, "_require_auth", lambda request: None)
     monkeypatch.setattr(admin, "ensure_domain_tables", lambda: None)
     monkeypatch.setattr(admin, "get_engine", lambda: Engine())
-    monkeypatch.setattr(admin, "get_verify_by_tenant", lambda tenant_id: None)
+    result = admin.list_tenants(SimpleNamespace(cookies={}, headers={}))
 
-    with caplog.at_level("WARNING", logger="wecom-gateway"):
-        result = admin.list_tenants(SimpleNamespace(cookies={}, headers={}))
-
-    assert len(calls) == 2
-    assert result["items"][0]["data_mode"] == "stored"
-    assert "data_mode" in caplog.text
+    assert len(calls) == 1
+    assert result["items"][0]["login_status"] == "disabled"
+    assert all(
+        column not in calls[0]
+        for column in ("corpid", "mcp_token", "secret_encrypted", "data_mode")
+    )
 
 
 def test_tenant_list_does_not_hide_unrelated_sql_errors(monkeypatch):

@@ -2,6 +2,7 @@ import test from 'node:test'
 import assert from 'node:assert/strict'
 import {
   EMPTY_FILTERS,
+  buildTenantIdentityPayload,
   buildTenantLoginPatch,
   buildTenantLoginStatusPatch,
   buildTenantPasswordReset,
@@ -9,7 +10,6 @@ import {
   createTenantActionLock,
   createTenantRequestGeneration,
   filterTenants,
-  getDirectModeReason,
   getTenantStats,
   projectTenantLoginState,
   tenantLoginPasswordEndpoint,
@@ -21,41 +21,37 @@ const tenants = [
   {
     tenant_id: 'alpha',
     display_name: '北区门店',
-    corpid: 'wwAlpha',
-    data_mode: 'stored',
     enabled: true,
-    has_secret: true,
+    has_login_account: true,
+    login_status: 'active',
   },
   {
     tenant_id: 'beta',
-    display_name: '华南直连',
-    corpid: 'wwBeta',
-    data_mode: 'direct',
+    display_name: '华南门店',
     enabled: true,
-    has_secret: false,
+    has_login_account: false,
+    login_status: null,
   },
   {
     tenant_id: 'gamma',
     display_name: '停用租户',
-    corpid: 'wwGamma',
-    data_mode: 'stored',
     enabled: false,
-    has_secret: true,
+    has_login_account: true,
+    login_status: 'disabled',
   },
 ]
 
-test('getTenantStats derives stable full-list counts', () => {
+test('getTenantStats derives identity-only tenant counts', () => {
   assert.deepEqual(getTenantStats(tenants), {
     total: 3,
-    running: 2,
-    direct: 1,
-    attention: 2,
+    enabled: 2,
+    disabled: 1,
   })
 })
 
-test('filterTenants searches name, tenant id, and CorpID case-insensitively', () => {
+test('filterTenants searches only tenant name and id case-insensitively', () => {
   assert.deepEqual(
-    filterTenants(tenants, { ...EMPTY_FILTERS, query: 'WWBETA' }).map((row) => row.tenant_id),
+    filterTenants(tenants, { ...EMPTY_FILTERS, query: 'BETA' }).map((row) => row.tenant_id),
     ['beta'],
   )
   assert.deepEqual(
@@ -64,17 +60,44 @@ test('filterTenants searches name, tenant id, and CorpID case-insensitively', ()
   )
 })
 
-test('filterTenants combines mode and enabled filters', () => {
+test('filterTenants combines query and tenant status filters', () => {
   assert.deepEqual(
-    filterTenants(tenants, { query: '', dataMode: 'stored', enabled: 'disabled' })
+    filterTenants(tenants, { query: '', enabled: 'disabled' })
       .map((row) => row.tenant_id),
     ['gamma'],
   )
 })
 
-test('getDirectModeReason explains unavailable synchronization actions', () => {
-  assert.equal(getDirectModeReason(tenants[1]), '直连模式实时调用企微 API，无需同步')
-  assert.equal(getDirectModeReason(tenants[0]), '')
+test('tenant identity payload excludes connection and legacy configuration fields', () => {
+  const values = {
+    tenant_id: 'alpha',
+    display_name: '北区门店',
+    enabled: true,
+    tenant_password: 'secure-value-123',
+    corpid: 'must-not-leak',
+    secret: 'must-not-leak',
+    mcp_token: 'must-not-leak',
+    data_mode: 'direct',
+    trusted_domain: 'must-not-leak.example',
+  }
+  assert.deepEqual(buildTenantIdentityPayload(values), {
+    tenant_id: 'alpha',
+    display_name: '北区门店',
+    enabled: true,
+    tenant_password: 'secure-value-123',
+  })
+  assert.throws(
+    () => buildTenantIdentityPayload({ ...values, tenant_password: '' }),
+    /password.*required/i,
+  )
+  assert.throws(
+    () => buildTenantIdentityPayload({ ...values, tenant_password: undefined }),
+    /password.*string/i,
+  )
+  assert.deepEqual(buildTenantIdentityPayload(values, { editing: true }), {
+    display_name: '北区门店',
+    enabled: true,
+  })
 })
 
 test('buildTenantLoginPatch includes only explicitly nonempty exact passwords', () => {

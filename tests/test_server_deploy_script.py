@@ -19,6 +19,7 @@ def test_deployer_runs_all_migrations_in_order_before_starting_new_image():
             "006_connection_platform.sql",
             "007_tenant_auth.sql",
             "008_mcp_service.sql",
+            "009_tenant_identity_boundary.sql",
         )
     ]
 

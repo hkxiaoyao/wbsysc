@@ -1,6 +1,7 @@
 """Authenticated, tenant-scoped administration for MCP connection instances."""
 from __future__ import annotations
 
+import hashlib
 import inspect
 import logging
 import math
@@ -26,12 +27,14 @@ from .connectors.declarative.models import (
     SpecValidationError,
 )
 from .connectors.declarative.validator import import_openapi_revision, validate_revision
+from .db import ensure_schema
 from .mcp_audit import write_event
 from .mcp_log_models import McpLogEvent
 from .mcp_services import store as service_store
 
 
 logger = logging.getLogger(__name__)
+WECOM_CONNECTOR_KEY = "wecom"
 _NO_STORE_HEADERS = {"Cache-Control": "no-store"}
 _SENSITIVE_PARTS = frozenset(
     {"authorization", "cookie", "credential", "password", "secret", "token"}
@@ -109,6 +112,44 @@ class CredentialReplaceRequest(_StrictModel):
 
 class TokenIssueRequest(_StrictModel):
     label: str = Field(default="", max_length=128)
+
+
+def _wecom_schema_name(connection_id: str) -> str:
+    digest = hashlib.sha256(connection_id.encode("utf-8")).hexdigest()[:12]
+    return f"wbd_{digest}"
+
+
+def _legacy_wecom_connection_id(tenant_id: str) -> str:
+    return str(uuid.uuid5(uuid.NAMESPACE_URL, f"wbsysc:legacy-wecom:{tenant_id}"))
+
+
+def _connection_public_config(
+    connector_key: str,
+    connection_id: str,
+    value: Mapping[str, Any],
+    *,
+    tenant_id: str = "",
+    current: Mapping[str, Any] | None = None,
+) -> dict[str, Any]:
+    config = dict(value)
+    if connector_key != WECOM_CONNECTOR_KEY:
+        return config
+    current_config = current or {}
+    current_schema = current_config.get("schema_name")
+    is_verified_legacy = (
+        bool(tenant_id)
+        and connection_id == _legacy_wecom_connection_id(tenant_id)
+        and current_config.get("legacy_source") == "tenant_config"
+        and isinstance(current_schema, str)
+        and bool(current_schema)
+    )
+    if is_verified_legacy:
+        config["schema_name"] = current_schema
+        config["legacy_source"] = "tenant_config"
+    else:
+        config["schema_name"] = _wecom_schema_name(connection_id)
+        config.pop("legacy_source", None)
+    return config
 
 
 class PolicyInput(_StrictModel):
@@ -810,24 +851,33 @@ def create_connection_use_case(
     if not isinstance(body.public_config, Mapping):
         _schema_error()
     credentials = _credentials(body.credentials)
+    connection_id = str(uuid.uuid4())
+    public_config = _connection_public_config(
+        body.connector_key,
+        connection_id,
+        body.public_config,
+        tenant_id=tenant_id,
+    )
     if body.connector_key == DECLARATIVE_CONNECTOR_KEY:
-        if body.status != "draft" or body.public_config or credentials:
+        if body.status != "draft" or public_config or credentials:
             _schema_error()
         spec = None
     else:
         spec = _spec(request, body.connector_key)
         if body.data_mode not in spec.supports_data_modes:
             _schema_error()
-        _validate_schema(body.public_config, spec.config_schema)
+        _validate_schema(public_config, spec.config_schema)
         _validate_schema(credentials, spec.credential_schema)
+    if body.connector_key == WECOM_CONNECTOR_KEY:
+        ensure_schema(public_config["schema_name"])
     record = ConnectionRecord(
-        connection_id=str(uuid.uuid4()),
+        connection_id=connection_id,
         tenant_id=tenant_id,
         connector_key=body.connector_key,
         display_name=body.display_name,
         status=body.status,
         data_mode=body.data_mode,
-        public_config=dict(body.public_config),
+        public_config=public_config,
         config_version=1,
     )
     try:
@@ -904,13 +954,22 @@ def update_connection_use_case(
         spec = _spec(request, current.connector_key)
     if body.data_mode not in spec.supports_data_modes or not isinstance(body.public_config, Mapping):
         _schema_error()
-    _validate_schema(body.public_config, spec.config_schema)
+    public_config = _connection_public_config(
+        current.connector_key,
+        connection_id,
+        body.public_config,
+        tenant_id=tenant_id,
+        current=current.public_config,
+    )
+    _validate_schema(public_config, spec.config_schema)
+    if current.connector_key == WECOM_CONNECTOR_KEY:
+        ensure_schema(public_config["schema_name"])
     updated = _mutate(store.update_connection,
         connection_id,
         tenant_id,
         display_name=body.display_name,
         data_mode=body.data_mode,
-        public_config=body.public_config,
+        public_config=public_config,
         status=body.status,
         expected_config_version=current.config_version,
     )
