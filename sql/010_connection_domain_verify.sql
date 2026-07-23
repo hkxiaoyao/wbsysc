@@ -63,4 +63,3 @@ JOIN `connection_instance` AS connection_row
      ) = 'tenant_config'
 SET verify_file.`connection_id` = connection_row.`connection_id`
 WHERE verify_file.`connection_id` IS NULL;
-
