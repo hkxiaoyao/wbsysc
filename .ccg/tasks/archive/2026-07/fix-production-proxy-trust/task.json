@@ -1,0 +1,12 @@
+{
+  "id": "fix-production-proxy-trust",
+  "title": "修复生产 HTTPS 写操作与租户会话不可用",
+  "status": "completed",
+  "complexity": "M",
+  "risk": "high",
+  "domain": "infrastructure",
+  "currentPhase": "completed",
+  "nextAction": "归档、提交、推送并部署验证",
+  "createdAt": "2026-07-24T00:15:00+08:00",
+  "branch": "main"
+}

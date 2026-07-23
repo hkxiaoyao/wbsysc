@@ -174,7 +174,9 @@ python tests/test_smoke_client.py
 
 ## 🎛 管理后台
 
-访问 `http://server_host_name:8001/admin/ui/`，单密码登录（`.env` 的 `ADMIN_PASSWORD`）。
+生产环境通过 `https://your-domain/admin/ui/` 访问，单密码登录（`.env` 的
+`ADMIN_PASSWORD`）。应用端口 8001 仅绑定宿主机回环地址，不支持绕过 Nginx
+直接访问。
 
 | API | 说明 |
 |-----|------|

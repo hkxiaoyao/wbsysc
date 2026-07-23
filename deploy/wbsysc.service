@@ -17,6 +17,7 @@ EnvironmentFile=/opt/wbsysc/.env
 # 单 worker（MCP session 粘性）；生产可加 --loop uvloop --http httptools
 ExecStart=/opt/wbsysc/.venv/bin/uvicorn app.main:app \
     --host 127.0.0.1 --port 8001 \
+    --proxy-headers --forwarded-allow-ips 127.0.0.1 \
     --workers 1 --no-access-log
 Restart=on-failure
 RestartSec=5s

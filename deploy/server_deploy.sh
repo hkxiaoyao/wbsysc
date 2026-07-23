@@ -468,8 +468,9 @@ trap - EXIT INT TERM
 
 echo ""
 echo "===== 完成 ====="
-echo "管理后台: http://<服务器IP>:8001/admin/ui/"
-echo "MCP地址:  http://<服务器IP>:8001/mcp   (workbuddy 用 Bearer Token 连)"
+echo "管理后台: https://<你的域名>/admin/ui/"
+echo "租户后台: https://<你的域名>/tenant/ui/"
+echo "MCP地址:  https://<你的域名>/mcp   (workbuddy 用 Bearer Token 连)"
 echo ""
 echo "下一步：在容器内接入第一个租户"
 echo "  docker compose exec wbsysc python -m app.tenant_init \\"

@@ -40,4 +40,5 @@ HEALTHCHECK --interval=30s --timeout=5s --start-period=10s --retries=3 \
 ENTRYPOINT ["/usr/bin/tini", "--"]
 # gunicorn/uvicorn 生产建议单进程+多worker uvloop；MCP session 需粘性，单 worker 最稳
 CMD ["uvicorn", "app.main:app", "--host", "0.0.0.0", "--port", "8001", \
+     "--proxy-headers", "--forwarded-allow-ips", "172.16.0.0/12", \
      "--workers", "1", "--no-access-log"]
