@@ -11,6 +11,13 @@ set -euo pipefail
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 APP_DIR="$(cd "$SCRIPT_DIR/.." && pwd)"
 
+trim_env_value() {
+  local value="$1"
+  value="${value#"${value%%[![:space:]]*}"}"
+  value="${value%"${value##*[![:space:]]}"}"
+  printf '%s' "$value"
+}
+
 read_env_value() {
   local key="$1"
   local line value
@@ -21,13 +28,47 @@ read_env_value() {
   fi
   value="${line#*=}"
   value="${value%$'\r'}"
-  value="${value#"${value%%[![:space:]]*}"}"
-  value="${value%"${value##*[![:space:]]}"}"
+  value="$(trim_env_value "$value")"
   if [[ "$value" == \"*\" && "$value" == *\" ]] ||
      [[ "$value" == \'*\' && "$value" == *\' ]]; then
     value="${value:1:${#value}-2}"
   fi
+  value="$(trim_env_value "$value")"
   printf '%s' "$value"
+}
+
+set_env_value() {
+  local key="$1"
+  local value="$2"
+  local temp_file
+  if ! temp_file="$(mktemp "$APP_DIR/.env.tmp.XXXXXX")"; then
+    return 1
+  fi
+  if ! awk -v key="$key" -v value="$value" '
+    BEGIN { replaced = 0 }
+    index($0, key "=") == 1 {
+      if (!replaced) {
+        print key "=" value
+        replaced = 1
+      }
+      next
+    }
+    { print }
+    END {
+      if (!replaced) print key "=" value
+    }
+  ' "$APP_DIR/.env" > "$temp_file"; then
+    rm -f -- "$temp_file"
+    return 1
+  fi
+  if ! chmod 600 "$temp_file"; then
+    rm -f -- "$temp_file"
+    return 1
+  fi
+  if ! mv -f -- "$temp_file" "$APP_DIR/.env"; then
+    rm -f -- "$temp_file"
+    return 1
+  fi
 }
 
 is_example_password() {
@@ -44,8 +85,42 @@ is_example_mcp_token_hmac_key() {
   esac
 }
 
+is_example_mcp_token_plaintext_key() {
+  case "$1" in
+    ""|"CHANGE_ME"|"<强随机串>"|"<独立强随机串>"|"MCP_TOKEN_PLAINTEXT_KEY"|"<MCP_TOKEN_PLAINTEXT_KEY>"|"PoC_DEFAULT_KEY_DO_NOT_USE_IN_PRODUCTION_32bytes!"|"replace_with_plaintext_key") return 0 ;;
+    *) return 1 ;;
+  esac
+}
+
 byte_length() {
   LC_ALL=C printf '%s' "$1" | wc -c | tr -d '[:space:]'
+}
+
+validate_positive_decimal() {
+  local target_name="$1"
+  local raw_value="$2"
+  local upper_bound="$3"
+  local normalized="$raw_value"
+  case "$normalized" in
+    ""|*[!0-9]*)
+      echo "❌ $target_name 必须为十进制正整数" >&2
+      return 1
+      ;;
+  esac
+  while [ "${normalized#0}" != "$normalized" ]; do
+    normalized="${normalized#0}"
+  done
+  normalized="${normalized:-0}"
+  if [ "$normalized" = "0" ]; then
+    echo "❌ $target_name 必须大于 0" >&2
+    return 1
+  fi
+  if [ "${#normalized}" -gt "${#upper_bound}" ] ||
+    { [ "${#normalized}" -eq "${#upper_bound}" ] && [[ "$normalized" > "$upper_bound" ]]; }; then
+    echo "❌ $target_name 超出允许上限 $upper_bound" >&2
+    return 1
+  fi
+  printf -v "$target_name" '%s' "$normalized"
 }
 
 echo "代码目录: $APP_DIR"
@@ -83,12 +158,13 @@ if [ ! -f .env ]; then
   echo "首次运行：生成 .env 模板，请编辑填入真实值后重新运行本脚本"
   cp .env.prod.example .env
   echo ""
-  echo "生产必填：APP_ENV=prod / WECOM_USE_MOCK=false / DB_PASSWORD / ADMIN_PASSWORD / CREDENTIAL_KEY / MCP_TOKEN_HMAC_KEY"
+  echo "生产必填：APP_ENV=prod / WECOM_USE_MOCK=false / DB_PASSWORD / ADMIN_PASSWORD / CREDENTIAL_KEY / MCP_TOKEN_HMAC_KEY / MCP_TOKEN_PLAINTEXT_KEY / MCP_SERVICE_ENABLED"
   echo "  ADMIN_PASSWORD = 管理后台登录强密码"
   echo "  DB_PASSWORD    = MySQL websysc 账户密码（需与 MySQL 一致）"
   echo "  DB_HOST 已默认 host.docker.internal（同台部署容器访问宿主MySQL）"
   echo "  CREDENTIAL_KEY 和 MCP_TOKEN_HMAC_KEY 可保留模板占位符，下次运行会分别自动生成 32 字节以上强密钥"
-  echo "  两把密钥必须保持独立；弱的自定义值会被拒绝"
+  echo "  MCP_TOKEN_PLAINTEXT_KEY 必须在首次启用前手工配置，部署脚本不会生成或轮换它"
+  echo "  三把密钥必须两两独立；弱的自定义值会被拒绝"
   echo ""
   echo "编辑：vim $APP_DIR/.env"
   exit 1
@@ -139,6 +215,10 @@ if is_example_mcp_token_hmac_key "$MCP_TOKEN_HMAC_KEY"; then
   echo "✓ 已自动生成 MCP_TOKEN_HMAC_KEY"
 fi
 
+# Reveal ciphertext depends on this exact key. Never generate or rotate it here.
+MCP_TOKEN_PLAINTEXT_KEY="$(read_env_value MCP_TOKEN_PLAINTEXT_KEY)"
+REQUESTED_MCP_SERVICE_ENABLED="$(read_env_value MCP_SERVICE_ENABLED)"
+
 chmod 600 .env
 
 CONFIG_INVALID=0
@@ -184,12 +264,94 @@ if [ "$MCP_TOKEN_HMAC_KEY" = "$CREDENTIAL_KEY" ]; then
   echo "❌ MCP_TOKEN_HMAC_KEY 必须与 CREDENTIAL_KEY 保持独立"
   CONFIG_INVALID=1
 fi
+if is_example_mcp_token_plaintext_key "$MCP_TOKEN_PLAINTEXT_KEY" || [ "$(byte_length "$MCP_TOKEN_PLAINTEXT_KEY")" -lt 32 ]; then
+  echo "❌ MCP_TOKEN_PLAINTEXT_KEY 必须为非示例值且至少 32 UTF-8 字节"
+  CONFIG_INVALID=1
+fi
+if [ "$MCP_TOKEN_PLAINTEXT_KEY" = "$CREDENTIAL_KEY" ] || [ "$MCP_TOKEN_PLAINTEXT_KEY" = "$MCP_TOKEN_HMAC_KEY" ]; then
+  echo "❌ MCP_TOKEN_PLAINTEXT_KEY 必须与 CREDENTIAL_KEY 和 MCP_TOKEN_HMAC_KEY 两两独立"
+  CONFIG_INVALID=1
+fi
+case "$REQUESTED_MCP_SERVICE_ENABLED" in
+  "true"|"false") ;;
+  *)
+    echo "❌ MCP_SERVICE_ENABLED 必须明确设置为 true 或 false"
+    CONFIG_INVALID=1
+    ;;
+esac
 if [ "$CONFIG_INVALID" -ne 0 ]; then
   echo "❌ .env 生产配置校验失败，尚未拉取镜像或启动应用"
   exit 1
 fi
-unset ADMIN_PASSWORD CREDENTIAL_KEY MCP_TOKEN_HMAC_KEY
+unset ADMIN_PASSWORD CREDENTIAL_KEY MCP_TOKEN_HMAC_KEY MCP_TOKEN_PLAINTEXT_KEY
 echo "✓ .env 生产配置校验通过"
+
+validate_positive_decimal HEALTH_MAX_ATTEMPTS "${HEALTH_MAX_ATTEMPTS:-30}" 60
+validate_positive_decimal HEALTH_RETRY_SECONDS "${HEALTH_RETRY_SECONDS:-2}" 10
+
+wait_for_health_state() {
+  local expected="$1"
+  local attempt
+  local health_body
+  for ((attempt = 1; attempt <= HEALTH_MAX_ATTEMPTS; attempt++)); do
+    if health_body="$(curl -fsS http://127.0.0.1:8001/health 2>/dev/null)" &&
+      printf '%s' "$health_body" | grep -Eq '"status"[[:space:]]*:[[:space:]]*"ok"' &&
+      printf '%s' "$health_body" | grep -Eq "\"mcp_service_enabled\"[[:space:]]*:[[:space:]]*$expected[[:space:]]*[,}]"; then
+      return 0
+    fi
+    if [ "$attempt" -lt "$HEALTH_MAX_ATTEMPTS" ]; then
+      sleep "$HEALTH_RETRY_SECONDS"
+    fi
+  done
+  return 1
+}
+
+rollback_service_flag() {
+  echo "⚠️  发布未完成，正在恢复并验证 MCP 服务禁用状态"
+  if ! set_env_value MCP_SERVICE_ENABLED false; then
+    echo "❌ 严重：无法原子写入禁用状态"
+    return 1
+  fi
+  # Always recreate: the pre-deploy process may still be effectively enabled
+  # even though the environment file now requests false.
+  if ! docker compose up -d --force-recreate; then
+    echo "❌ 严重：禁用状态容器重建失败；配置已保持 false"
+    return 1
+  fi
+  if ! wait_for_health_state false; then
+    echo "❌ 严重：禁用状态健康恢复失败；配置已保持 false"
+    return 1
+  fi
+  echo "✓ 已恢复 MCP 服务禁用状态；数据库和 008 数据均保留"
+}
+
+rollout_exit() {
+  local original_status="$1"
+  trap - EXIT INT TERM
+  if [ "$original_status" -eq 0 ] || [ "${ROLLOUT_COMPLETE:-0}" -eq 1 ]; then
+    exit "$original_status"
+  fi
+  if ! rollback_service_flag; then
+    echo "❌ 严重：发布失败，且禁用状态恢复未通过验证"
+  fi
+  exit "$original_status"
+}
+
+rollout_signal() {
+  local signal_status="$1"
+  trap - INT TERM
+  exit "$signal_status"
+}
+
+ROLLOUT_COMPLETE=0
+trap 'rollout_exit "$?"' EXIT
+trap 'rollout_signal 130' INT
+trap 'rollout_signal 143' TERM
+
+# A requested true rollout must still start in the disabled state. This atomic
+# write happens before any new image is started and retains all schema/data.
+# BEGIN ROLLOUT MUTATIONS
+set_env_value MCP_SERVICE_ENABLED false
 
 ENV_MIGRATION_HOST="$(read_env_value DB_MIGRATION_HOST)"
 MIGRATION_HOST="${DB_MIGRATION_HOST:-${ENV_MIGRATION_HOST:-127.0.0.1}}"
@@ -224,6 +386,8 @@ MIGRATIONS=(
   "sql/004_gateway_hardening.sql"
   "sql/005_mcp_call_log.sql"
   "sql/006_connection_platform.sql"
+  "sql/007_tenant_auth.sql"
+  "sql/008_mcp_service.sql"
 )
 for migration in "${MIGRATIONS[@]}"; do
   if [ ! -f "$APP_DIR/$migration" ]; then
@@ -232,7 +396,7 @@ for migration in "${MIGRATIONS[@]}"; do
   fi
 done
 
-echo "使用宿主 mysql CLI 按 004 → 005 → 006 执行迁移（迁移主机默认 127.0.0.1，可用 DB_MIGRATION_HOST 覆盖）"
+echo "使用宿主 mysql CLI 按 004 → 005 → 006 → 007 → 008 执行迁移（迁移主机默认 127.0.0.1，可用 DB_MIGRATION_HOST 覆盖）"
 for migration in "${MIGRATIONS[@]}"; do
   echo "执行 $migration"
   if ! MYSQL_PWD="$DB_MIGRATION_PASSWORD" mysql --protocol=TCP \
@@ -243,7 +407,7 @@ for migration in "${MIGRATIONS[@]}"; do
   fi
 done
 unset DB_PASSWORD DB_MIGRATION_USER DB_MIGRATION_PASSWORD
-echo "✓ 004、005、006 数据库迁移完成"
+echo "✓ 004、005、006、007、008 数据库迁移完成"
 
 echo ""
 echo "===== 5. 拉取镜像（GitHub Actions 已构建推送到 GHCR） ====="
@@ -271,26 +435,34 @@ docker images | grep wbsysc | head -2 || true
 
 echo ""
 echo "===== 6. 启动 ====="
-docker compose up -d
+docker compose up -d --force-recreate
 
 echo ""
-echo "===== 7. 等待健康检查 ====="
-sleep 10
-docker compose ps
-
-echo ""
-echo "===== 8. 验证 ====="
-if curl -fs http://127.0.0.1:8001/health 2>/dev/null; then
-  echo ""
-  echo "✅ 部署成功"
-else
-  echo "❌ 健康检查未通过，部署失败"
-  echo "===== 容器状态 ====="
+echo "===== 7. 验证禁用阶段 ====="
+if ! wait_for_health_state false; then
+  echo "❌ 禁用阶段健康检查未通过，部署失败（MCP_SERVICE_ENABLED 保持 false）"
   docker compose ps || true
-  echo "===== 最近日志 ====="
-  docker compose logs --tail=50 || true
   exit 1
 fi
+echo "✓ 禁用阶段健康检查通过"
+
+if [ "$REQUESTED_MCP_SERVICE_ENABLED" = "true" ]; then
+  echo ""
+  echo "===== 8. 启用 MCP 服务并验证 ====="
+  set_env_value MCP_SERVICE_ENABLED true
+  docker compose up -d --force-recreate
+  if ! wait_for_health_state true; then
+    echo "❌ MCP 服务启用阶段健康检查未通过"
+    exit 1
+  fi
+  echo "✓ MCP 服务启用阶段健康检查通过"
+else
+  echo "✓ MCP 服务按请求保持禁用"
+fi
+
+docker compose ps
+ROLLOUT_COMPLETE=1
+trap - EXIT INT TERM
 
 echo ""
 echo "===== 完成 ====="

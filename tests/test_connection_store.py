@@ -34,6 +34,7 @@ class Result:
 class FakeConnection:
     def __init__(self):
         self.statements = []
+        self.tenant_enabled = True
 
     def __enter__(self):
         return self
@@ -44,7 +45,17 @@ class FakeConnection:
     def execute(self, statement, params=None):
         params = params or {}
         self.statements.append((str(statement), params))
+        if "SELECT enabled FROM tenant_config" in str(statement):
+            return Result(
+                scalar_value=1
+                if params.get("tenant_id") == "tenant-a" and self.tenant_enabled
+                else None
+            )
+        if "SELECT tenant_id FROM connection_instance" in str(statement):
+            return Result(scalar_value="tenant-a" if params.get("connection_id") == "conn-a" else None)
         if "FROM connection_token" in str(statement):
+            if "JOIN tenant_config tenant_row" in str(statement) and not self.tenant_enabled:
+                return Result()
             if params["connection_id"] == "conn-a":
                 return Result(
                     {
@@ -78,6 +89,8 @@ class LockedMutationConnection(FakeConnection):
         params = params or {}
         sql = str(statement)
         self.statements.append((sql, params))
+        if "SELECT enabled FROM tenant_config" in sql:
+            return Result(scalar_value=1)
         if "SELECT connection_id, tenant_id, connector_key" in sql:
             return Result(
                 {
@@ -222,6 +235,8 @@ def test_direct_policy_write_makes_a_concurrent_activation_cas_stale(monkeypatch
             params = params or {}
             sql = str(statement)
             self.statements.append((sql, params))
+            if "SELECT enabled FROM tenant_config" in sql:
+                return Result(scalar_value=1)
             if "SELECT config_version" in sql:
                 return Result(scalar_value=self.version)
             if sql.lstrip().startswith("UPDATE connection_instance SET config_version"):
@@ -274,6 +289,8 @@ def test_replacement_mutations_lock_connection_version_before_writes(monkeypatch
             self.statements.append((sql, params))
             if "SELECT config_version" in sql:
                 return Result(scalar_value=7)
+            if "SELECT enabled FROM tenant_config" in sql:
+                return Result(scalar_value=1)
             if "SELECT tenant_id" in sql:
                 return Result(scalar_value="tenant-a")
             return Result()
@@ -296,13 +313,16 @@ def test_replacement_mutations_lock_connection_version_before_writes(monkeypatch
         ),
     )
 
-    for call in calls:
+    for index, call in enumerate(calls):
         connection = VersionLockConnection()
         monkeypatch.setattr(db, "get_engine", lambda: FakeEngine(connection))
 
         assert call()
         first_sql, _ = connection.statements[0]
-        assert "SELECT config_version" in first_sql
+        if index == 1:
+            assert "SELECT enabled FROM tenant_config" in first_sql
+        else:
+            assert "SELECT config_version" in first_sql
         assert "FOR UPDATE" in first_sql
         assert "plain-secret" not in repr(connection.statements)
 
@@ -457,6 +477,8 @@ def test_declarative_lifecycle_rejects_stale_connection_version_before_revision_
             params = params or {}
             sql = str(statement)
             self.statements.append((sql, params))
+            if "SELECT enabled FROM tenant_config" in sql:
+                return Result(scalar_value=1)
             if "FROM connection_instance" in sql:
                 return Result(
                     {
@@ -497,7 +519,10 @@ def test_declarative_lifecycle_rejects_stale_connection_version_before_revision_
     finally:
         store.unregister_connection_cache_invalidator(invalidator)
 
-    assert len(connection.statements) == 1
+    assert len(connection.statements) == (2 if operation == "activate" else 1)
+    if operation == "activate":
+        assert "FROM tenant_config" in connection.statements[0][0]
+        assert "FROM connection_instance" in connection.statements[1][0]
     assert events == []
 
 
@@ -507,6 +532,8 @@ def test_activation_rejects_a_published_revision_that_is_not_staged(monkeypatch)
             params = params or {}
             sql = str(statement)
             self.statements.append((sql, params))
+            if "SELECT enabled FROM tenant_config" in sql:
+                return Result(scalar_value=1)
             if "FROM connection_instance" in sql:
                 return Result(
                     {
@@ -534,7 +561,9 @@ def test_activation_rejects_a_published_revision_that_is_not_staged(monkeypatch)
             expected_config_version=7,
         )
 
-    assert len(connection.statements) == 1
+    assert len(connection.statements) == 2
+    assert "FROM tenant_config" in connection.statements[0][0]
+    assert "FROM connection_instance" in connection.statements[1][0]
 
 
 class LegacyBackfillConnection(FakeConnection):
@@ -648,6 +677,10 @@ class MutationConnection(FakeConnection):
         params = params or {}
         sql = str(statement)
         self.statements.append((sql, params))
+        if "SELECT enabled FROM tenant_config" in sql:
+            return Result(scalar_value=1)
+        if "SELECT tenant_id FROM connection_instance" in sql:
+            return Result(scalar_value="tenant-a")
         if "SELECT config_version FROM connection_instance" in sql:
             return Result(scalar_value=7)
         if self.fail_policy_write and "INSERT INTO connection_tool_policy" in sql:
@@ -665,6 +698,26 @@ def test_token_resolution_requires_matching_connection_id(monkeypatch):
     assert store.resolve_connection_token("token-a", "conn-a").connection_id == "conn-a"
     assert store.resolve_connection_token("token-a", "conn-b") is None
     assert token.raw_value == "token-a"
+    resolver_sql = next(
+        sql for sql, _ in fake_connection.statements
+        if "FROM connection_token" in sql
+    )
+    assert "JOIN tenant_config tenant_row" in resolver_sql
+    assert "tenant_row.enabled=1" in resolver_sql
+
+
+def test_connection_token_and_issue_fail_after_tenant_authorization_root_is_gone(
+    monkeypatch,
+):
+    fake_connection = FakeConnection()
+    monkeypatch.setattr(db, "get_engine", lambda: FakeEngine(fake_connection))
+    monkeypatch.setattr(store, "token_hmac", lambda raw_token: "a" * 64)
+    issued = store.issue_token("conn-a", "token-a")
+    fake_connection.tenant_enabled = False
+
+    assert store.resolve_connection_token(issued.raw_value, "conn-a") is None
+    with pytest.raises(ValueError, match="tenant is not active"):
+        store.issue_token("conn-a", "token-after-delete")
 
 
 def test_token_row_never_contains_raw_value(monkeypatch):
@@ -784,6 +837,28 @@ def test_create_connection_binds_public_config_and_encrypts_credentials(monkeypa
     assert connection_params["tenant_id"] == "tenant-a"
     assert credential_params["encrypted_value"] == b"ciphertext"
     assert "plain-secret" not in repr(credential_params)
+
+
+def test_create_connection_rejects_reserved_service_id_before_storage(monkeypatch):
+    from app.connections.models import ConnectionRecord
+
+    fake_connection = FakeConnection()
+    monkeypatch.setattr(db, "get_engine", lambda: FakeEngine(fake_connection))
+    record = ConnectionRecord(
+        connection_id="service",
+        tenant_id="tenant-a",
+        connector_key="wecom",
+        display_name="Reserved",
+        status="draft",
+        data_mode="stored",
+        public_config={},
+        config_version=1,
+    )
+
+    with pytest.raises(ValueError, match="reserved connection_id"):
+        store.create_connection(record)
+
+    assert fake_connection.statements == []
 
 
 def test_ensure_connection_tables_uses_mysql57_compatible_ddl(monkeypatch):

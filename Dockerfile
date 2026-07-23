@@ -2,9 +2,9 @@
 FROM node:20-alpine AS frontend
 WORKDIR /ui
 # 先拷依赖清单，利用层缓存（vite.config.js 的 outDir=../app/static/dist）
-COPY admin-ui/package.json admin-ui/pnpm-lock.yaml* ./
-RUN corepack enable && corepack prepare pnpm@10 --activate \
-    && pnpm install --frozen-lockfile || pnpm install
+COPY admin-ui/package.json admin-ui/pnpm-lock.yaml ./
+RUN corepack enable && corepack prepare pnpm@10.34.5 --activate \
+    && pnpm install --frozen-lockfile
 # 拷源码 + vite 配置 → 构建产物输出到 /ui/../app/static/dist 即 /app/static/dist
 COPY admin-ui/ ./
 COPY admin-ui/vite.config.js ./

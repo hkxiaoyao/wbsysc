@@ -6,18 +6,17 @@
 """
 from __future__ import annotations
 
-import hashlib
 import logging
 import secrets
 import time
 from typing import Literal, Optional
 
 from fastapi import APIRouter, File, Form, HTTPException, Request, Response, UploadFile
-from pydantic import BaseModel
+from pydantic import BaseModel, SecretStr
 from sqlalchemy import text
 
 from .config import get_settings
-from .crypto import encrypt_secret, decrypt_secret
+from .crypto import encrypt_secret
 from .db import get_engine, ensure_schema
 from .domain_verify import (
     delete_verify_by_tenant,
@@ -27,7 +26,14 @@ from .domain_verify import (
     save_verify_file,
 )
 from .tenant import _hash_corpid, reload_tenants
-from .wecom.dispatch import run_sync_all
+from .tenant_auth import store as tenant_auth_store
+from .tenant_auth.dependencies import require_same_origin
+from .tenant_auth.passwords import validate_password
+from .tenant_lifecycle import (
+    TenantNotFoundError,
+    invalidate_retired_tenant,
+    retire_tenant,
+)
 
 router = APIRouter(prefix="/admin", tags=["admin"])
 logger = logging.getLogger("wecom-gateway")
@@ -113,6 +119,74 @@ class TenantUpsert(BaseModel):
     checkin_userids: str = ""
     trusted_domain: str = ""  # 反代对外域名，如 mcp.example.com
     enabled: bool = True
+    tenant_password: Optional[SecretStr] = None
+
+
+class TenantPasswordRequest(BaseModel):
+    password: SecretStr
+
+
+class TenantLoginStatusRequest(BaseModel):
+    status: Literal["active", "disabled"]
+
+
+def _tenant_exists(tenant_id: str) -> bool:
+    with get_engine().connect() as conn:
+        row = conn.execute(
+            text("SELECT 1 FROM tenant_config WHERE tenant_id=:tenant_id"),
+            {"tenant_id": tenant_id},
+        ).fetchone()
+    return row is not None
+
+
+def _tenant_enabled(tenant_id: str) -> bool:
+    with get_engine().connect() as conn:
+        row = conn.execute(
+            text("SELECT enabled FROM tenant_config WHERE tenant_id=:tenant_id"),
+            {"tenant_id": tenant_id},
+        ).fetchone()
+    return bool(row and row[0])
+
+
+def _fetchone(result):
+    fetchone = getattr(result, "fetchone", None)
+    return fetchone() if callable(fetchone) else None
+
+
+@router.put("/tenants/{tenant_id}/login-password")
+def reset_tenant_login_password(
+    tenant_id: str,
+    body: TenantPasswordRequest,
+    request: Request,
+):
+    _require_auth(request)
+    require_same_origin(request)
+    if not _tenant_exists(tenant_id):
+        raise HTTPException(404, "租户不存在")
+    try:
+        tenant_auth_store.upsert_account(
+            tenant_id,
+            body.password.get_secret_value(),
+            status="active" if _tenant_enabled(tenant_id) else "disabled",
+        )
+    except ValueError:
+        raise HTTPException(422, "密码不符合要求") from None
+    return {"ok": True}
+
+
+@router.put("/tenants/{tenant_id}/login-status")
+def set_tenant_login_status(
+    tenant_id: str,
+    body: TenantLoginStatusRequest,
+    request: Request,
+):
+    _require_auth(request)
+    require_same_origin(request)
+    if not _tenant_exists(tenant_id):
+        raise HTTPException(404, "租户不存在")
+    if not tenant_auth_store.set_account_status(tenant_id, body.status):
+        raise HTTPException(409, "租户尚未设置登录密码")
+    return {"ok": True, "status": body.status}
 
 
 def _mcp_token_hint(token: str) -> str:
@@ -157,6 +231,8 @@ def _tenant_item(r) -> dict:
         "created_at": str(r[11]), "updated_at": str(r[12]),
         "trusted_domain": (r[13] if len(r) > 13 else "") or "",
         "data_mode": (r[14] if len(r) > 14 else "stored") or "stored",
+        "has_login_account": bool(r[15]) if len(r) > 15 else False,
+        "login_status": r[16] if len(r) > 16 and r[15] else None,
         "verify_filename": "",
         "verify_url": "",
     }
@@ -186,16 +262,25 @@ def list_tenants(request: Request):
                          sync_interval_min, enabled_modules, checkin_userids,
                          IFNULL(contact_secret_encrypted IS NOT NULL, 0) AS has_contact_secret,
                          IFNULL(secret_encrypted IS NOT NULL, 0) AS has_secret,
-                         enabled, created_at, updated_at,
+                         enabled, tenant_config.created_at, tenant_config.updated_at,
                          IFNULL(trusted_domain, '') AS trusted_domain,
-                         IFNULL(data_mode, 'stored') AS data_mode
-                  FROM tenant_config ORDER BY created_at""")
+                         IFNULL(data_mode, 'stored') AS data_mode,
+                         IF(tenant_account.tenant_id IS NULL, 0, 1) AS has_login_account,
+                         tenant_account.status AS login_status
+                  FROM tenant_config
+                  LEFT JOIN tenant_account USING (tenant_id)
+                  ORDER BY tenant_config.created_at""")
     sql_legacy = text("""SELECT tenant_id, display_name, corpid, mcp_token, schema_name,
                          sync_interval_min, enabled_modules, checkin_userids,
                          IFNULL(contact_secret_encrypted IS NOT NULL, 0) AS has_contact_secret,
                          IFNULL(secret_encrypted IS NOT NULL, 0) AS has_secret,
-                         enabled, created_at, updated_at
-                  FROM tenant_config ORDER BY created_at""")
+                         enabled, tenant_config.created_at, tenant_config.updated_at,
+                         '', 'stored',
+                         IF(tenant_account.tenant_id IS NULL, 0, 1) AS has_login_account,
+                         tenant_account.status AS login_status
+                  FROM tenant_config
+                  LEFT JOIN tenant_account USING (tenant_id)
+                  ORDER BY tenant_config.created_at""")
     with get_engine().connect() as conn:
         try:
             rows = conn.execute(sql_full).fetchall()
@@ -226,6 +311,8 @@ def list_tenants(request: Request):
                 "created_at": str(r[11]), "updated_at": str(r[12]),
                 "trusted_domain": (r[13] if len(r) > 13 else "") or "",
                 "data_mode": (r[14] if len(r) > 14 else "stored") or "stored",
+                "has_login_account": bool(r[15]) if len(r) > 15 else False,
+                "login_status": r[16] if len(r) > 16 and r[15] else None,
                 "verify_filename": "",
                 "verify_url": "",
             })
@@ -255,11 +342,18 @@ def get_mcp_config(tenant_id: str, request: Request, response: Response):
 def create_tenant(body: TenantUpsert, request: Request):
     """新增租户：写配置 + 建 schema + 刷缓存"""
     _require_auth(request)
+    if body.tenant_password is not None:
+        require_same_origin(request)
     if not body.secret:
         raise HTTPException(400, "新增租户必须填 secret")
     if not body.mcp_token:
         raise HTTPException(400, "新增租户必须填 MCP Token")
     _validate_mcp_token(body.mcp_token)
+    if body.tenant_password is not None:
+        try:
+            validate_password(body.tenant_password.get_secret_value())
+        except ValueError:
+            raise HTTPException(422, "租户登录密码不符合要求") from None
     ensure_domain_tables()
     try:
         trusted_domain = normalize_domain(body.trusted_domain) if body.trusted_domain else ""
@@ -277,8 +371,33 @@ def create_tenant(body: TenantUpsert, request: Request):
              trusted_domain, data_mode, enabled)
         VALUES (:t,:dn,:c,:se,:mt,:sn,:si,:em,:cu,:cs,:td,:dm,:en)
     """)
-    try:
-        with eng.begin() as conn:
+    with eng.begin() as conn:
+        try:
+            existing_tenant = _fetchone(conn.execute(
+                text("""
+                    SELECT tenant_id FROM tenant_config
+                    WHERE tenant_id=:t LIMIT 1 FOR UPDATE
+                """),
+                {"t": body.tenant_id},
+            ))
+            if existing_tenant is not None:
+                raise HTTPException(409, "租户 ID 已存在")
+            retained_connection = _fetchone(conn.execute(
+                text("""
+                    SELECT connection_id FROM connection_instance
+                    WHERE tenant_id=:t ORDER BY connection_id LIMIT 1 FOR UPDATE
+                """),
+                {"t": body.tenant_id},
+            ))
+            retained_service = _fetchone(conn.execute(
+                text("""
+                    SELECT service_id FROM mcp_service
+                    WHERE tenant_id=:t ORDER BY service_id LIMIT 1 FOR UPDATE
+                """),
+                {"t": body.tenant_id},
+            ))
+            if retained_connection is not None or retained_service is not None:
+                raise HTTPException(409, "租户 ID 存在保留历史，不能直接重建")
             conn.execute(sql, {
                 "t": body.tenant_id, "dn": body.display_name, "c": body.corpid,
                 "se": enc, "mt": body.mcp_token, "sn": schema_name, "si": body.sync_interval_min,
@@ -286,17 +405,30 @@ def create_tenant(body: TenantUpsert, request: Request):
                 "cs": contact_enc, "td": trusted_domain, "dm": body.data_mode,
                 "en": 1 if body.enabled else 0,
             })
-    except Exception as exc:
-        logger.warning(
-            "tenant create write failed tenant=%s error_type=%s",
-            body.tenant_id,
-            type(exc).__name__,
-        )
-        raise HTTPException(
-            400,
-            "写入失败，可能租户 ID、企业 ID 或 MCP Token 重复",
-        ) from None
-
+        except HTTPException:
+            raise
+        except Exception as exc:
+            logger.warning(
+                "tenant create write failed tenant=%s error_type=%s",
+                body.tenant_id,
+                type(exc).__name__,
+            )
+            raise HTTPException(
+                400,
+                "写入失败，可能租户 ID、企业 ID 或 MCP Token 重复",
+            ) from None
+        if body.tenant_password is not None:
+            try:
+                tenant_auth_store.upsert_account(
+                    body.tenant_id,
+                    body.tenant_password.get_secret_value(),
+                    status="active" if body.enabled else "disabled",
+                    conn=conn,
+                )
+            except ValueError:
+                raise HTTPException(422, "租户登录密码不符合要求") from None
+    # Schema DDL is intentionally post-commit: never drop committed config/account
+    # as compensation. A failed idempotent provisioning call is retried by update.
     ensure_schema(schema_name)   # 建该租户 schema + 业务表
     reload_tenants()
     return {"ok": True, "schema_name": schema_name, "trusted_domain": trusted_domain}
@@ -306,8 +438,15 @@ def create_tenant(body: TenantUpsert, request: Request):
 def update_tenant(tenant_id: str, body: TenantUpsert, request: Request):
     """编辑租户：留空的 secret/contact_secret 不修改（保持原值）"""
     _require_auth(request)
+    if body.tenant_password is not None:
+        require_same_origin(request)
     if body.mcp_token:
         _validate_mcp_token(body.mcp_token)
+    if body.tenant_password is not None:
+        try:
+            validate_password(body.tenant_password.get_secret_value())
+        except ValueError:
+            raise HTTPException(422, "租户登录密码不符合要求") from None
     ensure_domain_tables()
     eng = get_engine()
     try:
@@ -356,6 +495,17 @@ def update_tenant(tenant_id: str, body: TenantUpsert, request: Request):
                 text("UPDATE domain_verify_file SET trusted_domain=:d WHERE tenant_id=:t"),
                 {"d": trusted_domain, "t": tenant_id},
             )
+        account_status = "active" if body.enabled else "disabled"
+        if body.tenant_password is not None:
+            tenant_auth_store.upsert_account(
+                tenant_id,
+                body.tenant_password.get_secret_value(),
+                status=account_status,
+                conn=conn,
+            )
+        elif not body.enabled:
+            tenant_auth_store.set_account_status(tenant_id, "disabled", conn=conn)
+    # Keep DDL outside the data transaction; retry is safe and cleanup is non-destructive.
     ensure_schema(new_schema)   # 新 schema 建表（若改了 corpid）
     reload_tenants()
     return {"ok": True, "trusted_domain": trusted_domain}
@@ -363,17 +513,25 @@ def update_tenant(tenant_id: str, body: TenantUpsert, request: Request):
 
 @router.delete("/tenants/{tenant_id}")
 def delete_tenant(tenant_id: str, request: Request):
-    """删除租户配置（保留历史数据 schema，需另行手动删）"""
+    """Atomically retire authorization while preserving historical data."""
     _require_auth(request)
-    with get_engine().begin() as conn:
-        r = conn.execute(text("DELETE FROM tenant_config WHERE tenant_id=:t"), {"t": tenant_id})
-    if r.rowcount == 0:
-        raise HTTPException(404, "租户不存在")
     try:
-        delete_verify_by_tenant(tenant_id)
-    except Exception:
-        pass
-    reload_tenants()
+        retirement = retire_tenant(
+            tenant_id,
+            request_id=request.headers.get("x-request-id", ""),
+            client_ip=request.client.host if request.client else "",
+            http_method=request.method,
+        )
+    except TenantNotFoundError:
+        raise HTTPException(404, "租户不存在") from None
+    except Exception as exc:
+        logger.warning(
+            "tenant retirement failed tenant=%s error_type=%s",
+            tenant_id,
+            type(exc).__name__,
+        )
+        raise HTTPException(409, "租户删除失败，请重试") from None
+    invalidate_retired_tenant(retirement, reload_tenants=reload_tenants)
     return {"ok": True}
 
 

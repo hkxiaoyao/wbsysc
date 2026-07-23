@@ -2,8 +2,11 @@ import test from 'node:test'
 import assert from 'node:assert/strict'
 import {
   buildConnectionMcpConfig,
+  apiClientEndpoint,
   canEnableWriteTool,
   closeTokenModal,
+  connectionCollectionEndpoint,
+  connectionResourceEndpoint,
   createConnectionMutationSequence,
   createRequestSequence,
   createWizardState,
@@ -19,6 +22,25 @@ import {
   setExplicitToolPolicy,
   wizardRevisionIdentity,
 } from './connectionView.js'
+
+test('tenant connection endpoints never use admin tenant routes', () => {
+  assert.equal(connectionCollectionEndpoint('tenant', ''), '/tenant/connections')
+  assert.equal(connectionCollectionEndpoint('tenant', 'tenant-b'), '/tenant/connections')
+  assert.equal(connectionResourceEndpoint('tenant', 'conn/a', 'tools'), '/tenant/connections/conn%2Fa/tools')
+})
+
+test('admin connection endpoint serialization remains unchanged', () => {
+  assert.equal(
+    connectionCollectionEndpoint('admin', 'tenant /a'),
+    '/admin/tenants/tenant%20%2Fa/connections',
+  )
+  assert.equal(connectionResourceEndpoint('admin', 'conn/a'), '/admin/connections/conn%2Fa')
+})
+
+test('tenant API base URL does not duplicate the tenant path prefix', () => {
+  assert.equal(apiClientEndpoint({ defaults: { baseURL: '/tenant' } }, '/tenant/connections'), '/connections')
+  assert.equal(apiClientEndpoint({ defaults: { baseURL: '' } }, '/admin/tenants'), '/admin/tenants')
+})
 
 test('buildConnectionMcpConfig uses the encoded instance-specific endpoint', () => {
   const config = JSON.parse(buildConnectionMcpConfig(

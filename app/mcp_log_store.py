@@ -4,6 +4,7 @@ from __future__ import annotations
 import logging
 import math
 import uuid
+from contextlib import nullcontext
 from dataclasses import replace
 from datetime import datetime, timedelta, timezone
 from typing import Any
@@ -25,9 +26,11 @@ _LOG_TABLE_DDL = """
 CREATE TABLE IF NOT EXISTS `mcp_call_log` (
   `id` BIGINT NOT NULL AUTO_INCREMENT,
   `tenant_id` VARCHAR(64) NOT NULL DEFAULT '',
+  `service_id` VARCHAR(64) NULL,
   `connection_id` VARCHAR(64) NULL,
   `connector_key` VARCHAR(64) NULL,
   `tool_key` VARCHAR(128) NULL,
+  `tool_alias` VARCHAR(128) NULL,
   `category` VARCHAR(16) NOT NULL,
   `event_name` VARCHAR(96) NOT NULL,
   `target` VARCHAR(256) NOT NULL DEFAULT '',
@@ -45,6 +48,8 @@ CREATE TABLE IF NOT EXISTS `mcp_call_log` (
   `created_at` DATETIME(6) NOT NULL DEFAULT CURRENT_TIMESTAMP(6),
   PRIMARY KEY (`id`),
   KEY `idx_mcp_log_tenant_created` (`tenant_id`, `created_at`, `id`),
+  KEY `idx_mcp_log_service_created` (`tenant_id`, `service_id`, `created_at`, `id`),
+  KEY `idx_mcp_log_alias_created` (`service_id`, `tool_alias`, `created_at`, `id`),
   KEY `idx_mcp_log_connection_created` (`tenant_id`, `connection_id`, `created_at`, `id`),
   KEY `idx_mcp_log_connector_created` (`connector_key`, `created_at`, `id`),
   KEY `idx_mcp_log_tool_created` (`tool_key`, `created_at`, `id`),
@@ -68,17 +73,28 @@ CREATE TABLE IF NOT EXISTS `gateway_setting` (
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4
 """
 
-_SAFE_COLUMNS = """id, tenant_id, category, event_name, target, params_summary,
-connection_id, connector_key, tool_key, result_status, error_code, error_summary,
+_SAFE_COLUMNS = """id, tenant_id, service_id, tool_alias, category, event_name,
+target, params_summary, connection_id, connector_key, tool_key,
+result_status, error_code, error_summary,
 cost_ms, request_id, client_ip, http_method, http_status, created_at"""
 _TREND_BUCKET_EXPRESSION = "DATE_FORMAT(created_at, '%Y-%m-%d %H:00:00')"
 
 _DIMENSION_COLUMN_DDLS = {
-    "connection_id": "ADD COLUMN `connection_id` VARCHAR(64) NULL AFTER `tenant_id`",
+    "service_id": "ADD COLUMN `service_id` VARCHAR(64) NULL AFTER `tenant_id`",
+    "connection_id": "ADD COLUMN `connection_id` VARCHAR(64) NULL AFTER `service_id`",
     "connector_key": "ADD COLUMN `connector_key` VARCHAR(64) NULL AFTER `connection_id`",
     "tool_key": "ADD COLUMN `tool_key` VARCHAR(128) NULL AFTER `connector_key`",
+    "tool_alias": "ADD COLUMN `tool_alias` VARCHAR(128) NULL AFTER `tool_key`",
 }
 _DIMENSION_INDEX_DDLS = {
+    "idx_mcp_log_service_created": (
+        "ADD KEY `idx_mcp_log_service_created` "
+        "(`tenant_id`, `service_id`, `created_at`, `id`)"
+    ),
+    "idx_mcp_log_alias_created": (
+        "ADD KEY `idx_mcp_log_alias_created` "
+        "(`service_id`, `tool_alias`, `created_at`, `id`)"
+    ),
     "idx_mcp_log_connection_created": (
         "ADD KEY `idx_mcp_log_connection_created` "
         "(`tenant_id`, `connection_id`, `created_at`, `id`)"
@@ -244,17 +260,19 @@ def migrate_legacy_logs(days: int = 90) -> None:
         )
 
 
-def insert_event(event: McpLogEvent) -> None:
+def insert_event(event: McpLogEvent, *, conn: Any | None = None) -> None:
     if not isinstance(event, McpLogEvent):
         raise TypeError("event must be McpLogEvent")
     statement = text("""
         INSERT INTO mcp_call_log
-          (tenant_id, connection_id, connector_key, tool_key, category,
+          (tenant_id, service_id, tool_alias, connection_id, connector_key,
+           tool_key, category,
            event_name, target, params_summary, result_status, error_code,
            error_summary, cost_ms, request_id, client_ip, http_method,
            http_status, created_at)
         VALUES
-          (:tenant_id, :connection_id, :connector_key, :tool_key, :category,
+          (:tenant_id, :service_id, :tool_alias, :connection_id, :connector_key,
+           :tool_key, :category,
            :event_name, :target, :params_summary, :result_status, :error_code,
            :error_summary, :cost_ms, :request_id, :client_ip, :http_method,
            :http_status,
@@ -262,6 +280,8 @@ def insert_event(event: McpLogEvent) -> None:
     """)
     params = {
         "tenant_id": event.tenant_id,
+        "service_id": event.service_id,
+        "tool_alias": event.tool_alias,
         "connection_id": event.connection_id,
         "connector_key": event.connector_key,
         "tool_key": event.tool_key,
@@ -279,8 +299,9 @@ def insert_event(event: McpLogEvent) -> None:
         "http_status": event.http_status,
         "created_at": event.created_at,
     }
-    with _engine().begin() as conn:
-        conn.execute(statement, params)
+    transaction = nullcontext(conn) if conn is not None else _engine().begin()
+    with transaction as active_conn:
+        active_conn.execute(statement, params)
 
 
 def _escaped_like(value: str) -> str:
@@ -296,6 +317,8 @@ def _filter_where(filters: LogFilters) -> tuple[list[str], dict[str, Any]]:
         clauses.append("tenant_id = :tenant_id")
         params["tenant_id"] = filters.tenant_id
     for attribute, column in (
+        ("service_id", "service_id"),
+        ("tool_alias", "tool_alias"),
         ("connection_id", "connection_id"),
         ("connector_key", "connector_key"),
         ("tool_key", "tool_key"),

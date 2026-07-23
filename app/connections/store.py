@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import hashlib
 import json
 import logging
 import secrets
@@ -12,13 +13,19 @@ from typing import Any, Mapping
 from sqlalchemy import text
 
 from .crypto import encrypt_credential, token_hmac
-from .models import ConnectionRecord, IssuedToken, ToolPolicy
+from .models import (
+    ConnectionRecord,
+    IssuedToken,
+    ToolPolicy,
+    validate_connection_alias,
+)
 
 
 logger = logging.getLogger(__name__)
 
 _LEGACY_WATERMARK_KEY = "legacy_wecom_backfill_v1"
 _LEGACY_WATERMARK_STATUS = "completed"
+_RESERVED_CONNECTION_IDS = frozenset({"service"})
 
 # The gateway owns the callback registration.  The store only emits the safe,
 # exact cache key after a transaction has committed; it never receives raw
@@ -31,6 +38,19 @@ class ConnectionVersionConflictError(RuntimeError):
     """A validated management write targeted an obsolete connection version."""
 
 
+class ConnectionAliasConflictError(RuntimeError):
+    """A tenant alias is already owned by a different connection."""
+
+
+class DeclarativeRevisionInUseError(RuntimeError):
+    """A published declarative revision is still used by runtime state."""
+
+
+def _validate_connection_id(connection_id: str) -> None:
+    if connection_id.casefold() in _RESERVED_CONNECTION_IDS:
+        raise ValueError("reserved connection_id")
+
+
 _connection_cache_invalidator_lock = threading.Lock()
 
 
@@ -39,6 +59,7 @@ _CONNECTION_DDLS = (
     CREATE TABLE IF NOT EXISTS `connection_instance` (
       `connection_id` VARCHAR(64) NOT NULL,
       `tenant_id` VARCHAR(64) NOT NULL,
+      `connection_alias` VARCHAR(64) NOT NULL,
       `connector_key` VARCHAR(64) NOT NULL,
       `display_name` VARCHAR(128) NOT NULL DEFAULT '',
       `status` VARCHAR(16) NOT NULL DEFAULT 'draft',
@@ -49,6 +70,8 @@ _CONNECTION_DDLS = (
       `updated_at` DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP
         ON UPDATE CURRENT_TIMESTAMP,
       PRIMARY KEY (`connection_id`),
+      UNIQUE KEY `uk_connection_instance_tenant_alias`
+        (`tenant_id`, `connection_alias`),
       KEY `idx_connection_instance_tenant` (`tenant_id`, `status`, `connector_key`)
     ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4
     """,
@@ -214,6 +237,38 @@ def _notify_connection_cache_invalidator(
                 "Connection cache invalidation hook failed type=%s",
                 type(exc).__name__,
             )
+    from app.mcp_services import store as service_store
+
+    service_store.invalidate_services_for_connection(connection_id)
+
+
+def invalidate_connection_cache(connection_id: str, config_version: int) -> None:
+    """Retire one exact cached connection version without database lookups."""
+    if not connection_id or isinstance(config_version, bool) or config_version < 1:
+        raise ValueError("valid connection_id and config_version are required")
+    with _connection_cache_invalidator_lock:
+        invalidators = tuple(_connection_cache_invalidators)
+    for invalidator in invalidators:
+        try:
+            invalidator(connection_id, config_version)
+        except Exception as exc:
+            logger.warning(
+                "Connection cache invalidation hook failed type=%s",
+                type(exc).__name__,
+            )
+
+
+def _lock_live_tenant(conn: Any, tenant_id: str) -> None:
+    enabled = conn.execute(
+        text("""
+            SELECT enabled FROM tenant_config
+            WHERE tenant_id=:tenant_id
+            LIMIT 1 FOR UPDATE
+        """),
+        {"tenant_id": tenant_id},
+    ).scalar()
+    if enabled != 1:
+        raise ValueError("tenant is not active")
 
 
 def _connection_from_row(row: Any) -> ConnectionRecord:
@@ -227,6 +282,7 @@ def _connection_from_row(row: Any) -> ConnectionRecord:
         data_mode=values["data_mode"],
         public_config=json.loads(values["public_config_json"] or "{}"),
         config_version=int(values["config_version"]),
+        connection_alias=values.get("connection_alias") or "",
     )
 
 
@@ -235,7 +291,81 @@ def ensure_connection_tables() -> None:
     with _engine().begin() as conn:
         for ddl in _CONNECTION_DDLS:
             conn.execute(text(ddl))
+        _migrate_connection_alias(conn)
         _migrate_declarative_tenant_identity(conn)
+
+
+def _default_connection_alias(connection_id: str) -> str:
+    digest = hashlib.sha1(connection_id.encode("utf-8")).hexdigest()
+    return f"conn_{digest}"
+
+
+def _materialize_connection_alias(record: ConnectionRecord) -> ConnectionRecord:
+    alias = record.connection_alias or _default_connection_alias(record.connection_id)
+    validate_connection_alias(alias)
+    return record if alias == record.connection_alias else replace(
+        record, connection_alias=alias
+    )
+
+
+def _migrate_connection_alias(conn: Any) -> None:
+    """Idempotently add the tenant-unique materialized connection alias."""
+    alias_column = conn.execute(
+        text("""
+            SELECT COUNT(*) FROM information_schema.COLUMNS
+            WHERE TABLE_SCHEMA=DATABASE()
+              AND TABLE_NAME='connection_instance'
+              AND COLUMN_NAME='connection_alias'
+        """)
+    ).scalar()
+    if not alias_column:
+        conn.execute(text("""
+            ALTER TABLE connection_instance
+            ADD COLUMN `connection_alias` VARCHAR(64) NULL AFTER `tenant_id`
+        """))
+    conn.execute(text("""
+        UPDATE connection_instance
+        SET connection_alias=CONCAT('conn_', LEFT(SHA1(connection_id), 40))
+        WHERE connection_alias IS NULL OR connection_alias=''
+    """))
+    alias_shape = conn.execute(
+        text("""
+            SELECT CONCAT(IS_NULLABLE, '|', CHARACTER_MAXIMUM_LENGTH)
+            FROM information_schema.COLUMNS
+            WHERE TABLE_SCHEMA=DATABASE()
+              AND TABLE_NAME='connection_instance'
+              AND COLUMN_NAME='connection_alias'
+            LIMIT 1
+        """)
+    ).scalar()
+    if alias_shape != "NO|64":
+        conn.execute(text("""
+            ALTER TABLE connection_instance
+            MODIFY COLUMN `connection_alias` VARCHAR(64) NOT NULL
+        """))
+    index_shape = conn.execute(
+        text("""
+            SELECT CONCAT(
+                MIN(NON_UNIQUE), '|',
+                GROUP_CONCAT(COLUMN_NAME ORDER BY SEQ_IN_INDEX SEPARATOR ',')
+            )
+            FROM information_schema.STATISTICS
+            WHERE TABLE_SCHEMA=DATABASE()
+              AND TABLE_NAME='connection_instance'
+              AND INDEX_NAME='uk_connection_instance_tenant_alias'
+        """)
+    ).scalar()
+    if index_shape != "0|tenant_id,connection_alias":
+        if isinstance(index_shape, str) and index_shape:
+            conn.execute(text("""
+                ALTER TABLE connection_instance
+                DROP INDEX `uk_connection_instance_tenant_alias`
+            """))
+        conn.execute(text("""
+            ALTER TABLE connection_instance
+            ADD UNIQUE KEY `uk_connection_instance_tenant_alias`
+              (`tenant_id`, `connection_alias`)
+        """))
 
 
 def _declarative_index_columns(conn: Any, table_name: str, index_name: str) -> str:
@@ -341,45 +471,81 @@ def create_connection(
         raise TypeError("record must be a ConnectionRecord")
     if not record.connection_id or not record.tenant_id or not record.connector_key:
         raise ValueError("connection_id, tenant_id, and connector_key are required")
+    _validate_connection_id(record.connection_id)
     if record.status not in {"draft", "active", "disabled", "error"}:
         raise ValueError("invalid connection status")
     if record.data_mode not in {"direct", "stored", "hybrid"}:
         raise ValueError("invalid connection data_mode")
+    record = _materialize_connection_alias(record)
 
     retired_version: int | None
     with _engine().begin() as conn:
         retired_version = _retired_connection_version(
             conn, record.connection_id, for_update=True
         )
-        conn.execute(
+        alias_row = conn.execute(
             text("""
-                INSERT INTO connection_instance
-                    (connection_id, tenant_id, connector_key, display_name, status,
-                     data_mode, public_config_json, config_version)
-                VALUES (:connection_id, :tenant_id, :connector_key, :display_name,
-                        :status, :data_mode, :public_config_json, :config_version)
-                ON DUPLICATE KEY UPDATE
-                    tenant_id=VALUES(tenant_id),
-                    connector_key=VALUES(connector_key),
-                    display_name=VALUES(display_name),
-                    status=VALUES(status),
-                    data_mode=VALUES(data_mode),
-                    public_config_json=VALUES(public_config_json),
-                    config_version=VALUES(config_version)
+                SELECT connection_id FROM connection_instance
+                WHERE tenant_id=:tenant_id
+                  AND connection_alias=:connection_alias
+                LIMIT 1 FOR UPDATE
             """),
             {
-                "connection_id": record.connection_id,
                 "tenant_id": record.tenant_id,
-                "connector_key": record.connector_key,
-                "display_name": record.display_name,
-                "status": record.status,
-                "data_mode": record.data_mode,
-                "public_config_json": json.dumps(
-                    record.public_config, ensure_ascii=False, separators=(",", ":")
-                ),
-                "config_version": record.config_version,
+                "connection_alias": record.connection_alias,
             },
-        )
+        ).fetchone()
+        if alias_row is not None:
+            alias_values = (
+                dict(alias_row._mapping)
+                if hasattr(alias_row, "_mapping")
+                else dict(alias_row)
+            )
+            if alias_values["connection_id"] != record.connection_id:
+                raise ConnectionAliasConflictError(
+                    "connection alias is already in use"
+                )
+        params = {
+            "connection_id": record.connection_id,
+            "tenant_id": record.tenant_id,
+            "connection_alias": record.connection_alias,
+            "connector_key": record.connector_key,
+            "display_name": record.display_name,
+            "status": record.status,
+            "data_mode": record.data_mode,
+            "public_config_json": json.dumps(
+                record.public_config, ensure_ascii=False, separators=(",", ":")
+            ),
+            "config_version": record.config_version,
+        }
+        if retired_version is None:
+            conn.execute(
+                text("""
+                    INSERT INTO connection_instance
+                        (connection_id, tenant_id, connection_alias, connector_key,
+                         display_name, status, data_mode, public_config_json,
+                         config_version)
+                    VALUES (:connection_id, :tenant_id, :connection_alias,
+                            :connector_key, :display_name, :status, :data_mode,
+                            :public_config_json, :config_version)
+                """),
+                params,
+            )
+        else:
+            conn.execute(
+                text("""
+                    UPDATE connection_instance SET tenant_id=:tenant_id,
+                        connection_alias=:connection_alias,
+                        connector_key=:connector_key,
+                        display_name=:display_name,
+                        status=:status,
+                        data_mode=:data_mode,
+                        public_config_json=:public_config_json,
+                        config_version=:config_version
+                    WHERE connection_id=:connection_id
+                """),
+                params,
+            )
         for credential_key, plaintext in (credentials or {}).items():
             if not credential_key:
                 raise ValueError("credential_key is required")
@@ -419,7 +585,7 @@ def get_connection(
         clauses.append("tenant_id=:tenant_id")
         params["tenant_id"] = tenant_id
     statement = text(f"""
-        SELECT connection_id, tenant_id, connector_key, display_name, status,
+        SELECT connection_id, tenant_id, connector_key, connection_alias, display_name, status,
                data_mode, public_config_json, config_version
         FROM connection_instance
         WHERE {' AND '.join(clauses)}
@@ -434,7 +600,7 @@ def list_connections(tenant_id: str) -> list[ConnectionRecord]:
     if not tenant_id:
         raise ValueError("tenant_id is required")
     statement = text("""
-        SELECT connection_id, tenant_id, connector_key, display_name, status,
+        SELECT connection_id, tenant_id, connector_key, connection_alias, display_name, status,
                data_mode, public_config_json, config_version
         FROM connection_instance
         WHERE tenant_id=:tenant_id
@@ -443,6 +609,46 @@ def list_connections(tenant_id: str) -> list[ConnectionRecord]:
     with _engine().connect() as conn:
         rows = conn.execute(statement, {"tenant_id": tenant_id}).mappings().all()
     return [_connection_from_row(row) for row in rows]
+
+
+def delete_connection(connection_id: str, tenant_id: str) -> bool:
+    """Delete only an unreferenced owned connection row."""
+    if not connection_id or not tenant_id:
+        raise ValueError("connection_id and tenant_id are required")
+    retired_version: int | None = None
+    with _engine().begin() as conn:
+        row = conn.execute(
+            text("""
+                SELECT connection_id, tenant_id, connector_key, connection_alias,
+                       display_name, status, data_mode, public_config_json,
+                       config_version
+                FROM connection_instance
+                WHERE connection_id=:connection_id AND tenant_id=:tenant_id
+                LIMIT 1 FOR UPDATE
+            """),
+            {"connection_id": connection_id, "tenant_id": tenant_id},
+        ).fetchone()
+        if row is None:
+            return False
+        retired_version = _connection_from_row(row).config_version
+        from app.mcp_services import store as service_store
+
+        service_store.assert_connection_deletable(
+            connection_id,
+            tenant_id,
+            _connection=conn,
+        )
+        result = conn.execute(
+            text("""
+                DELETE FROM connection_instance
+                WHERE connection_id=:connection_id AND tenant_id=:tenant_id
+            """),
+            {"connection_id": connection_id, "tenant_id": tenant_id},
+        )
+        if result.rowcount != 1:
+            raise RuntimeError("connection delete failed closed")
+    _notify_connection_cache_invalidator(connection_id, retired_version)
+    return True
 
 
 def save_declarative_revision(
@@ -479,7 +685,7 @@ def save_declarative_revision(
     with _engine().begin() as conn:
         connection_row = conn.execute(
             text("""
-                SELECT connection_id, tenant_id, connector_key, display_name,
+                SELECT connection_id, tenant_id, connector_key, connection_alias, display_name,
                        status, data_mode, public_config_json, config_version
                 FROM connection_instance
                 WHERE connection_id=:connection_id AND tenant_id=:tenant_id
@@ -666,6 +872,192 @@ def get_declarative_revision(
     return None if row is None else _declarative_revision_from_row(row)
 
 
+def _revision_is_selected(
+    public_config: Mapping[str, Any], spec_id: str, revision: int
+) -> bool:
+    if not isinstance(public_config, Mapping):
+        raise DeclarativeRevisionInUseError
+    selectors: list[tuple[str, int]] = []
+    for spec_key, revision_key in (
+        ("spec_id", "revision"),
+        ("pending_spec_id", "pending_revision"),
+    ):
+        has_spec = spec_key in public_config
+        has_revision = revision_key in public_config
+        if has_spec != has_revision:
+            raise DeclarativeRevisionInUseError
+        if not has_spec:
+            continue
+        selected_spec = public_config[spec_key]
+        selected_revision = public_config[revision_key]
+        if (
+            not isinstance(selected_spec, str)
+            or not selected_spec
+            or not isinstance(selected_revision, int)
+            or isinstance(selected_revision, bool)
+            or selected_revision < 1
+        ):
+            raise DeclarativeRevisionInUseError
+        selectors.append((selected_spec, selected_revision))
+    return (spec_id, revision) in selectors
+
+
+def _assert_revision_deletable(
+    conn: Any,
+    spec_id: str,
+    revision: int,
+    tenant_id: str,
+    connection_id: str,
+    *,
+    for_update: bool,
+) -> bool:
+    lock_clause = " FOR UPDATE" if for_update else ""
+    connection_row = conn.execute(
+        text(f"""
+            SELECT connection_id, tenant_id, connector_key, connection_alias,
+                   display_name, status, data_mode, public_config_json,
+                   config_version
+            FROM connection_instance
+            WHERE connection_id=:connection_id AND tenant_id=:tenant_id
+            LIMIT 1{lock_clause}
+        """),
+        {"connection_id": connection_id, "tenant_id": tenant_id},
+    ).fetchone()
+    revision_row = conn.execute(
+        text(f"""
+            SELECT status FROM declarative_spec_revision
+            WHERE spec_id=:spec_id AND revision=:revision
+              AND tenant_id=:tenant_id AND connection_id=:connection_id
+            LIMIT 1{lock_clause}
+        """),
+        {
+            "spec_id": spec_id,
+            "revision": revision,
+            "tenant_id": tenant_id,
+            "connection_id": connection_id,
+        },
+    ).fetchone()
+    if revision_row is None:
+        return False
+    if connection_row is None:
+        raise DeclarativeRevisionInUseError
+    status = _row_values(revision_row).get("status")
+    if status == "draft":
+        return True
+    if status != "published":
+        raise DeclarativeRevisionInUseError
+
+    current = _connection_from_row(connection_row)
+    if current.connector_key != "http_declarative" or _revision_is_selected(
+        current.public_config, spec_id, revision
+    ):
+        raise DeclarativeRevisionInUseError
+
+    binding = conn.execute(
+        text(f"""
+            SELECT 1
+            FROM mcp_service_tool_binding AS binding
+            JOIN declarative_spec_operation AS operation
+              ON operation.tenant_id=:tenant_id
+             AND operation.spec_id=:spec_id
+             AND operation.revision=:revision
+             AND operation.connection_id=:connection_id
+             AND operation.operation_key=binding.source_tool_key
+            WHERE binding.connection_id=:connection_id
+            LIMIT 1{lock_clause}
+        """),
+        {
+            "spec_id": spec_id,
+            "revision": revision,
+            "tenant_id": tenant_id,
+            "connection_id": connection_id,
+        },
+    ).scalar()
+    if binding is not None:
+        raise DeclarativeRevisionInUseError
+    return True
+
+
+def assert_revision_deletable(
+    spec_id: str,
+    revision: int,
+    tenant_id: str,
+    connection_id: str,
+) -> None:
+    """Fail closed when a published owned revision is still in use."""
+    if (
+        not spec_id
+        or not tenant_id
+        or not connection_id
+        or not isinstance(revision, int)
+        or isinstance(revision, bool)
+        or revision < 1
+    ):
+        raise ValueError("declarative revision identity is required")
+    with _engine().connect() as conn:
+        _assert_revision_deletable(
+            conn,
+            spec_id,
+            revision,
+            tenant_id,
+            connection_id,
+            for_update=False,
+        )
+
+
+def delete_declarative_revision(
+    spec_id: str,
+    revision: int,
+    tenant_id: str,
+    connection_id: str,
+) -> bool:
+    """Delete one unused revision and only its compiled operation rows."""
+    if (
+        not spec_id
+        or not tenant_id
+        or not connection_id
+        or not isinstance(revision, int)
+        or isinstance(revision, bool)
+        or revision < 1
+    ):
+        raise ValueError("declarative revision identity is required")
+    params = {
+        "spec_id": spec_id,
+        "revision": revision,
+        "tenant_id": tenant_id,
+        "connection_id": connection_id,
+    }
+    with _engine().begin() as conn:
+        if not _assert_revision_deletable(
+            conn,
+            spec_id,
+            revision,
+            tenant_id,
+            connection_id,
+            for_update=True,
+        ):
+            return False
+        conn.execute(
+            text("""
+                DELETE FROM declarative_spec_operation
+                WHERE spec_id=:spec_id AND revision=:revision
+                  AND tenant_id=:tenant_id AND connection_id=:connection_id
+            """),
+            params,
+        )
+        result = conn.execute(
+            text("""
+                DELETE FROM declarative_spec_revision
+                WHERE spec_id=:spec_id AND revision=:revision
+                  AND tenant_id=:tenant_id AND connection_id=:connection_id
+            """),
+            params,
+        )
+        if result.rowcount != 1:
+            raise RuntimeError("declarative revision delete failed closed")
+    return True
+
+
 def publish_declarative_revision(
     spec_id: str,
     revision: int,
@@ -680,7 +1072,7 @@ def publish_declarative_revision(
     with _engine().begin() as conn:
         connection_row = conn.execute(
             text("""
-                SELECT connection_id, tenant_id, connector_key, display_name, status,
+                SELECT connection_id, tenant_id, connector_key, connection_alias, display_name, status,
                        data_mode, public_config_json, config_version
                 FROM connection_instance
                 WHERE connection_id=:connection_id AND tenant_id=:tenant_id
@@ -758,9 +1150,10 @@ def activate_declarative_revision(
     """Activate only a published revision on its exact tenant connection."""
     retired_version: int | None = None
     with _engine().begin() as conn:
+        _lock_live_tenant(conn, tenant_id)
         row = conn.execute(
             text("""
-                SELECT connection_id, tenant_id, connector_key, display_name, status,
+                SELECT connection_id, tenant_id, connector_key, connection_alias, display_name, status,
                        data_mode, public_config_json, config_version
                 FROM connection_instance
                 WHERE connection_id=:connection_id AND tenant_id=:tenant_id
@@ -897,11 +1290,31 @@ def issue_token(
         raw_value=token_value,
         prefix=digest[:12],
     )
+    with _engine().connect() as lookup_conn:
+        tenant_id = lookup_conn.execute(
+            text("""
+                SELECT tenant_id FROM connection_instance
+                WHERE connection_id=:connection_id LIMIT 1
+            """),
+            {"connection_id": connection_id},
+        ).scalar()
+    if not isinstance(tenant_id, str) or not tenant_id:
+        raise ValueError("connection is not owned by a live tenant")
     retired_version: int | None
     with _engine().begin() as conn:
+        _lock_live_tenant(conn, tenant_id)
         retired_version = _retired_connection_version(
             conn, connection_id, for_update=True
         )
+        owner = conn.execute(
+            text("""
+                SELECT tenant_id FROM connection_instance
+                WHERE connection_id=:connection_id LIMIT 1 FOR UPDATE
+            """),
+            {"connection_id": connection_id},
+        ).scalar()
+        if owner != tenant_id:
+            raise ValueError("connection is not owned by a live tenant")
         conn.execute(
             text("""
                 INSERT INTO connection_token
@@ -929,21 +1342,26 @@ def create_connection_with_token(
     """Atomically create one connection, its credentials, and initial token."""
     if not isinstance(record, ConnectionRecord):
         raise TypeError("record must be a ConnectionRecord")
+    _validate_connection_id(record.connection_id)
+    record = _materialize_connection_alias(record)
     raw_value = f"mcp_{secrets.token_urlsafe(32)}"
     digest = token_hmac(raw_value)
     issued = IssuedToken(str(uuid.uuid4()), raw_value, digest[:12])
     with _engine().begin() as conn:
+        _lock_live_tenant(conn, record.tenant_id)
         conn.execute(
             text("""
                 INSERT INTO connection_instance
-                    (connection_id, tenant_id, connector_key, display_name, status,
-                     data_mode, public_config_json, config_version)
-                VALUES (:connection_id, :tenant_id, :connector_key, :display_name,
-                        :status, :data_mode, :public_config_json, :config_version)
+                    (connection_id, tenant_id, connection_alias, connector_key,
+                     display_name, status, data_mode, public_config_json, config_version)
+                VALUES (:connection_id, :tenant_id, :connection_alias, :connector_key,
+                        :display_name, :status, :data_mode, :public_config_json,
+                        :config_version)
             """),
             {
                 "connection_id": record.connection_id,
                 "tenant_id": record.tenant_id,
+                "connection_alias": record.connection_alias,
                 "connector_key": record.connector_key,
                 "display_name": record.display_name,
                 "status": record.status,
@@ -998,9 +1416,10 @@ def update_connection(
     """Update a tenant-owned connection and retire only its committed cache key."""
     retired_version: int | None = None
     with _engine().begin() as conn:
+        _lock_live_tenant(conn, tenant_id)
         row = conn.execute(
             text("""
-                SELECT connection_id, tenant_id, connector_key, display_name, status,
+                SELECT connection_id, tenant_id, connector_key, connection_alias, display_name, status,
                        data_mode, public_config_json, config_version
                 FROM connection_instance
                 WHERE connection_id=:connection_id AND tenant_id=:tenant_id
@@ -1047,6 +1466,56 @@ def update_connection(
         data_mode=data_mode,  # type: ignore[arg-type]
         public_config=dict(public_config),
         config_version=current.config_version + 1,
+        connection_alias=current.connection_alias,
+    )
+    _notify_connection_cache_invalidator(connection_id, retired_version)
+    return updated
+
+
+def update_connection_alias(
+    connection_id: str,
+    tenant_id: str,
+    connection_alias: str,
+) -> ConnectionRecord | None:
+    """Rename a tenant-owned connection without rewriting service snapshots."""
+    if not connection_id or not tenant_id:
+        raise ValueError("connection_id and tenant_id are required")
+    validate_connection_alias(connection_alias)
+    retired_version: int | None = None
+    with _engine().begin() as conn:
+        row = conn.execute(
+            text("""
+                SELECT connection_id, tenant_id, connector_key, connection_alias,
+                       display_name, status, data_mode, public_config_json,
+                       config_version
+                FROM connection_instance
+                WHERE connection_id=:connection_id AND tenant_id=:tenant_id
+                LIMIT 1 FOR UPDATE
+            """),
+            {"connection_id": connection_id, "tenant_id": tenant_id},
+        ).fetchone()
+        if row is None:
+            return None
+        current = _connection_from_row(row)
+        if current.connection_alias == connection_alias:
+            return current
+        retired_version = current.config_version
+        conn.execute(
+            text("""
+                UPDATE connection_instance SET connection_alias=:connection_alias,
+                    config_version=config_version+1
+                WHERE connection_id=:connection_id AND tenant_id=:tenant_id
+            """),
+            {
+                "connection_id": connection_id,
+                "tenant_id": tenant_id,
+                "connection_alias": connection_alias,
+            },
+        )
+    updated = replace(
+        current,
+        connection_alias=connection_alias,
+        config_version=current.config_version + 1,
     )
     _notify_connection_cache_invalidator(connection_id, retired_version)
     return updated
@@ -1057,7 +1526,7 @@ def disable_connection(connection_id: str, tenant_id: str) -> ConnectionRecord |
     with _engine().begin() as conn:
         row = conn.execute(
             text("""
-                SELECT connection_id, tenant_id, connector_key, display_name, status,
+                SELECT connection_id, tenant_id, connector_key, connection_alias, display_name, status,
                        data_mode, public_config_json, config_version
                 FROM connection_instance
                 WHERE connection_id=:connection_id AND tenant_id=:tenant_id
@@ -1176,6 +1645,7 @@ def rotate_token(
     issued = IssuedToken(str(uuid.uuid4()), raw_value, digest[:12])
     retired_version: int | None = None
     with _engine().begin() as conn:
+        _lock_live_tenant(conn, tenant_id)
         retired_version = _retired_connection_version(
             conn, connection_id, for_update=True
         )
@@ -1248,10 +1718,12 @@ def resolve_connection_token(
                c.status, c.data_mode, c.public_config_json, c.config_version
         FROM connection_token t
         JOIN connection_instance c ON c.connection_id=t.connection_id
+        JOIN tenant_config tenant_row ON tenant_row.tenant_id=c.tenant_id
         WHERE t.connection_id=:connection_id AND t.token_hmac=:token_hmac
           AND t.revoked_at IS NULL
           AND (t.expires_at IS NULL OR t.expires_at > UTC_TIMESTAMP())
           AND c.status='active'
+          AND tenant_row.enabled=1
         LIMIT 1
     """)
     with _engine().connect() as conn:
@@ -1343,6 +1815,7 @@ def _backfill_legacy_tenant(values: Mapping[str, Any]) -> bool:
         logger.warning("Skipping legacy connection row without a tenant_id")
         return False
     connection_id = _legacy_connection_id(tenant_id)
+    _validate_connection_id(connection_id)
     with _engine().connect() as conn:
         marker = conn.execute(
             text("""
@@ -1364,11 +1837,13 @@ def _backfill_legacy_tenant(values: Mapping[str, Any]) -> bool:
             conn.execute(
                 text("""
                     INSERT INTO connection_instance
-                        (connection_id, tenant_id, connector_key, display_name, status,
-                         data_mode, public_config_json, config_version)
-                    VALUES (:connection_id, :tenant_id, 'wecom', :display_name, :status,
-                            :data_mode, :public_config_json, 1)
+                        (connection_id, tenant_id, connection_alias, connector_key,
+                         display_name, status, data_mode, public_config_json,
+                         config_version)
+                    VALUES (:connection_id, :tenant_id, :connection_alias, 'wecom',
+                            :display_name, :status, :data_mode, :public_config_json, 1)
                     ON DUPLICATE KEY UPDATE
+                        connection_alias=VALUES(connection_alias),
                         display_name=VALUES(display_name),
                         status=VALUES(status),
                         data_mode=VALUES(data_mode),
@@ -1378,6 +1853,7 @@ def _backfill_legacy_tenant(values: Mapping[str, Any]) -> bool:
                 {
                     "connection_id": connection_id,
                     "tenant_id": tenant_id,
+                    "connection_alias": _default_connection_alias(connection_id),
                     "display_name": display_name,
                     "status": "active" if enabled else "disabled",
                     "data_mode": data_mode,

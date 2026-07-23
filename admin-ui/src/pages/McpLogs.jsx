@@ -31,16 +31,17 @@ import {
   SettingOutlined,
 } from '@ant-design/icons'
 import dayjs from 'dayjs'
-import api from '../api.js'
+import defaultApi from '../api.js'
+import { apiClientEndpoint } from './connectionView.js'
 import {
   buildDeleteSpec,
-  buildLogQuery,
+  buildLogQuery, buildScopedLogQuery,
   formatDuration,
   isDeleteSelectionOverLimit,
   MAX_DELETE_IDS,
   normalizeLogKeyword,
-  parseLogLocation,
-  serializeLogFilters,
+  logCollectionEndpoint, logScopeCopy, parseScopedLogLocation,
+  serializeScopedLogFilters,
   statusMeta,
 } from './mcpLogsView.js'
 import './McpLogs.css'
@@ -272,8 +273,9 @@ function StatsDashboard({ stats, loading, error, onRetry }) {
   )
 }
 
-export default function McpLogs({ filters, onFiltersChange = () => {} }) {
-  const fallbackFilters = useMemo(() => parseLogLocation(''), [])
+export default function McpLogs({ scope = 'admin', apiClient = defaultApi, filters, onFiltersChange = () => {} }) {
+  const tenantScope = scope === 'tenant'
+  const fallbackFilters = useMemo(() => parseScopedLogLocation(scope, ''), [scope])
   const activeFilters = filters || fallbackFilters
   const [items, setItems] = useState([])
   const [total, setTotal] = useState(0)
@@ -305,7 +307,7 @@ export default function McpLogs({ filters, onFiltersChange = () => {} }) {
   const compactTable = !screens.md
   const listRequest = useRef(0)
   const statsRequest = useRef(0)
-  const filterSignature = useMemo(() => serializeLogFilters(activeFilters), [activeFilters])
+  const filterSignature = useMemo(() => serializeScopedLogFilters(scope, activeFilters), [activeFilters, scope])
 
   const rangePresets = useMemo(() => {
     return [
@@ -345,8 +347,8 @@ export default function McpLogs({ filters, onFiltersChange = () => {} }) {
     const controller = new AbortController()
     setLogsLoading(true)
     setLogsError('')
-    api.get('/admin/mcp-logs', {
-      params: buildLogQuery(activeFilters, page, pageSize),
+    apiClient.get(apiClientEndpoint(apiClient, logCollectionEndpoint(scope)), {
+      params: buildScopedLogQuery(scope, activeFilters, page, pageSize),
       signal: controller.signal,
     }).then((response) => {
       if (requestId !== listRequest.current) return
@@ -359,10 +361,10 @@ export default function McpLogs({ filters, onFiltersChange = () => {} }) {
       if (requestId === listRequest.current) setLogsLoading(false)
     })
     return () => controller.abort()
-  }, [filterSignature, page, pageSize, reloadNonce])
+  }, [apiClient, filterSignature, page, pageSize, reloadNonce, scope])
 
   useEffect(() => {
-    if (!activeFilters.tenantId) {
+    if (tenantScope || !activeFilters.tenantId) {
       statsRequest.current += 1
       setStats(null)
       setStatsError('')
@@ -376,7 +378,7 @@ export default function McpLogs({ filters, onFiltersChange = () => {} }) {
     delete query.page_size
     setStatsLoading(true)
     setStatsError('')
-    api.get('/admin/mcp-logs/stats', { params: query, signal: controller.signal })
+    apiClient.get('/admin/mcp-logs/stats', { params: query, signal: controller.signal })
       .then((response) => {
         if (requestId === statsRequest.current) setStats(response.data || {})
       })
@@ -388,11 +390,15 @@ export default function McpLogs({ filters, onFiltersChange = () => {} }) {
         if (requestId === statsRequest.current) setStatsLoading(false)
       })
     return () => controller.abort()
-  }, [filterSignature, reloadNonce])
+  }, [activeFilters, apiClient, filterSignature, reloadNonce, tenantScope])
 
   useEffect(() => {
+    if (tenantScope) {
+      setTenantOptions([])
+      return undefined
+    }
     const controller = new AbortController()
-    api.get('/admin/tenants', { signal: controller.signal })
+    apiClient.get('/admin/tenants', { signal: controller.signal })
       .then((response) => {
         const options = (response.data?.items || []).map((tenant) => ({
           value: tenant.tenant_id,
@@ -404,7 +410,7 @@ export default function McpLogs({ filters, onFiltersChange = () => {} }) {
       })
       .catch(() => {})
     return () => controller.abort()
-  }, [])
+  }, [apiClient, tenantScope])
 
   const openMoreFilters = () => {
     moreForm.setFieldsValue({
@@ -452,7 +458,7 @@ export default function McpLogs({ filters, onFiltersChange = () => {} }) {
     setSettingsLoading(true)
     setSettingsError('')
     try {
-      const response = await api.get('/admin/mcp-log-settings')
+      const response = await apiClient.get('/admin/mcp-log-settings')
       setRetentionDays(Number(response.data?.retention_days ?? 90))
     } catch (error) {
       setSettingsError(errorMessage(error, '保留策略加载失败'))
@@ -468,7 +474,7 @@ export default function McpLogs({ filters, onFiltersChange = () => {} }) {
     }
     setSettingsSaving(true)
     try {
-      const response = await api.put('/admin/mcp-log-settings', { retention_days: retentionDays })
+      const response = await apiClient.put('/admin/mcp-log-settings', { retention_days: retentionDays })
       setRetentionDays(Number(response.data?.retention_days ?? retentionDays))
       messageApi.success('日志保留策略已保存')
       setSettingsOpen(false)
@@ -482,7 +488,7 @@ export default function McpLogs({ filters, onFiltersChange = () => {} }) {
   const executeDelete = async (spec, preview) => {
     setCleanupLoading(true)
     try {
-      const response = await api.post('/admin/mcp-logs/delete', {
+      const response = await apiClient.post('/admin/mcp-logs/delete', {
         ...spec,
         confirm_token: preview.confirm_token,
       })
@@ -546,7 +552,7 @@ export default function McpLogs({ filters, onFiltersChange = () => {} }) {
     }
     setCleanupLoading(true)
     try {
-      const response = await api.post('/admin/mcp-logs/delete-preview', spec)
+      const response = await apiClient.post('/admin/mcp-logs/delete-preview', spec)
       showDeleteConfirmation(mode, spec, response.data || {})
     } catch (error) {
       messageApi.error(errorMessage(error, '清理预览失败'))
@@ -566,6 +572,7 @@ export default function McpLogs({ filters, onFiltersChange = () => {} }) {
   const activeTenantLabel = tenantOptions.find((option) => option.value === activeFilters.tenantId)?.label
     || activeFilters.tenantId
     || '全部租户'
+  const scopeCopy = logScopeCopy(scope, activeFilters, activeTenantLabel)
   const deleteSelectionOverLimit = isDeleteSelectionOverLimit(selectedRowKeys)
 
   const summaryTags = [
@@ -587,10 +594,10 @@ export default function McpLogs({ filters, onFiltersChange = () => {} }) {
       title: '时间', dataIndex: 'created_at', key: 'created_at', width: 154,
       render: (value) => <Text className="mcp-time">{formatTimestamp(value)}</Text>,
     },
-    {
+    ...(!tenantScope ? [{
       title: '租户', dataIndex: 'tenant_id', key: 'tenant_id', width: 150, responsive: ['md'],
       render: (value) => <Text ellipsis={{ tooltip: value }}>{value || '未识别租户'}</Text>,
-    },
+    }] : []),
     {
       title: '连接', dataIndex: 'connection_id', key: 'connection_id', width: 170,
       render: (value) => <Text code ellipsis={{ tooltip: value }}>{value || '旧版租户端点'}</Text>,
@@ -652,7 +659,7 @@ export default function McpLogs({ filters, onFiltersChange = () => {} }) {
   }
 
   return (
-    <main className={`mcp-log-workbench ${activeFilters.tenantId ? 'mcp-log-workbench--tenant' : ''}`}>
+    <main className={`mcp-log-workbench ${tenantScope || activeFilters.tenantId ? 'mcp-log-workbench--tenant' : ''}`}>
       {modalContextHolder}
       {messageContextHolder}
 
@@ -663,19 +670,19 @@ export default function McpLogs({ filters, onFiltersChange = () => {} }) {
           <Paragraph>检索业务、协议与鉴权事件，定位异常并执行可预览的安全清理。</Paragraph>
         </div>
         <Space wrap className="mcp-log-heading__actions">
-          <Button icon={<SettingOutlined />} onClick={loadSettings}>日志设置</Button>
+          {!tenantScope && <Button icon={<SettingOutlined />} onClick={loadSettings}>日志设置</Button>}
           <Button icon={<ReloadOutlined />} loading={logsLoading} onClick={reloadData}>刷新</Button>
-          <Dropdown menu={dangerMenu} trigger={['click']}>
+          {!tenantScope && <Dropdown menu={dangerMenu} trigger={['click']}>
             <Button danger loading={cleanupLoading}>危险操作 <DownOutlined /></Button>
-          </Dropdown>
+          </Dropdown>}
         </Space>
       </header>
 
       <section className="mcp-scope-rail" aria-label="当前日志视角">
         <div className="mcp-scope-rail__signal"><span /><span /><span /></div>
         <div>
-          <Text>{activeFilters.connectionId ? '连接视角' : activeFilters.tenantId ? '租户视角' : '全局视角'}</Text>
-          <strong>{activeFilters.connectionId || activeTenantLabel}</strong>
+          <Text>{scopeCopy.perspective}</Text>
+          <strong>{scopeCopy.identity}</strong>
         </div>
         <div className="mcp-scope-rail__range">
           <Text>时间窗</Text>
@@ -689,7 +696,7 @@ export default function McpLogs({ filters, onFiltersChange = () => {} }) {
 
       <section className="mcp-log-panel">
         <div className="mcp-filter-bar">
-          <Select
+          {!tenantScope && <Select
             allowClear
             showSearch
             optionFilterProp="label"
@@ -698,7 +705,9 @@ export default function McpLogs({ filters, onFiltersChange = () => {} }) {
             value={activeFilters.tenantId || undefined}
             options={tenantOptions}
             onChange={(tenantId) => updateFilters({ tenantId: tenantId || '' })}
-          />
+          />}
+          {tenantScope && <Input allowClear aria-label="按 MCP 服务筛选" placeholder="服务 ID" value={activeFilters.serviceId || ''} onChange={(event) => updateFilters({ serviceId: event.target.value })} />}
+          {tenantScope && <Input allowClear aria-label="按工具别名筛选" placeholder="工具别名" value={activeFilters.toolAlias || ''} onChange={(event) => updateFilters({ toolAlias: event.target.value })} />}
           <Select
             allowClear
             showSearch
@@ -708,22 +717,23 @@ export default function McpLogs({ filters, onFiltersChange = () => {} }) {
             options={[...new Set(items.map((item) => item.connection_id).filter(Boolean))].map((value) => ({ value, label: value }))}
             onChange={(connectionId) => updateFilters({ connectionId: connectionId || '' })}
           />
-          <Select
+          {!tenantScope && <Select
             allowClear
             aria-label="按连接器筛选"
             placeholder="全部连接器"
             value={activeFilters.connectorKey || undefined}
             options={[...new Set(items.map((item) => item.connector_key).filter(Boolean))].map((value) => ({ value, label: value }))}
             onChange={(connectorKey) => updateFilters({ connectorKey: connectorKey || '' })}
-          />
-          <Select
+          />}
+          {tenantScope && <Input allowClear aria-label="按源工具 Key 筛选" placeholder="源工具 Key" value={activeFilters.sourceToolKey || ''} onChange={(event) => updateFilters({ sourceToolKey: event.target.value })} />}
+          {!tenantScope && <Select
             allowClear
             aria-label="按日志类别筛选"
             placeholder="全部类别"
             value={activeFilters.category || undefined}
             options={Object.entries(CATEGORY_LABELS).map(([value, label]) => ({ value, label }))}
             onChange={(category) => updateFilters({ category: category || '' })}
-          />
+          />}
           <Select
             allowClear
             aria-label="按结果状态筛选"
@@ -735,7 +745,7 @@ export default function McpLogs({ filters, onFiltersChange = () => {} }) {
             }))}
             onChange={(status) => updateFilters({ status: status || '' })}
           />
-          <RangePicker
+          {!tenantScope && <RangePicker
             allowClear={false}
             showTime
             presets={rangePresets}
@@ -746,8 +756,8 @@ export default function McpLogs({ filters, onFiltersChange = () => {} }) {
                 updateFilters({ from: range[0].toISOString(), to: range[1].toISOString() })
               }
             }}
-          />
-          <Input.Search
+          />}
+          {!tenantScope && <Input.Search
             allowClear
             enterButton={<SearchOutlined />}
             maxLength={100}
@@ -756,21 +766,21 @@ export default function McpLogs({ filters, onFiltersChange = () => {} }) {
             value={keywordDraft}
             onChange={(event) => setKeywordDraft(event.target.value)}
             onSearch={(keyword) => updateFilters({ keyword: normalizeLogKeyword(keyword) })}
-          />
-          <Button icon={<FilterOutlined />} onClick={openMoreFilters}>
+          />}
+          {!tenantScope && <Button icon={<FilterOutlined />} onClick={openMoreFilters}>
             更多筛选{moreFilterCount ? ` · ${moreFilterCount}` : ''}
-          </Button>
+          </Button>}
         </div>
 
         <div className="mcp-filter-summary" aria-label="当前筛选摘要">
           <Text type="secondary">筛选摘要</Text>
-          <Tag icon={<ClockCircleOutlined />}>
+          {!tenantScope && <Tag icon={<ClockCircleOutlined />}>
             {formatTimestamp(activeFilters.from)} — {formatTimestamp(activeFilters.to)}
-          </Tag>
+          </Tag>}
           {summaryTags.map((label) => <Tag key={label}>{label}</Tag>)}
         </div>
 
-        {selectedRowKeys.length > 0 && (
+        {!tenantScope && selectedRowKeys.length > 0 && (
           <div className="mcp-selection-bar">
             <div>
               <strong>已选择 {selectedRowKeys.length} 条</strong>
@@ -811,7 +821,7 @@ export default function McpLogs({ filters, onFiltersChange = () => {} }) {
           columns={columns}
           dataSource={items}
           loading={logsLoading}
-          rowSelection={{
+          rowSelection={tenantScope ? undefined : {
             selectedRowKeys,
             preserveSelectedRowKeys: true,
             onChange: setSelectedRowKeys,

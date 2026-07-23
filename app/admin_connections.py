@@ -3,13 +3,14 @@ from __future__ import annotations
 
 import inspect
 import logging
+import math
 import re
 import uuid
 from collections.abc import Mapping
 from dataclasses import replace
 from typing import Any, Literal
 
-from fastapi import APIRouter, Depends, HTTPException, Request
+from fastapi import APIRouter, Depends, HTTPException, Request, Response
 from pydantic import BaseModel, ConfigDict, Field
 
 from . import admin
@@ -18,16 +19,57 @@ from .connections import store
 from .connections.models import ConnectionRecord, ToolPolicy
 from .connectors.contracts import ConnectionContext, ConnectorSpec
 from .connectors.declarative.provider import DECLARATIVE_CONNECTOR_KEY
-from .connectors.declarative.models import SpecValidationError
+from .connectors.declarative.models import (
+    MAX_MAPPING_DEPTH,
+    MAX_OPERATION_COUNT,
+    MAX_OUTPUT_MAPPINGS,
+    SpecValidationError,
+)
 from .connectors.declarative.validator import import_openapi_revision, validate_revision
 from .mcp_audit import write_event
 from .mcp_log_models import McpLogEvent
+from .mcp_services import store as service_store
 
 
 logger = logging.getLogger(__name__)
+_NO_STORE_HEADERS = {"Cache-Control": "no-store"}
 _SENSITIVE_PARTS = frozenset(
     {"authorization", "cookie", "credential", "password", "secret", "token"}
 )
+_PREVIEW_SCHEMA_TYPES = frozenset(
+    {"object", "array", "string", "integer", "number", "boolean", "null"}
+)
+_PREVIEW_SCHEMA_NONNEGATIVE_INTEGER_KEYWORDS = (
+    "minLength",
+    "maxLength",
+    "minItems",
+    "maxItems",
+    "minProperties",
+    "maxProperties",
+)
+_PREVIEW_SCHEMA_NUMBER_KEYWORDS = (
+    "minimum",
+    "maximum",
+)
+_PREVIEW_SCHEMA_EXCLUSIVE_BOUND_KEYWORDS = (
+    "exclusiveMinimum",
+    "exclusiveMaximum",
+)
+_PREVIEW_SCHEMA_MAX_NODES = 2_048
+_PREVIEW_SECRET_PATTERNS = tuple(
+    re.compile(pattern, re.IGNORECASE)
+    for pattern in (
+        r"\beyJ[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]{6,}\b",
+        r"\b(?:sk|rk)_(?:live|test)_[A-Za-z0-9]{8,}\b",
+        r"\b(?:gh[pousr]_[A-Za-z0-9]{20,}|github_pat_[A-Za-z0-9_]{20,})\b",
+        r"\bxox[baprs]-[A-Za-z0-9-]{20,}\b",
+        r"\b(?:AKIA|ASIA)[A-Z0-9]{16}\b",
+        r"\b(?:api[\s_-]*key|access[\s_-]*token|authorization|client[\s_-]*secret|password|secret|token)\s*[:=]\s*[^\s,;]{4,}",
+    )
+)
+_BEARER_VALUE_RE = re.compile(r"\bbearer\s+([^\s,;]+)", re.IGNORECASE)
+_CREDENTIAL_CANDIDATE_RE = re.compile(r"[A-Za-z0-9_+=/-]{24,}")
+_PREVIEW_IDENTIFIER_RE = re.compile(r"^[A-Za-z][A-Za-z0-9_.-]{0,127}$")
 
 
 def _require_admin(request: Request) -> None:
@@ -352,12 +394,330 @@ def _plain_schema_metadata(value: Any) -> Any:
     raise HTTPException(409, "connector schema is unavailable")
 
 
+def _credential_shape(value: str, *, minimum: int = 12) -> bool:
+    if len(value) < minimum:
+        return False
+    classes = sum(
+        (
+            any(character.islower() for character in value),
+            any(character.isupper() for character in value),
+            any(character.isdigit() for character in value),
+            any(not character.isalnum() for character in value),
+        )
+    )
+    if classes >= 3:
+        return True
+    return (
+        any(character.isalpha() for character in value)
+        and any(character.isdigit() for character in value)
+    ) or (classes >= 2 and any(not character.isalnum() for character in value))
+
+
+def _high_entropy_credential(value: str) -> bool:
+    if not _credential_shape(value, minimum=24) or len(set(value)) < 10:
+        return False
+    frequencies = (value.count(character) / len(value) for character in set(value))
+    entropy = -sum(frequency * math.log2(frequency) for frequency in frequencies)
+    return entropy >= 3.5
+
+
+def _unsafe_preview_description(value: str) -> bool:
+    if len(value) > 512 or "://" in value or any(
+        character in value for character in "\r\n\0"
+    ):
+        return True
+    if any(pattern.search(value) is not None for pattern in _PREVIEW_SECRET_PATTERNS):
+        return True
+    bearer = _BEARER_VALUE_RE.search(value)
+    if bearer is not None and _credential_shape(bearer.group(1), minimum=8):
+        return True
+    return any(
+        _high_entropy_credential(match.group(0))
+        for match in _CREDENTIAL_CANDIDATE_RE.finditer(value)
+    )
+
+
+def _safe_preview_description(value: Any) -> str:
+    if not isinstance(value, str) or _unsafe_preview_description(value):
+        return ""
+    return value
+
+
+def _safe_preview_schema(value: Any) -> dict[str, Any]:
+    """Return a bounded structural subset of a compiled JSON schema."""
+
+    def unavailable() -> None:
+        raise HTTPException(409, "declarative revision is unavailable")
+
+    active: set[int] = set()
+    nodes = [0]
+
+    def project(schema: Any, *, depth: int) -> dict[str, Any]:
+        if not isinstance(schema, Mapping) or depth > MAX_MAPPING_DEPTH:
+            unavailable()
+        identity = id(schema)
+        if identity in active:
+            unavailable()
+        nodes[0] += 1
+        if nodes[0] > _PREVIEW_SCHEMA_MAX_NODES:
+            unavailable()
+        active.add(identity)
+        try:
+            result: dict[str, Any] = {}
+            schema_type = schema.get("type", _OMIT)
+            if schema_type is not _OMIT:
+                if (
+                    not isinstance(schema_type, str)
+                    or schema_type not in _PREVIEW_SCHEMA_TYPES
+                ):
+                    unavailable()
+                result["type"] = schema_type
+
+            for keyword in _PREVIEW_SCHEMA_NONNEGATIVE_INTEGER_KEYWORDS:
+                item = schema.get(keyword, _OMIT)
+                if item is _OMIT:
+                    continue
+                if (
+                    not isinstance(item, int)
+                    or isinstance(item, bool)
+                    or item < 0
+                ):
+                    unavailable()
+                result[keyword] = item
+
+            for keyword in _PREVIEW_SCHEMA_NUMBER_KEYWORDS:
+                item = schema.get(keyword, _OMIT)
+                if item is _OMIT:
+                    continue
+                if (
+                    not isinstance(item, (int, float))
+                    or isinstance(item, bool)
+                    or not math.isfinite(item)
+                ):
+                    unavailable()
+                result[keyword] = item
+
+            for keyword in _PREVIEW_SCHEMA_EXCLUSIVE_BOUND_KEYWORDS:
+                item = schema.get(keyword, _OMIT)
+                if item is _OMIT:
+                    continue
+                if isinstance(item, bool):
+                    result[keyword] = item
+                elif isinstance(item, (int, float)) and math.isfinite(item):
+                    result[keyword] = item
+                else:
+                    unavailable()
+
+            unique_items = schema.get("uniqueItems", _OMIT)
+            if unique_items is not _OMIT:
+                if not isinstance(unique_items, bool):
+                    unavailable()
+                result["uniqueItems"] = unique_items
+
+            properties = schema.get("properties", _OMIT)
+            safe_property_names: set[str] = set()
+            if properties is not _OMIT:
+                if not isinstance(properties, Mapping):
+                    unavailable()
+                projected_properties = {}
+                for name, child_schema in properties.items():
+                    if (
+                        not isinstance(name, str)
+                        or _PREVIEW_IDENTIFIER_RE.fullmatch(name) is None
+                        or not isinstance(child_schema, Mapping)
+                    ):
+                        unavailable()
+                    projected_properties[name] = project(
+                        child_schema, depth=depth + 1
+                    )
+                    safe_property_names.add(name)
+                result["properties"] = projected_properties
+
+            required = schema.get("required", _OMIT)
+            if required is not _OMIT:
+                if not isinstance(required, (list, tuple)):
+                    unavailable()
+                required_names = []
+                seen_required = set()
+                for name in required:
+                    if (
+                        not isinstance(name, str)
+                        or name not in safe_property_names
+                        or name in seen_required
+                    ):
+                        unavailable()
+                    seen_required.add(name)
+                    required_names.append(name)
+                result["required"] = required_names
+
+            items = schema.get("items", _OMIT)
+            if items is not _OMIT:
+                if not isinstance(items, Mapping):
+                    unavailable()
+                result["items"] = project(items, depth=depth + 1)
+
+            additional = schema.get("additionalProperties", _OMIT)
+            if additional is not _OMIT:
+                if isinstance(additional, bool):
+                    result["additionalProperties"] = additional
+                elif isinstance(additional, Mapping):
+                    result["additionalProperties"] = project(
+                        additional, depth=depth + 1
+                    )
+                else:
+                    unavailable()
+
+            for minimum_key, maximum_key in (
+                ("minLength", "maxLength"),
+                ("minItems", "maxItems"),
+                ("minProperties", "maxProperties"),
+                ("minimum", "maximum"),
+            ):
+                if (
+                    minimum_key in result
+                    and maximum_key in result
+                    and result[minimum_key] > result[maximum_key]
+                ):
+                    unavailable()
+            return result
+        finally:
+            active.discard(identity)
+
+    try:
+        return project(value, depth=0)
+    except HTTPException:
+        raise
+    except (SpecValidationError, TypeError, ValueError, RecursionError, OverflowError):
+        unavailable()
+        raise AssertionError  # pragma: no cover
+
+
+def _declarative_preview(revision: Any) -> dict[str, Any]:
+    """Project only compiled tool metadata; transport and auth data stay absent."""
+    compiled_operations = getattr(revision, "operations", _OMIT)
+    if (
+        not isinstance(compiled_operations, (list, tuple))
+        or not compiled_operations
+        or len(compiled_operations) > MAX_OPERATION_COUNT
+    ):
+        raise HTTPException(409, "declarative revision is unavailable")
+    operations = {}
+    operation_identities = set()
+    operation_catalog = []
+    for compiled_operation in compiled_operations:
+        try:
+            input_mappings = tuple(
+                replace(mapping)
+                for mapping in compiled_operation.input_mappings
+            )
+            output_mappings = tuple(
+                replace(mapping)
+                for mapping in compiled_operation.output_mappings
+            )
+            operation = replace(
+                compiled_operation,
+                input_mappings=input_mappings,
+                output_mappings=output_mappings,
+            )
+        except (
+            AttributeError,
+            SpecValidationError,
+            TypeError,
+            ValueError,
+            RecursionError,
+        ):
+            raise HTTPException(
+                409, "declarative revision is unavailable"
+            ) from None
+        operation_key = getattr(operation, "tool_key", None)
+        mcp_name = getattr(operation, "mcp_name", None)
+        operation_kind = getattr(operation, "operation_kind", None)
+        identities = {operation_key, mcp_name}
+        if (
+            not isinstance(operation_key, str)
+            or _PREVIEW_IDENTIFIER_RE.fullmatch(operation_key) is None
+            or not isinstance(mcp_name, str)
+            or _PREVIEW_IDENTIFIER_RE.fullmatch(mcp_name) is None
+            or bool(operation_identities & identities)
+            or operation_kind not in {"read", "write"}
+            or not isinstance(output_mappings, (list, tuple))
+            or not output_mappings
+            or len(output_mappings) > MAX_OUTPUT_MAPPINGS
+            or not isinstance(getattr(operation, "description", None), str)
+        ):
+            raise HTTPException(409, "declarative revision is unavailable")
+        operation_identities.update(identities)
+        output_names = []
+        seen_output_names = set()
+        for mapping in output_mappings:
+            name = getattr(mapping, "name", None)
+            pointer = getattr(mapping, "pointer", None)
+            if (
+                not isinstance(name, str)
+                or _PREVIEW_IDENTIFIER_RE.fullmatch(name) is None
+                or name in seen_output_names
+                or not isinstance(pointer, str)
+                or not pointer.startswith("/")
+            ):
+                raise HTTPException(409, "declarative revision is unavailable")
+            seen_output_names.add(name)
+            output_names.append(name)
+        operations[operation_key] = operation
+        try:
+            input_schema = _safe_preview_schema(operation.input_schema)
+        except (AttributeError, TypeError, HTTPException):
+            raise HTTPException(409, "declarative revision is unavailable") from None
+        operation_catalog.append(
+            {
+                "operation_key": operation_key,
+                "mcp_name": mcp_name,
+                "description": _safe_preview_description(
+                    getattr(operation, "description", None)
+                ),
+                "operation_kind": operation_kind,
+                "input_schema": input_schema,
+                "output_names": output_names,
+            }
+        )
+    tools = []
+    for tool in getattr(revision, "tools", ()):
+        steps = []
+        operation_kinds = []
+        for step in tool.steps:
+            operation = operations.get(step.operation_key)
+            if operation is None:
+                raise HTTPException(409, "declarative revision is unavailable")
+            operation_kinds.append(operation.operation_kind)
+            steps.append(
+                {
+                    "step_id": step.step_id,
+                    "operation_key": operation.tool_key,
+                    "operation_kind": operation.operation_kind,
+                }
+            )
+        tools.append(
+            {
+                "tool_key": tool.tool_key,
+                "mcp_name": tool.mcp_name,
+                "description": _safe_preview_description(tool.description),
+                "input_schema": _safe_preview_schema(tool.input_schema),
+                "output_schema": _safe_preview_schema(tool.output_schema),
+                "operation_kind": (
+                    "write" if "write" in operation_kinds else "read"
+                ),
+                "steps": steps,
+            }
+        )
+    return {"tools": tools, "operations": operation_catalog}
+
+
 _OMIT = object()
 
 
 def _safe_connection(record: ConnectionRecord, spec: ConnectorSpec) -> dict[str, Any]:
     return {
         "connection_id": record.connection_id,
+        "connection_alias": record.connection_alias,
         "tenant_id": record.tenant_id,
         "connector_key": record.connector_key,
         "display_name": record.display_name,
@@ -375,6 +735,7 @@ def _safe_connection_for_request(request: Request, record: ConnectionRecord) -> 
         except HTTPException:
             return {
                 "connection_id": record.connection_id,
+                "connection_alias": record.connection_alias,
                 "tenant_id": record.tenant_id,
                 "connector_key": record.connector_key,
                 "display_name": record.display_name,
@@ -431,16 +792,21 @@ def _mutate(operation, *args, **kwargs):
         raise HTTPException(400, "connection mutation failed") from None
 
 
-@router.get("/tenants/{tenant_id}/connections")
-def list_connections(tenant_id: str, request: Request):
+def list_connections_use_case(tenant_id: str, request: Request):
     items = []
     for record in store.list_connections(tenant_id):
         items.append(_safe_connection_for_request(request, record))
     return {"items": items}
 
 
-@router.post("/tenants/{tenant_id}/connections", status_code=201)
-def create_connection(tenant_id: str, body: ConnectionCreateRequest, request: Request):
+@router.get("/tenants/{tenant_id}/connections")
+def list_connections(tenant_id: str, request: Request):
+    return list_connections_use_case(tenant_id, request)
+
+
+def create_connection_use_case(
+    tenant_id: str, body: ConnectionCreateRequest, request: Request
+):
     if not isinstance(body.public_config, Mapping):
         _schema_error()
     credentials = _credentials(body.credentials)
@@ -481,8 +847,18 @@ def create_connection(tenant_id: str, body: ConnectionCreateRequest, request: Re
     }
 
 
-@router.get("/tenants/{tenant_id}/connections/{connection_id}")
-def get_connection(tenant_id: str, connection_id: str, request: Request):
+@router.post("/tenants/{tenant_id}/connections", status_code=201)
+def create_connection(
+    tenant_id: str,
+    body: ConnectionCreateRequest,
+    request: Request,
+    response: Response,
+):
+    response.headers.update(_NO_STORE_HEADERS)
+    return create_connection_use_case(tenant_id, body, request)
+
+
+def get_connection_use_case(tenant_id: str, connection_id: str, request: Request):
     record = _owned(tenant_id, connection_id)
     return {
         "connection": _safe_connection_for_request(request, record),
@@ -490,12 +866,17 @@ def get_connection(tenant_id: str, connection_id: str, request: Request):
     }
 
 
+@router.get("/tenants/{tenant_id}/connections/{connection_id}")
+def get_connection(tenant_id: str, connection_id: str, request: Request):
+    return get_connection_use_case(tenant_id, connection_id, request)
+
+
 @router.get("/connections/{connection_id}")
 def get_connection_global(connection_id: str, request: Request):
     record = store.get_connection(connection_id)
     if record is None:
         raise HTTPException(404, "connection not found")
-    return get_connection(record.tenant_id, connection_id, request)
+    return get_connection_use_case(record.tenant_id, connection_id, request)
 
 
 def _global_owner(connection_id: str) -> ConnectionRecord:
@@ -505,8 +886,12 @@ def _global_owner(connection_id: str) -> ConnectionRecord:
     return record
 
 
-@router.put("/tenants/{tenant_id}/connections/{connection_id}")
-def update_connection(tenant_id: str, connection_id: str, body: ConnectionUpdateRequest, request: Request):
+def update_connection_use_case(
+    tenant_id: str,
+    connection_id: str,
+    body: ConnectionUpdateRequest,
+    request: Request,
+):
     current = _owned(tenant_id, connection_id)
     if current.connector_key == DECLARATIVE_CONNECTOR_KEY:
         if body.status == "active":
@@ -535,13 +920,24 @@ def update_connection(tenant_id: str, connection_id: str, body: ConnectionUpdate
     return {"connection": _safe_connection_for_request(request, updated)}
 
 
+@router.put("/tenants/{tenant_id}/connections/{connection_id}")
+def update_connection(
+    tenant_id: str,
+    connection_id: str,
+    body: ConnectionUpdateRequest,
+    request: Request,
+):
+    return update_connection_use_case(tenant_id, connection_id, body, request)
+
+
 @router.put("/connections/{connection_id}")
 def update_connection_global(connection_id: str, body: ConnectionUpdateRequest, request: Request):
-    return update_connection(_global_owner(connection_id).tenant_id, connection_id, body, request)
+    return update_connection_use_case(
+        _global_owner(connection_id).tenant_id, connection_id, body, request
+    )
 
 
-@router.post("/tenants/{tenant_id}/connections/{connection_id}/disable")
-def disable_connection(tenant_id: str, connection_id: str, request: Request):
+def disable_connection_use_case(tenant_id: str, connection_id: str, request: Request):
     _owned(tenant_id, connection_id)
     record = _mutate(store.disable_connection, connection_id, tenant_id)
     if record is None:
@@ -550,17 +946,60 @@ def disable_connection(tenant_id: str, connection_id: str, request: Request):
     return {"connection": _safe_connection_for_request(request, record)}
 
 
+@router.post("/tenants/{tenant_id}/connections/{connection_id}/disable")
+def disable_connection(tenant_id: str, connection_id: str, request: Request):
+    return disable_connection_use_case(tenant_id, connection_id, request)
+
+
 @router.post("/connections/{connection_id}/disable")
 def disable_connection_global(connection_id: str, request: Request):
     record = store.get_connection(connection_id)
     if record is None:
         raise HTTPException(404, "connection not found")
-    return disable_connection(record.tenant_id, connection_id, request)
+    return disable_connection_use_case(record.tenant_id, connection_id, request)
 
 
-@router.put("/tenants/{tenant_id}/connections/{connection_id}/credentials")
-@router.post("/tenants/{tenant_id}/connections/{connection_id}/credentials/rotate")
-def replace_connection_credentials(tenant_id: str, connection_id: str, body: CredentialReplaceRequest, request: Request):
+def delete_connection_use_case(tenant_id: str, connection_id: str, request: Request):
+    record = _owned(tenant_id, connection_id)
+    try:
+        deleted = store.delete_connection(connection_id, tenant_id)
+    except service_store.ServiceReferenceConflictError as exc:
+        raise HTTPException(
+            409,
+            {
+                "message": "connection is referenced by MCP services",
+                "services": [
+                    {
+                        "service_id": service.service_id,
+                        "display_name": service.display_name,
+                    }
+                    for service in exc.services
+                ],
+            },
+        ) from None
+    if not deleted:
+        raise HTTPException(404, "connection not found")
+    _audit(record, "connection_deleted")
+    return {"ok": True}
+
+
+@router.delete("/tenants/{tenant_id}/connections/{connection_id}")
+def delete_connection(tenant_id: str, connection_id: str, request: Request):
+    return delete_connection_use_case(tenant_id, connection_id, request)
+
+
+@router.delete("/connections/{connection_id}")
+def delete_connection_global(connection_id: str, request: Request):
+    record = _global_owner(connection_id)
+    return delete_connection_use_case(record.tenant_id, connection_id, request)
+
+
+def replace_connection_credentials_use_case(
+    tenant_id: str,
+    connection_id: str,
+    body: CredentialReplaceRequest,
+    request: Request,
+):
     record = _owned(tenant_id, connection_id)
     values = _credentials(body.credentials)
     _validate_schema(
@@ -578,27 +1017,64 @@ def replace_connection_credentials(tenant_id: str, connection_id: str, body: Cre
     return {"ok": True, "credential_keys": sorted(values)}
 
 
+@router.put("/tenants/{tenant_id}/connections/{connection_id}/credentials")
+@router.post("/tenants/{tenant_id}/connections/{connection_id}/credentials/rotate")
+def replace_connection_credentials(
+    tenant_id: str,
+    connection_id: str,
+    body: CredentialReplaceRequest,
+    request: Request,
+):
+    return replace_connection_credentials_use_case(
+        tenant_id, connection_id, body, request
+    )
+
+
 @router.put("/connections/{connection_id}/credentials")
 @router.post("/connections/{connection_id}/credentials/rotate")
 def replace_connection_credentials_global(connection_id: str, body: CredentialReplaceRequest, request: Request):
-    return replace_connection_credentials(_global_owner(connection_id).tenant_id, connection_id, body, request)
+    return replace_connection_credentials_use_case(
+        _global_owner(connection_id).tenant_id, connection_id, body, request
+    )
 
 
-@router.post("/tenants/{tenant_id}/connections/{connection_id}/tokens", status_code=201)
-def issue_connection_token(tenant_id: str, connection_id: str, body: TokenIssueRequest, request: Request):
+def issue_connection_token_use_case(
+    tenant_id: str, connection_id: str, body: TokenIssueRequest, request: Request
+):
     record = _owned(tenant_id, connection_id)
     issued = _mutate(store.issue_token, connection_id, label=body.label)
     _audit(record, "connection_token_issued")
     return {"token_id": issued.token_id, "token": issued.raw_value, "prefix": issued.prefix, "label": body.label}
 
 
+@router.post("/tenants/{tenant_id}/connections/{connection_id}/tokens", status_code=201)
+def issue_connection_token(
+    tenant_id: str,
+    connection_id: str,
+    body: TokenIssueRequest,
+    request: Request,
+    response: Response,
+):
+    response.headers.update(_NO_STORE_HEADERS)
+    return issue_connection_token_use_case(tenant_id, connection_id, body, request)
+
+
 @router.post("/connections/{connection_id}/tokens", status_code=201)
-def issue_connection_token_global(connection_id: str, body: TokenIssueRequest, request: Request):
-    return issue_connection_token(_global_owner(connection_id).tenant_id, connection_id, body, request)
+def issue_connection_token_global(
+    connection_id: str,
+    body: TokenIssueRequest,
+    request: Request,
+    response: Response,
+):
+    response.headers.update(_NO_STORE_HEADERS)
+    return issue_connection_token_use_case(
+        _global_owner(connection_id).tenant_id, connection_id, body, request
+    )
 
 
-@router.post("/tenants/{tenant_id}/connections/{connection_id}/tokens/rotate", status_code=201)
-def rotate_connection_token(tenant_id: str, connection_id: str, body: TokenIssueRequest, request: Request):
+def rotate_connection_token_use_case(
+    tenant_id: str, connection_id: str, body: TokenIssueRequest, request: Request
+):
     record = _owned(tenant_id, connection_id)
     issued = _mutate(store.rotate_token, connection_id, tenant_id, label=body.label)
     if issued is None:
@@ -607,13 +1083,34 @@ def rotate_connection_token(tenant_id: str, connection_id: str, body: TokenIssue
     return {"token_id": issued.token_id, "token": issued.raw_value, "prefix": issued.prefix, "label": body.label}
 
 
+@router.post("/tenants/{tenant_id}/connections/{connection_id}/tokens/rotate", status_code=201)
+def rotate_connection_token(
+    tenant_id: str,
+    connection_id: str,
+    body: TokenIssueRequest,
+    request: Request,
+    response: Response,
+):
+    response.headers.update(_NO_STORE_HEADERS)
+    return rotate_connection_token_use_case(tenant_id, connection_id, body, request)
+
+
 @router.post("/connections/{connection_id}/tokens/rotate", status_code=201)
-def rotate_connection_token_global(connection_id: str, body: TokenIssueRequest, request: Request):
-    return rotate_connection_token(_global_owner(connection_id).tenant_id, connection_id, body, request)
+def rotate_connection_token_global(
+    connection_id: str,
+    body: TokenIssueRequest,
+    request: Request,
+    response: Response,
+):
+    response.headers.update(_NO_STORE_HEADERS)
+    return rotate_connection_token_use_case(
+        _global_owner(connection_id).tenant_id, connection_id, body, request
+    )
 
 
-@router.delete("/tenants/{tenant_id}/connections/{connection_id}/tokens/{token_id}")
-def revoke_connection_token(tenant_id: str, connection_id: str, token_id: str, request: Request):
+def revoke_connection_token_use_case(
+    tenant_id: str, connection_id: str, token_id: str, request: Request
+):
     record = _owned(tenant_id, connection_id)
     if not _mutate(store.revoke_token, connection_id, tenant_id, token_id):
         raise HTTPException(404, "token not found")
@@ -621,13 +1118,25 @@ def revoke_connection_token(tenant_id: str, connection_id: str, token_id: str, r
     return {"ok": True}
 
 
+@router.delete("/tenants/{tenant_id}/connections/{connection_id}/tokens/{token_id}")
+def revoke_connection_token(
+    tenant_id: str, connection_id: str, token_id: str, request: Request
+):
+    return revoke_connection_token_use_case(
+        tenant_id, connection_id, token_id, request
+    )
+
+
 @router.delete("/connections/{connection_id}/tokens/{token_id}")
 def revoke_connection_token_global(connection_id: str, token_id: str, request: Request):
-    return revoke_connection_token(_global_owner(connection_id).tenant_id, connection_id, token_id, request)
+    return revoke_connection_token_use_case(
+        _global_owner(connection_id).tenant_id, connection_id, token_id, request
+    )
 
 
-@router.get("/tenants/{tenant_id}/connections/{connection_id}/tools")
-def list_connection_tools(tenant_id: str, connection_id: str, request: Request):
+def list_connection_tools_use_case(
+    tenant_id: str, connection_id: str, request: Request
+):
     record = _owned(tenant_id, connection_id)
     spec = _management_spec_for_record(request, record)
     configured = {item.tool_name: item for item in store.list_tool_policies(connection_id)}
@@ -652,13 +1161,24 @@ def list_connection_tools(tenant_id: str, connection_id: str, request: Request):
     }
 
 
+@router.get("/tenants/{tenant_id}/connections/{connection_id}/tools")
+def list_connection_tools(tenant_id: str, connection_id: str, request: Request):
+    return list_connection_tools_use_case(tenant_id, connection_id, request)
+
+
 @router.get("/connections/{connection_id}/tools")
 def list_connection_tools_global(connection_id: str, request: Request):
-    return list_connection_tools(_global_owner(connection_id).tenant_id, connection_id, request)
+    return list_connection_tools_use_case(
+        _global_owner(connection_id).tenant_id, connection_id, request
+    )
 
 
-@router.put("/tenants/{tenant_id}/connections/{connection_id}/tools")
-def update_connection_tools(tenant_id: str, connection_id: str, body: ToolPoliciesRequest, request: Request):
+def update_connection_tools_use_case(
+    tenant_id: str,
+    connection_id: str,
+    body: ToolPoliciesRequest,
+    request: Request,
+):
     record = _owned(tenant_id, connection_id)
     spec = _management_spec_for_record(request, record)
     declared = {tool.tool_key: tool for tool in spec.tools}
@@ -689,13 +1209,26 @@ def update_connection_tools(tenant_id: str, connection_id: str, body: ToolPolici
     return {"ok": True}
 
 
+@router.put("/tenants/{tenant_id}/connections/{connection_id}/tools")
+def update_connection_tools(
+    tenant_id: str,
+    connection_id: str,
+    body: ToolPoliciesRequest,
+    request: Request,
+):
+    return update_connection_tools_use_case(tenant_id, connection_id, body, request)
+
+
 @router.put("/connections/{connection_id}/tools")
 def update_connection_tools_global(connection_id: str, body: ToolPoliciesRequest, request: Request):
-    return update_connection_tools(_global_owner(connection_id).tenant_id, connection_id, body, request)
+    return update_connection_tools_use_case(
+        _global_owner(connection_id).tenant_id, connection_id, body, request
+    )
 
 
-@router.post("/tenants/{tenant_id}/connections/{connection_id}/test")
-async def test_connection(tenant_id: str, connection_id: str, request: Request):
+async def test_connection_use_case(
+    tenant_id: str, connection_id: str, request: Request
+):
     record = _owned(tenant_id, connection_id)
     execution_record = _management_record(record)
     if record.status != "active" and execution_record is record:
@@ -738,13 +1271,21 @@ async def test_connection(tenant_id: str, connection_id: str, request: Request):
     return {"ok": True, "status": "ok"}
 
 
+@router.post("/tenants/{tenant_id}/connections/{connection_id}/test")
+async def test_connection(tenant_id: str, connection_id: str, request: Request):
+    return await test_connection_use_case(tenant_id, connection_id, request)
+
+
 @router.post("/connections/{connection_id}/test")
 async def test_connection_global(connection_id: str, request: Request):
-    return await test_connection(_global_owner(connection_id).tenant_id, connection_id, request)
+    return await test_connection_use_case(
+        _global_owner(connection_id).tenant_id, connection_id, request
+    )
 
 
-@router.post("/tenants/{tenant_id}/connections/{connection_id}/sync")
-async def sync_connection(tenant_id: str, connection_id: str, request: Request):
+async def sync_connection_use_case(
+    tenant_id: str, connection_id: str, request: Request
+):
     record = _owned(tenant_id, connection_id)
     if record.status != "active" or record.data_mode not in {"stored", "hybrid"}:
         raise HTTPException(409, "connection is not eligible for sync")
@@ -761,13 +1302,24 @@ async def sync_connection(tenant_id: str, connection_id: str, request: Request):
     return {"ok": result.status != "error", "status": result.status}
 
 
+@router.post("/tenants/{tenant_id}/connections/{connection_id}/sync")
+async def sync_connection(tenant_id: str, connection_id: str, request: Request):
+    return await sync_connection_use_case(tenant_id, connection_id, request)
+
+
 @router.post("/connections/{connection_id}/sync")
 async def sync_connection_global(connection_id: str, request: Request):
-    return await sync_connection(_global_owner(connection_id).tenant_id, connection_id, request)
+    return await sync_connection_use_case(
+        _global_owner(connection_id).tenant_id, connection_id, request
+    )
 
 
-@router.post("/tenants/{tenant_id}/connections/{connection_id}/specs/import", status_code=201)
-def import_connection_spec(tenant_id: str, connection_id: str, body: OpenApiImportRequest, request: Request):
+def import_connection_spec_use_case(
+    tenant_id: str,
+    connection_id: str,
+    body: OpenApiImportRequest,
+    request: Request,
+):
     record = _owned(tenant_id, connection_id)
     _require_declarative(record)
     if record.status not in {"draft", "disabled"}:
@@ -783,9 +1335,9 @@ def import_connection_spec(tenant_id: str, connection_id: str, body: OpenApiImpo
             allowed_hosts=body.allowed_hosts,
             sync_spec=body.sync_spec,
         )
-        validate_revision(revision, data_mode=record.data_mode)
+        compiled = validate_revision(revision, data_mode=record.data_mode)
         store.save_declarative_revision(
-            revision, expected_config_version=record.config_version
+            compiled, expected_config_version=record.config_version
         )
     except store.ConnectionVersionConflictError:
         raise HTTPException(409, "connection configuration changed") from None
@@ -793,16 +1345,32 @@ def import_connection_spec(tenant_id: str, connection_id: str, body: OpenApiImpo
         logger.warning("Declarative import rejected type=%s", type(exc).__name__)
         raise HTTPException(422, "invalid declarative specification") from None
     _audit(record, "declarative_spec_imported")
-    return {"spec_id": revision.spec_id, "revision": revision.revision, "status": revision.status}
+    return {
+        "spec_id": compiled.spec_id,
+        "revision": compiled.revision,
+        "status": compiled.status,
+        "preview": _declarative_preview(compiled),
+    }
+
+
+@router.post("/tenants/{tenant_id}/connections/{connection_id}/specs/import", status_code=201)
+def import_connection_spec(
+    tenant_id: str,
+    connection_id: str,
+    body: OpenApiImportRequest,
+    request: Request,
+):
+    return import_connection_spec_use_case(tenant_id, connection_id, body, request)
 
 
 @router.post("/connections/{connection_id}/specs/import", status_code=201)
 def import_connection_spec_global(connection_id: str, body: OpenApiImportRequest, request: Request):
-    return import_connection_spec(_global_owner(connection_id).tenant_id, connection_id, body, request)
+    return import_connection_spec_use_case(
+        _global_owner(connection_id).tenant_id, connection_id, body, request
+    )
 
 
-@router.post("/tenants/{tenant_id}/connections/{connection_id}/specs/{spec_id}/revisions/{revision}/validate")
-def validate_connection_spec(
+def validate_connection_spec_use_case(
     tenant_id: str,
     connection_id: str,
     spec_id: str,
@@ -815,19 +1383,97 @@ def validate_connection_spec(
     if stored is None:
         raise HTTPException(404, "revision not found")
     try:
-        validate_revision(stored, data_mode=record.data_mode)
+        compiled = validate_revision(stored, data_mode=record.data_mode)
     except (SpecValidationError, ValueError, TypeError):
         raise HTTPException(422, "invalid declarative specification") from None
-    return {"valid": True, "spec_id": spec_id, "revision": revision, "status": stored.status}
+    return {
+        "valid": True,
+        "spec_id": spec_id,
+        "revision": revision,
+        "status": compiled.status,
+        "preview": _declarative_preview(compiled),
+    }
+
+
+@router.post("/tenants/{tenant_id}/connections/{connection_id}/specs/{spec_id}/revisions/{revision}/validate")
+def validate_connection_spec(
+    tenant_id: str,
+    connection_id: str,
+    spec_id: str,
+    revision: int,
+    request: Request,
+):
+    return validate_connection_spec_use_case(
+        tenant_id, connection_id, spec_id, revision, request
+    )
 
 
 @router.post("/connections/{connection_id}/specs/{spec_id}/revisions/{revision}/validate")
 def validate_connection_spec_global(connection_id: str, spec_id: str, revision: int, request: Request):
-    return validate_connection_spec(_global_owner(connection_id).tenant_id, connection_id, spec_id, revision, request)
+    return validate_connection_spec_use_case(
+        _global_owner(connection_id).tenant_id,
+        connection_id,
+        spec_id,
+        revision,
+        request,
+    )
 
 
-@router.post("/tenants/{tenant_id}/connections/{connection_id}/specs/{spec_id}/revisions/{revision}/publish")
-def publish_connection_spec(
+def delete_connection_spec_use_case(
+    tenant_id: str,
+    connection_id: str,
+    spec_id: str,
+    revision: int,
+    request: Request,
+):
+    record = _owned(tenant_id, connection_id)
+    _require_declarative(record)
+    try:
+        deleted = store.delete_declarative_revision(
+            spec_id,
+            revision,
+            tenant_id,
+            connection_id,
+        )
+    except store.DeclarativeRevisionInUseError:
+        raise HTTPException(409, "declarative revision is referenced") from None
+    if not deleted:
+        raise HTTPException(404, "revision not found")
+    _audit(record, "declarative_spec_deleted")
+    return {"ok": True}
+
+
+@router.delete("/tenants/{tenant_id}/connections/{connection_id}/specs/{spec_id}/revisions/{revision}")
+def delete_connection_spec(
+    tenant_id: str,
+    connection_id: str,
+    spec_id: str,
+    revision: int,
+    request: Request,
+):
+    return delete_connection_spec_use_case(
+        tenant_id, connection_id, spec_id, revision, request
+    )
+
+
+@router.delete("/connections/{connection_id}/specs/{spec_id}/revisions/{revision}")
+def delete_connection_spec_global(
+    connection_id: str,
+    spec_id: str,
+    revision: int,
+    request: Request,
+):
+    record = _global_owner(connection_id)
+    return delete_connection_spec_use_case(
+        record.tenant_id,
+        connection_id,
+        spec_id,
+        revision,
+        request,
+    )
+
+
+def publish_connection_spec_use_case(
     tenant_id: str,
     connection_id: str,
     spec_id: str,
@@ -856,13 +1502,31 @@ def publish_connection_spec(
     return {"spec_id": spec_id, "revision": revision, "status": "published"}
 
 
+@router.post("/tenants/{tenant_id}/connections/{connection_id}/specs/{spec_id}/revisions/{revision}/publish")
+def publish_connection_spec(
+    tenant_id: str,
+    connection_id: str,
+    spec_id: str,
+    revision: int,
+    request: Request,
+):
+    return publish_connection_spec_use_case(
+        tenant_id, connection_id, spec_id, revision, request
+    )
+
+
 @router.post("/connections/{connection_id}/specs/{spec_id}/revisions/{revision}/publish")
 def publish_connection_spec_global(connection_id: str, spec_id: str, revision: int, request: Request):
-    return publish_connection_spec(_global_owner(connection_id).tenant_id, connection_id, spec_id, revision, request)
+    return publish_connection_spec_use_case(
+        _global_owner(connection_id).tenant_id,
+        connection_id,
+        spec_id,
+        revision,
+        request,
+    )
 
 
-@router.post("/tenants/{tenant_id}/connections/{connection_id}/specs/{spec_id}/revisions/{revision}/activate")
-def activate_connection_spec(
+def activate_connection_spec_use_case(
     tenant_id: str,
     connection_id: str,
     spec_id: str,
@@ -904,6 +1568,25 @@ def activate_connection_spec(
     return {"connection": _safe_connection_for_request(request, activated)}
 
 
+@router.post("/tenants/{tenant_id}/connections/{connection_id}/specs/{spec_id}/revisions/{revision}/activate")
+def activate_connection_spec(
+    tenant_id: str,
+    connection_id: str,
+    spec_id: str,
+    revision: int,
+    request: Request,
+):
+    return activate_connection_spec_use_case(
+        tenant_id, connection_id, spec_id, revision, request
+    )
+
+
 @router.post("/connections/{connection_id}/specs/{spec_id}/revisions/{revision}/activate")
 def activate_connection_spec_global(connection_id: str, spec_id: str, revision: int, request: Request):
-    return activate_connection_spec(_global_owner(connection_id).tenant_id, connection_id, spec_id, revision, request)
+    return activate_connection_spec_use_case(
+        _global_owner(connection_id).tenant_id,
+        connection_id,
+        spec_id,
+        revision,
+        request,
+    )

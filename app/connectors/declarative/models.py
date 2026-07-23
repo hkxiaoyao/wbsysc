@@ -37,9 +37,17 @@ MAX_PAGE_COUNT = 10
 MAX_PAGE_LIMIT = 1_000
 MAX_TIMEOUT_MS = 30_000
 DEFAULT_TIMEOUT_MS = 10_000
+MAX_TOOL_STEPS = 16
+MAX_TOOL_TIMEOUT_MS = 60_000
 
 _IDENTIFIER_RE = re.compile(r"^[A-Za-z][A-Za-z0-9_.-]{0,127}$")
 _SCOPE_IDENTIFIER_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.-]{0,127}$")
+_STEP_IDENTIFIER_RE = re.compile(r"^[A-Za-z][A-Za-z0-9_-]{0,63}$")
+_VALUE_FIELD_RE = re.compile(r"^[A-Za-z][A-Za-z0-9_.-]{0,127}$")
+_INPUT_VALUE_REF_RE = re.compile(r"^\$input\.([A-Za-z][A-Za-z0-9_.-]{0,127})$")
+_STEP_VALUE_REF_RE = re.compile(
+    r"^\$steps\.([A-Za-z][A-Za-z0-9_-]{0,63})\.([A-Za-z][A-Za-z0-9_.-]{0,127})$"
+)
 _HEADER_RE = re.compile(r"^[A-Za-z0-9-]{1,64}$")
 _BODY_TARGET_RE = re.compile(r"^[A-Za-z][A-Za-z0-9_-]{0,63}$")
 _PROTECTED_DYNAMIC_HEADERS = frozenset(
@@ -72,6 +80,7 @@ _EXPRESSION_MARKERS = (
     "eval(",
     "exec(",
 )
+_VALUE_REFERENCE_MARKERS = ("$input.", "$steps.")
 
 
 class SpecValidationError(ValueError):
@@ -224,6 +233,23 @@ def assert_safe_declaration_value(
             assert_safe_declaration_value(child, depth=depth + 1, counter=counter)
         return
     raise SpecValidationError("specification contains unsupported values")
+
+
+def _assert_safe_non_reference_value(value: Any) -> None:
+    """Apply declaration safety and forbid references in ordinary values."""
+    assert_safe_declaration_value(value)
+    if isinstance(value, str):
+        if any(marker in value for marker in _VALUE_REFERENCE_MARKERS):
+            raise SpecValidationError("value references are not supported in this position")
+        return
+    if isinstance(value, Mapping):
+        for key, child in value.items():
+            _assert_safe_non_reference_value(key)
+            _assert_safe_non_reference_value(child)
+        return
+    if isinstance(value, (list, tuple)):
+        for child in value:
+            _assert_safe_non_reference_value(child)
 
 
 def _freeze_json_value(value: Any) -> Any:
@@ -395,6 +421,238 @@ class OutputMapping:
     def __post_init__(self) -> None:
         _identifier("output name", self.name)
         _pointer_tokens(self.pointer)
+
+
+@dataclass(frozen=True)
+class ValueRef:
+    """One value selected from tool input or a declared earlier step output."""
+
+    source: Literal["input", "steps"]
+    field: str
+    step_id: str | None = None
+
+    def __post_init__(self) -> None:
+        if self.source == "input":
+            if self.step_id is not None or not _VALUE_FIELD_RE.fullmatch(self.field):
+                raise SpecValidationError("invalid input reference")
+        elif self.source == "steps":
+            if (
+                self.step_id is None
+                or not _STEP_IDENTIFIER_RE.fullmatch(self.step_id)
+                or not _VALUE_FIELD_RE.fullmatch(self.field)
+            ):
+                raise SpecValidationError("invalid step reference")
+        else:
+            raise SpecValidationError("unsupported value reference")
+
+    @classmethod
+    def parse(cls, raw: Any) -> "ValueRef":
+        if not isinstance(raw, str):
+            raise SpecValidationError("value reference must be a string")
+        input_match = _INPUT_VALUE_REF_RE.fullmatch(raw)
+        if input_match is not None:
+            return cls(source="input", field=input_match.group(1))
+        step_match = _STEP_VALUE_REF_RE.fullmatch(raw)
+        if step_match is not None:
+            return cls(
+                source="steps",
+                step_id=step_match.group(1),
+                field=step_match.group(2),
+            )
+        raise SpecValidationError("unsupported value reference")
+
+    def __str__(self) -> str:
+        if self.source == "input":
+            return f"$input.{self.field}"
+        return f"$steps.{self.step_id}.{self.field}"
+
+
+def _value_ref_mapping(
+    value: Mapping[str, ValueRef],
+    *,
+    label: str,
+) -> Mapping[str, ValueRef]:
+    if not isinstance(value, Mapping):
+        raise SpecValidationError(f"{label} must be an object")
+    frozen: dict[str, ValueRef] = {}
+    for name, reference in value.items():
+        _identifier(label, name)
+        if not isinstance(reference, ValueRef):
+            raise SpecValidationError(f"invalid {label} reference")
+        frozen[name] = reference
+    return MappingProxyType(frozen)
+
+
+def _string_mapping(
+    value: Mapping[str, str],
+    *,
+    key_label: str,
+    value_label: str,
+) -> Mapping[str, str]:
+    if not isinstance(value, Mapping):
+        raise SpecValidationError(f"{key_label} must be an object")
+    frozen: dict[str, str] = {}
+    for name, target in value.items():
+        _identifier(key_label, name)
+        _identifier(value_label, target)
+        frozen[name] = target
+    return MappingProxyType(frozen)
+
+
+def _validate_property_schema(value: Any, *, label: str, depth: int = 0) -> None:
+    if not isinstance(value, Mapping) or depth > MAX_MAPPING_DEPTH:
+        raise SpecValidationError(f"invalid {label} property schema")
+    assert_safe_declaration_value(value)
+    schema_type = value.get("type")
+    if schema_type is not None and schema_type not in {
+        "string",
+        "integer",
+        "number",
+        "boolean",
+        "array",
+        "object",
+        "null",
+    }:
+        raise SpecValidationError(f"invalid {label} property schema")
+    if "items" in value:
+        _validate_property_schema(value["items"], label=label, depth=depth + 1)
+    if "properties" in value:
+        properties = value["properties"]
+        if not isinstance(properties, Mapping):
+            raise SpecValidationError(f"invalid {label} property schema")
+        for name, child in properties.items():
+            if not isinstance(name, str) or not _VALUE_FIELD_RE.fullmatch(name):
+                raise SpecValidationError(f"invalid {label} field")
+            _validate_property_schema(child, label=label, depth=depth + 1)
+        required = value.get("required", ())
+        if not isinstance(required, (list, tuple)) or any(
+            not isinstance(name, str) or name not in properties for name in required
+        ):
+            raise SpecValidationError(f"invalid {label} required fields")
+
+
+def _schema_fields(
+    schema: Mapping[str, Any],
+    *,
+    label: str,
+    require_non_empty: bool = False,
+) -> frozenset[str]:
+    if schema.get("type") != "object" or schema.get("additionalProperties") is not False:
+        raise SpecValidationError(f"invalid {label} schema")
+    properties = schema.get("properties")
+    if not isinstance(properties, Mapping) or (require_non_empty and not properties):
+        raise SpecValidationError(f"invalid {label} schema")
+    for name, property_schema in properties.items():
+        if not isinstance(name, str) or not _VALUE_FIELD_RE.fullmatch(name):
+            raise SpecValidationError(f"invalid {label} field")
+        _validate_property_schema(property_schema, label=label)
+    required = schema.get("required", ())
+    if not isinstance(required, (list, tuple)) or any(
+        not isinstance(name, str) or name not in properties for name in required
+    ):
+        raise SpecValidationError(f"invalid {label} required fields")
+    return frozenset(properties)
+
+
+@dataclass(frozen=True)
+class DeclarativeStep:
+    """One sequential invocation of an operation in the same revision."""
+
+    step_id: str
+    operation_key: str
+    input_mappings: Mapping[str, ValueRef]
+    output_mappings: Mapping[str, str]
+    timeout_ms: int | None = None
+
+    def __post_init__(self) -> None:
+        if not isinstance(self.step_id, str) or not _STEP_IDENTIFIER_RE.fullmatch(self.step_id):
+            raise SpecValidationError("invalid step ID")
+        _identifier("step operation key", self.operation_key)
+        inputs = _value_ref_mapping(self.input_mappings, label="step input")
+        outputs = _string_mapping(
+            self.output_mappings,
+            key_label="step output",
+            value_label="operation output",
+        )
+        if len(inputs) > MAX_INPUT_MAPPINGS or not outputs or len(outputs) > MAX_OUTPUT_MAPPINGS:
+            raise SpecValidationError("invalid step mappings")
+        if self.timeout_ms is not None and (
+            not isinstance(self.timeout_ms, int)
+            or isinstance(self.timeout_ms, bool)
+            or not 1 <= self.timeout_ms <= MAX_TIMEOUT_MS
+        ):
+            raise SpecValidationError("invalid step timeout")
+        object.__setattr__(self, "input_mappings", inputs)
+        object.__setattr__(self, "output_mappings", outputs)
+
+
+@dataclass(frozen=True)
+class DeclarativeTool:
+    """An immutable public tool composed from one to sixteen sequential steps."""
+
+    tool_key: str
+    mcp_name: str
+    description: str
+    input_schema: Mapping[str, Any]
+    output_schema: Mapping[str, Any]
+    steps: tuple[DeclarativeStep, ...]
+    result_map: Mapping[str, ValueRef]
+    cache_ttl_seconds: int | None = None
+
+    def __post_init__(self) -> None:
+        _identifier("tool key", self.tool_key)
+        _identifier("MCP name", self.mcp_name)
+        if not isinstance(self.description, str) or len(self.description) > 512:
+            raise SpecValidationError("invalid tool description")
+        input_schema = _frozen_mapping(self.input_schema)
+        output_schema = _frozen_mapping(self.output_schema)
+        input_fields = _schema_fields(input_schema, label="tool input")
+        output_fields = _schema_fields(
+            output_schema,
+            label="tool output",
+            require_non_empty=True,
+        )
+        steps = tuple(self.steps)
+        if not 1 <= len(steps) <= MAX_TOOL_STEPS or any(
+            not isinstance(step, DeclarativeStep) for step in steps
+        ):
+            raise SpecValidationError("tool requires one to sixteen steps")
+        if len({step.step_id for step in steps}) != len(steps):
+            raise SpecValidationError("duplicate step ID")
+
+        available_outputs: dict[str, frozenset[str]] = {}
+
+        def validate_reference(reference: ValueRef) -> None:
+            if reference.source == "input":
+                if reference.field not in input_fields:
+                    raise SpecValidationError("reference targets undeclared tool input")
+                return
+            declared = available_outputs.get(reference.step_id or "")
+            if declared is None:
+                raise SpecValidationError("step reference must target an earlier step")
+            if reference.field not in declared:
+                raise SpecValidationError("reference targets undeclared step output")
+
+        for step in steps:
+            for reference in step.input_mappings.values():
+                validate_reference(reference)
+            available_outputs[step.step_id] = frozenset(step.output_mappings)
+
+        result_map = _value_ref_mapping(self.result_map, label="result")
+        if not result_map or frozenset(result_map) != output_fields:
+            raise SpecValidationError("result map must declare every final output")
+        for reference in result_map.values():
+            validate_reference(reference)
+        if self.cache_ttl_seconds is not None and (
+            not isinstance(self.cache_ttl_seconds, int)
+            or isinstance(self.cache_ttl_seconds, bool)
+            or not 0 <= self.cache_ttl_seconds <= 86_400
+        ):
+            raise SpecValidationError("invalid tool cache TTL")
+        object.__setattr__(self, "input_schema", input_schema)
+        object.__setattr__(self, "output_schema", output_schema)
+        object.__setattr__(self, "steps", steps)
+        object.__setattr__(self, "result_map", result_map)
 
 
 @dataclass(frozen=True)
@@ -779,6 +1037,7 @@ class DeclarativeRevision:
     base_url: str = ""
     allowed_hosts: tuple[str, ...] = ()
     operations: tuple[DeclarativeOperation, ...] = ()
+    tools: tuple[DeclarativeTool, ...] = ()
     auth_scheme: AuthScheme | None = None
     sync_spec: SyncSpec | None = None
 
@@ -815,6 +1074,60 @@ class DeclarativeRevision:
                 if identifier in identifiers:
                     raise SpecValidationError("duplicate operation identifier")
                 identifiers.add(identifier)
+        tools = tuple(self.tools) or tuple(
+            self._single_operation_tool(operation) for operation in operations
+        )
+        if len(tools) > MAX_OPERATION_COUNT or any(
+            not isinstance(tool, DeclarativeTool) for tool in tools
+        ):
+            raise SpecValidationError("invalid declarative tools")
+        tool_identifiers: set[str] = set()
+        operations_by_key = {operation.tool_key: operation for operation in operations}
+        for tool in tools:
+            for identifier in {tool.tool_key, tool.mcp_name}:
+                if identifier in tool_identifiers:
+                    raise SpecValidationError("duplicate tool identifier")
+                tool_identifiers.add(identifier)
+            total_timeout_ms = 0
+            write_steps = 0
+            for step in tool.steps:
+                operation = operations_by_key.get(step.operation_key)
+                if operation is None:
+                    raise SpecValidationError("tool step operation is not declared")
+                declared_inputs = {
+                    mapping.arg_name: mapping for mapping in operation.input_mappings
+                }
+                if any(name not in declared_inputs for name in step.input_mappings):
+                    raise SpecValidationError("step input is not declared by operation")
+                if any(
+                    mapping.required and name not in step.input_mappings
+                    for name, mapping in declared_inputs.items()
+                ):
+                    raise SpecValidationError("required operation input is not mapped")
+                declared_outputs = {
+                    mapping.name for mapping in operation.output_mappings
+                }
+                if any(
+                    output_name not in declared_outputs
+                    for output_name in step.output_mappings.values()
+                ):
+                    raise SpecValidationError("step output is not declared by operation")
+                timeout_ms = (
+                    operation.timeout_ms if step.timeout_ms is None else step.timeout_ms
+                )
+                if (
+                    not isinstance(timeout_ms, int)
+                    or isinstance(timeout_ms, bool)
+                    or not 1 <= timeout_ms <= MAX_TIMEOUT_MS
+                ):
+                    raise SpecValidationError("invalid step timeout")
+                total_timeout_ms += timeout_ms
+                if operation.operation_kind == "write":
+                    write_steps += 1
+            if total_timeout_ms > MAX_TOOL_TIMEOUT_MS:
+                raise SpecValidationError("tool timeout exceeds total limit")
+            if write_steps > 1:
+                raise SpecValidationError("tool may contain at most one write step")
         if self.auth_scheme is not None and not isinstance(self.auth_scheme, AuthScheme):
             raise SpecValidationError("invalid declarative authentication")
         if self.auth_scheme is not None and self.auth_scheme.kind == "oauth2_client_credentials":
@@ -845,11 +1158,53 @@ class DeclarativeRevision:
                 raise SpecValidationError("sync field mapping is not declared")
         object.__setattr__(self, "allowed_hosts", hosts)
         object.__setattr__(self, "operations", operations)
+        object.__setattr__(self, "tools", tools)
+
+    @staticmethod
+    def _single_operation_tool(operation: DeclarativeOperation) -> DeclarativeTool:
+        step_id = "operation"
+        return DeclarativeTool(
+            tool_key=operation.tool_key,
+            mcp_name=operation.mcp_name,
+            description=operation.description,
+            input_schema=operation.input_schema,
+            output_schema=operation.output_schema,
+            steps=(
+                DeclarativeStep(
+                    step_id=step_id,
+                    operation_key=operation.tool_key,
+                    input_mappings={
+                        mapping.arg_name: ValueRef(
+                            source="input", field=mapping.arg_name
+                        )
+                        for mapping in operation.input_mappings
+                    },
+                    output_mappings={
+                        mapping.name: mapping.name
+                        for mapping in operation.output_mappings
+                    },
+                    timeout_ms=operation.timeout_ms,
+                ),
+            ),
+            result_map={
+                mapping.name: ValueRef(
+                    source="steps", step_id=step_id, field=mapping.name
+                )
+                for mapping in operation.output_mappings
+            },
+            cache_ttl_seconds=operation.cache_ttl_seconds,
+        )
 
     def operation_for(self, tool_key: str) -> DeclarativeOperation:
         for operation in self.operations:
             if tool_key in {operation.tool_key, operation.mcp_name}:
                 return operation
+        raise UnknownToolError("unknown declarative tool")
+
+    def tool_for(self, tool_key: str) -> DeclarativeTool:
+        for tool in self.tools:
+            if tool_key in {tool.tool_key, tool.mcp_name}:
+                return tool
         raise UnknownToolError("unknown declarative tool")
 
     def assert_data_mode_allowed(self, data_mode: str) -> None:
@@ -862,18 +1217,33 @@ class DeclarativeRevision:
         """Build the common runtime manifest without importing it at module load."""
         from app.connectors.contracts import ConnectorSpec, ToolSpec
 
+        operation_by_key = {
+            operation.tool_key: operation for operation in self.operations
+        }
         tools = tuple(
             ToolSpec(
-                tool_key=operation.tool_key,
-                mcp_name=operation.mcp_name,
-                description=operation.description,
-                input_schema=operation.input_schema,
-                output_schema=operation.output_schema,
-                operation_kind=operation.operation_kind,
-                default_timeout_ms=operation.timeout_ms,
-                cache_ttl_seconds=operation.cache_ttl_seconds,
+                tool_key=tool.tool_key,
+                mcp_name=tool.mcp_name,
+                description=tool.description,
+                input_schema=_plain_json_value(tool.input_schema),
+                output_schema=_plain_json_value(tool.output_schema),
+                operation_kind=(
+                    "write"
+                    if any(
+                        operation_by_key[step.operation_key].operation_kind == "write"
+                        for step in tool.steps
+                    )
+                    else "read"
+                ),
+                default_timeout_ms=sum(
+                    step.timeout_ms
+                    if step.timeout_ms is not None
+                    else operation_by_key[step.operation_key].timeout_ms
+                    for step in tool.steps
+                ),
+                cache_ttl_seconds=tool.cache_ttl_seconds,
             )
-            for operation in self.operations
+            for tool in self.tools
         )
         credential_schema: dict[str, Any] = {"type": "object", "properties": {}}
         if self.auth_scheme is not None:
@@ -937,6 +1307,33 @@ class DeclarativeRevision:
                 ),
             }
 
+        def tool_document(tool: DeclarativeTool) -> dict[str, Any]:
+            return {
+                "tool_key": tool.tool_key,
+                "mcp_name": tool.mcp_name,
+                "description": tool.description,
+                "input_schema": _plain_json_value(tool.input_schema),
+                "output_schema": _plain_json_value(tool.output_schema),
+                "steps": [
+                    {
+                        "step_id": step.step_id,
+                        "operation_key": step.operation_key,
+                        "input_mappings": {
+                            name: str(reference)
+                            for name, reference in step.input_mappings.items()
+                        },
+                        "output_mappings": dict(step.output_mappings),
+                        "timeout_ms": step.timeout_ms,
+                    }
+                    for step in tool.steps
+                ],
+                "result_map": {
+                    name: str(reference)
+                    for name, reference in tool.result_map.items()
+                },
+                "cache_ttl_seconds": tool.cache_ttl_seconds,
+            }
+
         auth_scheme: dict[str, Any] | None
         if self.auth_scheme is None:
             auth_scheme = None
@@ -969,6 +1366,7 @@ class DeclarativeRevision:
             "auth_scheme": auth_scheme,
             "sync_spec": sync_spec,
             "operations": [operation_document(operation) for operation in self.operations],
+            "tools": [tool_document(tool) for tool in self.tools],
         }
         assert_safe_declaration_value(document)
         _assert_bounded_json_value(document)
@@ -997,12 +1395,14 @@ class DeclarativeRevision:
         assert_safe_declaration_value(document)
         if _json_size(document) > MAX_DOCUMENT_BYTES:
             raise SpecValidationError("persisted declaration exceeds size limit")
-        stored = _stored_object(
-            document,
-            required=frozenset(
-                {"base_url", "allowed_hosts", "auth_scheme", "sync_spec", "operations"}
-            ),
+        legacy_keys = frozenset(
+            {"base_url", "allowed_hosts", "auth_scheme", "sync_spec", "operations"}
         )
+        stored_keys = frozenset({*legacy_keys, "tools"})
+        if isinstance(document, Mapping) and set(document) == legacy_keys:
+            stored = _stored_object(document, required=legacy_keys)
+        else:
+            stored = _stored_object(document, required=stored_keys)
         base_url = stored["base_url"]
         allowed_hosts = stored["allowed_hosts"]
         raw_operations = stored["operations"]
@@ -1017,6 +1417,8 @@ class DeclarativeRevision:
             raise SpecValidationError("invalid persisted declarative revision")
 
         auth_scheme: AuthScheme | None
+        _assert_safe_non_reference_value(base_url)
+        _assert_safe_non_reference_value(allowed_hosts)
         raw_auth = stored["auth_scheme"]
         if raw_auth is None:
             auth_scheme = None
@@ -1038,6 +1440,7 @@ class DeclarativeRevision:
                     }
                 ),
             )
+            _assert_safe_non_reference_value(auth)
             raw_scopes = auth["scopes"]
             if not isinstance(raw_scopes, list):
                 raise SpecValidationError("invalid persisted declarative revision")
@@ -1070,6 +1473,7 @@ class DeclarativeRevision:
                     }
                 ),
             )
+            _assert_safe_non_reference_value(sync)
             if not isinstance(sync["field_mappings"], Mapping):
                 raise SpecValidationError("invalid persisted declarative revision")
             sync_spec = SyncSpec(
@@ -1100,6 +1504,7 @@ class DeclarativeRevision:
                     }
                 ),
             )
+            _assert_safe_non_reference_value(operation)
             raw_inputs = operation["input_mappings"]
             raw_outputs = operation["output_mappings"]
             if (
@@ -1176,6 +1581,92 @@ class DeclarativeRevision:
                     pagination=pagination,
                 )
             )
+        tools: list[DeclarativeTool] = []
+        if "tools" in stored:
+            raw_tools = stored["tools"]
+            if (
+                not isinstance(raw_tools, list)
+                or not raw_tools
+                or len(raw_tools) > MAX_OPERATION_COUNT
+            ):
+                raise SpecValidationError("invalid persisted declarative revision")
+            for raw_tool in raw_tools:
+                tool = _stored_object(
+                    raw_tool,
+                    required=frozenset(
+                        {
+                            "tool_key",
+                            "mcp_name",
+                            "description",
+                            "input_schema",
+                            "output_schema",
+                            "steps",
+                            "result_map",
+                            "cache_ttl_seconds",
+                        }
+                    ),
+                )
+                if (
+                    not isinstance(tool["input_schema"], Mapping)
+                    or not isinstance(tool["output_schema"], Mapping)
+                    or not isinstance(tool["steps"], list)
+                    or not isinstance(tool["result_map"], Mapping)
+                ):
+                    raise SpecValidationError("invalid persisted declarative revision")
+                _assert_safe_non_reference_value(tool["description"])
+                _assert_safe_non_reference_value(tool["input_schema"])
+                _assert_safe_non_reference_value(tool["output_schema"])
+                steps: list[DeclarativeStep] = []
+                for raw_step in tool["steps"]:
+                    step = _stored_object(
+                        raw_step,
+                        required=frozenset(
+                            {
+                                "step_id",
+                                "operation_key",
+                                "input_mappings",
+                                "output_mappings",
+                                "timeout_ms",
+                            }
+                        ),
+                    )
+                    raw_step_inputs = step["input_mappings"]
+                    raw_step_outputs = step["output_mappings"]
+                    if not isinstance(raw_step_inputs, Mapping) or not isinstance(
+                        raw_step_outputs, Mapping
+                    ):
+                        raise SpecValidationError("invalid persisted declarative revision")
+                    _assert_safe_non_reference_value(step["step_id"])
+                    _assert_safe_non_reference_value(step["operation_key"])
+                    _assert_safe_non_reference_value(raw_step_outputs)
+                    _assert_safe_non_reference_value(step["timeout_ms"])
+                    steps.append(
+                        DeclarativeStep(
+                            step_id=step["step_id"],
+                            operation_key=step["operation_key"],
+                            input_mappings={
+                                name: ValueRef.parse(reference)
+                                for name, reference in raw_step_inputs.items()
+                            },
+                            output_mappings=dict(raw_step_outputs),
+                            timeout_ms=step["timeout_ms"],
+                        )
+                    )
+                tools.append(
+                    DeclarativeTool(
+                        tool_key=tool["tool_key"],
+                        mcp_name=tool["mcp_name"],
+                        description=tool["description"],
+                        input_schema=tool["input_schema"],
+                        output_schema=tool["output_schema"],
+                        steps=tuple(steps),
+                        result_map={
+                            name: ValueRef.parse(reference)
+                            for name, reference in tool["result_map"].items()
+                        },
+                        cache_ttl_seconds=tool["cache_ttl_seconds"],
+                    )
+                )
         return cls(
             spec_id=spec_id,
             revision=revision,
@@ -1185,6 +1676,7 @@ class DeclarativeRevision:
             base_url=base_url,
             allowed_hosts=tuple(allowed_hosts),
             operations=tuple(operations),
+            tools=tuple(tools),
             auth_scheme=auth_scheme,
             sync_spec=sync_spec,
         )

@@ -86,7 +86,10 @@ function normalizeCosts(minValue, maxValue) {
 function filterQuery(filters = DEFAULT_LOG_FILTERS) {
   const query = {}
   const tenantId = normalizeText(filters?.tenantId)
+  const serviceId = normalizeText(filters?.serviceId)
+  const toolAlias = normalizeText(filters?.toolAlias)
   const connectionId = normalizeText(filters?.connectionId)
+  const sourceToolKey = normalizeText(filters?.sourceToolKey)
   const connectorKey = normalizeText(filters?.connectorKey)
   const category = normalizeEnum(filters?.category, CATEGORY_VALUES)
   const eventName = normalizeText(filters?.eventName)
@@ -98,7 +101,10 @@ function filterQuery(filters = DEFAULT_LOG_FILTERS) {
   const costs = normalizeCosts(filters?.costMin, filters?.costMax)
 
   if (tenantId) query.tenant_id = tenantId
+  if (serviceId) query.service_id = serviceId
+  if (toolAlias) query.tool_alias = toolAlias
   if (connectionId) query.connection_id = connectionId
+  if (sourceToolKey) query.tool_key = sourceToolKey
   if (connectorKey) query.connector_key = connectorKey
   if (category) query.category = category
   if (eventName) query.event_name = eventName
@@ -112,6 +118,41 @@ function filterQuery(filters = DEFAULT_LOG_FILTERS) {
   if (costs.costMax !== '') query.cost_max = costs.costMax
 
   return query
+}
+
+function tenantFilterQuery(filters = DEFAULT_LOG_FILTERS) {
+  const query = {}
+  const serviceId = normalizeText(filters?.serviceId)
+  const toolAlias = normalizeText(filters?.toolAlias)
+  const connectionId = normalizeText(filters?.connectionId)
+  const sourceToolKey = normalizeText(filters?.sourceToolKey)
+  const status = normalizeEnum(filters?.status, STATUS_VALUES)
+
+  if (serviceId) query.service_id = serviceId
+  if (toolAlias) query.tool_alias = toolAlias
+  if (connectionId) query.connection_id = connectionId
+  if (sourceToolKey) query.source_tool_key = sourceToolKey
+  if (status) query.status = status
+  return query
+}
+
+export function logCollectionEndpoint(scope = 'admin') {
+  return scope === 'tenant' ? '/tenant/mcp-logs' : '/admin/mcp-logs'
+}
+
+export function logScopeCopy(scope = 'admin', filters = {}, tenantLabel = '全部租户') {
+  if (scope === 'tenant') {
+    return {
+      perspective: '当前租户视角',
+      identity: filters?.connectionId
+        ? `当前会话租户 · ${normalizeText(filters.connectionId)}`
+        : '当前会话租户',
+    }
+  }
+  return {
+    perspective: filters?.connectionId ? '连接视角' : filters?.tenantId ? '租户视角' : '全局视角',
+    identity: normalizeText(filters?.connectionId) || tenantLabel,
+  }
 }
 
 function positiveInteger(value, fallback, maximum = Number.MAX_SAFE_INTEGER) {
@@ -197,6 +238,19 @@ export function parseLogLocation(search = '') {
   }
 }
 
+export function parseScopedLogLocation(scope = 'admin', search = '') {
+  const filters = parseLogLocation(search)
+  if (scope !== 'tenant') return filters
+  const params = new URLSearchParams(search)
+  return {
+    ...filters,
+    tenantId: '',
+    serviceId: normalizeText(params.get('service_id')),
+    toolAlias: normalizeText(params.get('tool_alias')),
+    sourceToolKey: normalizeText(params.get('source_tool_key')),
+  }
+}
+
 export function serializeLogFilters(filters = DEFAULT_LOG_FILTERS) {
   const params = new URLSearchParams()
   for (const [key, value] of Object.entries(filterQuery(filters))) {
@@ -205,9 +259,24 @@ export function serializeLogFilters(filters = DEFAULT_LOG_FILTERS) {
   return params.toString()
 }
 
+export function serializeScopedLogFilters(scope = 'admin', filters = DEFAULT_LOG_FILTERS) {
+  const query = scope === 'tenant' ? tenantFilterQuery(filters) : filterQuery(filters)
+  const params = new URLSearchParams()
+  for (const [key, value] of Object.entries(query)) params.set(key, String(value))
+  return params.toString()
+}
+
 export function buildLogQuery(filters = DEFAULT_LOG_FILTERS, page = DEFAULT_PAGE, pageSize = DEFAULT_PAGE_SIZE) {
   return {
     ...filterQuery(filters),
+    page: positiveInteger(page, DEFAULT_PAGE),
+    page_size: positiveInteger(pageSize, DEFAULT_PAGE_SIZE, 100),
+  }
+}
+
+export function buildScopedLogQuery(scope = 'admin', filters = DEFAULT_LOG_FILTERS, page = DEFAULT_PAGE, pageSize = DEFAULT_PAGE_SIZE) {
+  return {
+    ...(scope === 'tenant' ? tenantFilterQuery(filters) : filterQuery(filters)),
     page: positiveInteger(page, DEFAULT_PAGE),
     page_size: positiveInteger(pageSize, DEFAULT_PAGE_SIZE, 100),
   }

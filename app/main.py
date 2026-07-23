@@ -13,9 +13,11 @@
 from __future__ import annotations
 
 import asyncio
+from collections.abc import Callable
 import contextlib
 from dataclasses import dataclass
 import logging
+from typing import Any
 
 import uvicorn
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
@@ -47,9 +49,16 @@ from .mcp_audit import (
     release_audit_writer,
 )
 from .mcp_gateway import ConnectionMcpGateway
+from .mcp_service_gateway import ServiceMcpGateway
+from .mcp_services import store as mcp_service_store
 from .admin import router as admin_router
 from .admin_connections import router as admin_connections_router
 from .mcp_logs_admin import router as mcp_logs_admin_router
+from .mcp_services.router import admin_router as mcp_services_admin_router
+from .mcp_services.router import tenant_router as mcp_services_tenant_router
+from .tenant_auth.router import router as tenant_auth_router
+from .tenant_console import router as tenant_console_router
+from .tenant_connections import router as tenant_connections_router
 
 logging.basicConfig(
     level=logging.INFO,
@@ -61,6 +70,10 @@ logger = logging.getLogger("wecom-gateway")
 _scheduler: AsyncIOScheduler | None = None
 mcp_gateway = ConnectionMcpGateway()
 connector_registry = mcp_gateway._runtime._registry
+service_gateway = ServiceMcpGateway(
+    runtime=mcp_gateway._runtime,
+    connection_context_builder=mcp_gateway.resolver.execution_context,
+)
 
 
 @dataclass(frozen=True)
@@ -172,11 +185,20 @@ def _build_connection_sync_orchestrator(
 connection_sync_orchestrator = _build_connection_sync_orchestrator()
 
 
-def create_app(*, gateway: ConnectionMcpGateway | None = None) -> FastAPI:
+def create_app(
+    *,
+    gateway: ConnectionMcpGateway | None = None,
+    service_gateway: ServiceMcpGateway | None = None,
+) -> FastAPI:
     settings = get_settings()
     gateway = gateway or mcp_gateway
+    service_gateway = service_gateway or globals()["service_gateway"]
     app = FastAPI(title="企微数据中转 MCP Gateway", version="0.1.0")
     app.state.mcp_gateway = gateway
+    app.state.mcp_service_gateway = service_gateway
+    app.state.mcp_service_enabled = bool(
+        getattr(settings, "mcp_service_enabled", False)
+    )
     gateway_registry = getattr(
         getattr(gateway, "_runtime", None), "_registry", connector_registry
     )
@@ -194,7 +216,18 @@ def create_app(*, gateway: ConnectionMcpGateway | None = None) -> FastAPI:
         if path == "/mcp":
             request.scope["path"] = "/mcp/"
         elif (
-            isinstance(path, str) and path.startswith("/mcp/") and path.count("/") == 2
+            app.state.mcp_service_enabled
+            and isinstance(path, str)
+            and path.startswith("/mcp/service/")
+            and path != "/mcp/service/"
+            and path.count("/") == 3
+        ):
+            request.scope["path"] = f"{path}/"
+        elif (
+            isinstance(path, str)
+            and path.startswith("/mcp/")
+            and path != "/mcp/service"
+            and path.count("/") == 2
         ):
             # A parameterized Mount needs its terminal slash to win over the
             # legacy `/mcp` catch-all mount for `/mcp/{connection_id}`.
@@ -205,6 +238,12 @@ def create_app(*, gateway: ConnectionMcpGateway | None = None) -> FastAPI:
     app.include_router(admin_router)
     app.include_router(admin_connections_router)
     app.include_router(mcp_logs_admin_router)
+    app.include_router(tenant_auth_router)
+    app.include_router(tenant_console_router)
+    app.include_router(tenant_connections_router)
+    if app.state.mcp_service_enabled:
+        app.include_router(mcp_services_tenant_router)
+    app.include_router(mcp_services_admin_router)
 
     # 健康检查（鉴权白名单）
     @app.get("/health")
@@ -214,7 +253,40 @@ def create_app(*, gateway: ConnectionMcpGateway | None = None) -> FastAPI:
             "env": settings.app_env,
             "mock": settings.wecom_use_mock,
             "scheduler": _scheduler.running if _scheduler else False,
+            "mcp_service_enabled": app.state.mcp_service_enabled,
         }
+
+    @app.api_route(
+        "/mcp/service/",
+        methods=["GET", "POST", "DELETE", "PUT", "PATCH", "OPTIONS", "HEAD"],
+        include_in_schema=False,
+    )
+    @app.api_route(
+        "/mcp/service",
+        methods=["GET", "POST", "DELETE", "PUT", "PATCH", "OPTIONS", "HEAD"],
+        include_in_schema=False,
+    )
+    async def reserved_service_route():
+        from fastapi.responses import JSONResponse
+
+        return JSONResponse({"detail": "Not Found"}, status_code=404)
+
+    if not app.state.mcp_service_enabled:
+
+        @app.api_route(
+            "/mcp/service/{service_id}",
+            methods=["GET", "POST", "DELETE", "PUT", "PATCH", "OPTIONS", "HEAD"],
+            include_in_schema=False,
+        )
+        @app.api_route(
+            "/mcp/service/{service_id}/{child_path:path}",
+            methods=["GET", "POST", "DELETE", "PUT", "PATCH", "OPTIONS", "HEAD"],
+            include_in_schema=False,
+        )
+        async def disabled_service_route(service_id: str, child_path: str = ""):
+            from fastapi.responses import JSONResponse
+
+            return JSONResponse({"detail": "Not Found"}, status_code=404)
 
     # /admin 快捷入口 → 静态管理后台（避免访问 /admin 或 /admin/index.html 得到 404）
     from fastapi.responses import RedirectResponse, Response
@@ -224,6 +296,12 @@ def create_app(*, gateway: ConnectionMcpGateway | None = None) -> FastAPI:
     @app.get("/admin/index.html", include_in_schema=False)
     async def admin_entry_redirect():
         return RedirectResponse(url="/admin/ui/", status_code=307)
+
+    @app.get("/tenant", include_in_schema=False)
+    @app.get("/tenant/", include_in_schema=False)
+    @app.get("/tenant/index.html", include_in_schema=False)
+    async def tenant_entry_redirect():
+        return RedirectResponse(url="/tenant/ui/", status_code=307)
 
     # 企微可信域名校验文件：根路径 /xxx.txt 公开可访问（反代到本服务后企微可拉取）
     from .domain_verify import get_verify_file, is_safe_verify_filename
@@ -255,6 +333,9 @@ def create_app(*, gateway: ConnectionMcpGateway | None = None) -> FastAPI:
         app.mount(
             "/admin/ui", StaticFiles(directory=dist_dir, html=True), name="admin-ui"
         )
+        app.mount(
+            "/tenant/ui", StaticFiles(directory=dist_dir, html=True), name="tenant-ui"
+        )
 
     # Each route reaches the same connection-aware gateway, but authentication
     # happens before it can create or dispatch a protocol session.
@@ -282,13 +363,31 @@ def create_app(*, gateway: ConnectionMcpGateway | None = None) -> FastAPI:
     dynamic_mcp_app = mcp_subapp(legacy=False)
     legacy_mcp_app = mcp_subapp(legacy=True)
 
+    service_mcp_app = Starlette(
+        routes=[Mount("/", app=service_gateway)],
+        middleware=[
+            Middleware(
+                CORSMiddleware,
+                allow_origins=["*"],
+                allow_methods=["GET", "POST", "DELETE"],
+                allow_headers=["*"],
+                expose_headers=["Mcp-Session-Id"],
+            )
+        ],
+    )
+
     # The parameterized mount must come first so a valid bearer token is bound
     # to the exact path connection ID before MCP handling.  `/mcp` remains for
     # callers using the Task 1 default legacy WeCom connection.
+    if app.state.mcp_service_enabled:
+        app.mount("/mcp/service/{service_id}", service_mcp_app)
     app.mount("/mcp/{connection_id}", dynamic_mcp_app)
     app.mount("/mcp", legacy_mcp_app)
 
-    logger.info("MCP Gateway mounted at /mcp/{connection_id} and legacy /mcp")
+    logger.info(
+        "MCP Gateway mounted service_enabled=%s at connection and legacy routes",
+        app.state.mcp_service_enabled,
+    )
     return app
 
 
@@ -320,6 +419,34 @@ async def _cleanup_logs_job_async():
         logger.error("MCP 日志清理异常 type=%s", type(exc).__name__)
 
 
+def _build_service_cache_invalidator(
+    gateway: Any, loop: asyncio.AbstractEventLoop
+) -> Callable[[str], None]:
+    async def invalidate(service_id: str) -> None:
+        lock = getattr(gateway, "_manager_lock", None)
+        if lock is None:
+            return
+        async with lock:
+            entries = getattr(gateway, "_entries", None)
+            if not isinstance(entries, dict):
+                return
+            for key in tuple(entries):
+                if isinstance(key, tuple) and key and key[0] == service_id:
+                    entries.pop(key, None)
+
+    def invalidate_from_any_thread(service_id: str) -> None:
+        try:
+            running_loop = asyncio.get_running_loop()
+        except RuntimeError:
+            running_loop = None
+        if running_loop is loop:
+            loop.create_task(invalidate(service_id))
+            return
+        asyncio.run_coroutine_threadsafe(invalidate(service_id), loop).result()
+
+    return invalidate_from_any_thread
+
+
 @contextlib.asynccontextmanager
 async def lifespan(app):
     global _scheduler
@@ -329,14 +456,28 @@ async def lifespan(app):
     db.run_startup_migrations()
     app_state = getattr(app, "state", None)
     gateway = getattr(app_state, "mcp_gateway", mcp_gateway)
+    service_session_manager = getattr(
+        app_state, "mcp_service_gateway", service_gateway
+    )
+    service_enabled = bool(
+        getattr(
+            app_state,
+            "mcp_service_enabled",
+            getattr(settings, "mcp_service_enabled", False),
+        )
+    )
     sync_orchestrator = getattr(
         app_state, "connection_sync_orchestrator", connection_sync_orchestrator
     )
+    gateway_registry = getattr(
+        getattr(gateway, "_runtime", None), "_registry", connector_registry
+    )
     if app_state is not None:
-        gateway_registry = getattr(
-            getattr(gateway, "_runtime", None), "_registry", connector_registry
-        )
         configure_trusted_connectors(registry=gateway_registry)
+    mcp_service_store.migrate_default_services(
+        gateway_registry,
+        enabled=service_enabled,
+    )
     acquire_audit_writer()
     audit_acquired = True
     audit_released = False
@@ -362,8 +503,20 @@ async def lifespan(app):
     # The gateway owns a cache of low-level Streamable HTTP session managers;
     # retain this lifecycle name for the established startup ordering contract.
     session_manager = gateway
+    invalidate_service_cache = _build_service_cache_invalidator(
+        service_session_manager,
+        asyncio.get_running_loop(),
+    )
+
+    if service_enabled:
+        mcp_service_store.register_service_cache_invalidator(
+            invalidate_service_cache
+        )
     try:
-        async with session_manager.run():
+        async with contextlib.AsyncExitStack() as stack:
+            await stack.enter_async_context(session_manager.run())
+            if service_enabled:
+                await stack.enter_async_context(service_session_manager.run())
             scheduler = None
             try:
                 # 3. APScheduler 定时同步
@@ -410,6 +563,10 @@ async def lifespan(app):
                     if _scheduler is scheduler:
                         _scheduler = None
     finally:
+        if service_enabled:
+            mcp_service_store.unregister_service_cache_invalidator(
+                invalidate_service_cache
+            )
         await release_audit_once()
 
 

@@ -4,12 +4,13 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 from datetime import datetime
 import re
-from typing import Literal
+from typing import Awaitable, Literal, Protocol
 
 
 LogCategory = Literal["tool", "protocol", "auth"]
 LogStatus = Literal["ok", "partial", "error", "denied"]
 DeleteMode = Literal["ids", "filter", "before_date", "all"]
+StepAuditStatus = Literal["ok", "error"]
 
 _CATEGORIES = frozenset(("tool", "protocol", "auth"))
 _STATUSES = frozenset(("ok", "partial", "error", "denied"))
@@ -17,6 +18,10 @@ _DIMENSION_IDENTIFIER_RE = re.compile(r"[A-Za-z0-9][A-Za-z0-9_.:-]*\Z")
 _SENSITIVE_DIMENSION_PARTS = frozenset(
     {"authorization", "cookie", "credential", "password", "secret", "token"}
 )
+_STEP_AUDIT_ERROR_CODES = frozenset(
+    ("", "cancelled", "mapping_error", "operation_error", "timeout")
+)
+MAX_STEP_AUDIT_COST_MS = 300_000
 
 
 def _validate_string(name: str, value: str, maximum: int) -> None:
@@ -57,8 +62,50 @@ def _validate_utc_naive(name: str, value: datetime | None) -> None:
 
 
 @dataclass(frozen=True)
+class StepAuditEvent:
+    """Payload-free audit record for one started declarative tool step."""
+
+    connection_id: str
+    tool_key: str
+    step_id: str
+    operation_key: str
+    status: StepAuditStatus
+    error_code: str = ""
+    cost_ms: int = 0
+
+    def __post_init__(self) -> None:
+        for name, maximum in (
+            ("connection_id", 64),
+            ("tool_key", 128),
+            ("step_id", 64),
+            ("operation_key", 128),
+        ):
+            _validate_dimension(name, getattr(self, name), maximum)
+        if self.status not in {"ok", "error"}:
+            raise ValueError("status must be ok or error")
+        if self.error_code not in _STEP_AUDIT_ERROR_CODES:
+            raise ValueError("error_code must be a stable step audit code")
+        if self.status == "ok" and self.error_code:
+            raise ValueError("successful step audit cannot have an error code")
+        if self.status == "error" and not self.error_code:
+            raise ValueError("failed step audit requires an error code")
+        if isinstance(self.cost_ms, bool) or not isinstance(self.cost_ms, int):
+            raise TypeError("cost_ms must be an integer")
+        if not 0 <= self.cost_ms <= MAX_STEP_AUDIT_COST_MS:
+            raise ValueError("cost_ms is outside the bounded audit range")
+
+
+class StepAuditSink(Protocol):
+    """Injected handoff for safe step audit records."""
+
+    def __call__(self, event: StepAuditEvent) -> Awaitable[object] | object: ...
+
+
+@dataclass(frozen=True)
 class McpLogEvent:
     tenant_id: str = ""
+    service_id: str | None = None
+    tool_alias: str | None = None
     connection_id: str | None = None
     connector_key: str | None = None
     tool_key: str | None = None
@@ -82,6 +129,7 @@ class McpLogEvent:
         # safe value into the new dimension while keeping anonymous events NULL.
         if (
             self.connection_id is None
+            and self.service_id is None
             and self.category in {"auth", "protocol"}
             and isinstance(self.target, str)
             and 0 < len(self.target) <= 64
@@ -104,6 +152,8 @@ class McpLogEvent:
         ):
             _validate_string(name, getattr(self, name), maximum)
         for name, maximum in (
+            ("service_id", 64),
+            ("tool_alias", 128),
             ("connection_id", 64),
             ("connector_key", 64),
             ("tool_key", 128),
@@ -123,6 +173,8 @@ class McpLogEvent:
 @dataclass(frozen=True)
 class LogFilters:
     tenant_id: str | None = None
+    service_id: str | None = None
+    tool_alias: str | None = None
     connection_id: str | None = None
     connector_key: str | None = None
     tool_key: str | None = None
@@ -145,6 +197,8 @@ class LogFilters:
         if self.tenant_id is not None:
             _validate_string("tenant_id", self.tenant_id, 64)
         for name, maximum in (
+            ("service_id", 64),
+            ("tool_alias", 128),
             ("connection_id", 64),
             ("connector_key", 64),
             ("tool_key", 128),

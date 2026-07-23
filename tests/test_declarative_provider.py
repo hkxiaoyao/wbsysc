@@ -133,6 +133,24 @@ async def test_provider_derives_spec_executes_and_closes_exact_host_client():
     assert closed == [True]
 
 
+def test_provider_preserves_single_operation_revision_as_one_declarative_tool():
+    provider = DeclarativeConnectorProvider._for_test(
+        revision_loader=lambda *args: _revision(),
+        client_factory=lambda loaded: SafeHttpClient._for_test(
+            loaded.allowed_hosts,
+            resolver=lambda host, port: ["93.184.216.34"],
+            transport=httpx.MockTransport(
+                lambda request: httpx.Response(200, json={"ok": True}, request=request)
+            ),
+        ),
+    )
+
+    spec = provider.spec_for(_context())
+
+    assert [tool.tool_key for tool in spec.tools] == ["health.get"]
+    assert _revision().tool_for("health.get").steps[0].operation_key == "health.get"
+
+
 @pytest.mark.parametrize(
     "loaded",
     [

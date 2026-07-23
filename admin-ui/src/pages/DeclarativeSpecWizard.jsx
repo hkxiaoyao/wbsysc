@@ -2,6 +2,14 @@ import { useEffect, useMemo, useRef, useState } from 'react'
 import { Alert, Button, Checkbox, Form, Input, InputNumber, Space, Steps, Tag, Typography, Upload, message } from 'antd'
 import { InboxOutlined, SafetyCertificateOutlined } from '@ant-design/icons'
 import api from '../api.js'
+import DeclarativeToolBuilder from './DeclarativeToolBuilder.jsx'
+import {
+  buildMcpToolsExtension,
+  createRevisionAllocator,
+  createSourceGeneration,
+  mergeMcpToolsExtension,
+  safeOperationCatalog,
+} from './declarativeToolView.js'
 import {
   canEnableWriteTool,
   createWizardState,
@@ -35,11 +43,19 @@ export default function DeclarativeSpecWizard({ connection, active = true, onCha
   const [policies, setPolicies] = useState([])
   const [credentialSchema, setCredentialSchema] = useState(null)
   const [credentialsText, setCredentialsText] = useState('{}')
+  const [originalSource, setOriginalSource] = useState(null)
+  const [operationCatalog, setOperationCatalog] = useState([])
+  const [compositeTools, setCompositeTools] = useState([])
+  const [compositeImported, setCompositeImported] = useState(false)
+  const [compositeValidated, setCompositeValidated] = useState(false)
+  const [validationPreview, setValidationPreview] = useState(null)
   const [busy, setBusy] = useState('')
   const [error, setError] = useState('')
   const [messageApi, contextHolder] = message.useMessage()
   const stateRef = useRef(state)
   const identityVersion = useRef(0)
+  const sourceGeneration = useRef(createSourceGeneration())
+  const revisionAllocator = useRef(createRevisionAllocator())
 
   useEffect(() => { stateRef.current = state }, [state])
   useEffect(() => {
@@ -51,6 +67,14 @@ export default function DeclarativeSpecWizard({ connection, active = true, onCha
     setPolicies([])
     setCredentialSchema(null)
     setCredentialsText('{}')
+    setOriginalSource(null)
+    setOperationCatalog([])
+    setCompositeTools([])
+    setCompositeImported(false)
+    setCompositeValidated(false)
+    setValidationPreview(null)
+    sourceGeneration.current.invalidate()
+    revisionAllocator.current.reset()
     setError('')
   }, [connection?.connection_id, connection?.status])
   useEffect(() => {
@@ -72,26 +96,36 @@ export default function DeclarativeSpecWizard({ connection, active = true, onCha
     version: identityVersion.current,
   })
 
-  const run = async (key, operation, successText) => {
+  const run = async (key, operation, successText, completionIsCurrent = () => true) => {
     setBusy(key)
     setError('')
     try {
       const result = await operation()
+      if (!completionIsCurrent()) return null
       if (successText) messageApi.success(successText)
       return result
     } catch (requestError) {
-      setError(safeServerError(requestError))
+      if (completionIsCurrent()) setError(safeServerError(requestError))
       return null
-    } finally { setBusy('') }
+    } finally { if (completionIsCurrent()) setBusy('') }
   }
 
   const invalidateSource = (patch) => {
     identityVersion.current += 1
+    sourceGeneration.current.invalidate()
     setState((current) => ({ ...invalidateWizardState(current, 'source'), ...patch, step: 1 }))
     setTools([])
     setPolicies([])
     setCredentialSchema(null)
     setCredentialsText('{}')
+    setOriginalSource(null)
+    setOperationCatalog([])
+    setCompositeTools([])
+    setCompositeImported(false)
+    setCompositeValidated(false)
+    setValidationPreview(null)
+    revisionAllocator.current.reset()
+    setBusy('')
     setError('')
   }
 
@@ -111,35 +145,161 @@ export default function DeclarativeSpecWizard({ connection, active = true, onCha
       return
     }
     const sourceText = state.sourceText
+    const sourceFormat = sourceText.trimStart().startsWith('{') ? 'json' : 'yaml'
+    const ticket = sourceGeneration.current.begin({ ...identity, phase: 'source-import' })
     setState((current) => invalidateWizardState(current, 'source'))
     setTools([])
     setPolicies([])
     setCredentialSchema(null)
     setCredentialsText('{}')
+    setOriginalSource(null)
+    setOperationCatalog([])
+    setCompositeTools([])
+    setCompositeImported(false)
+    setCompositeValidated(false)
+    setValidationPreview(null)
     const result = await run('import', () => api.post(`${base}/specs/import`, {
       document: sourceText,
       spec_id: identity.specId,
       revision: identity.revision,
-    }), '规范已导入')
-    if (result && identityIsCurrent(identity)) patchState({ imported: true, step: 2 })
+    }), '原始规范已导入', () => sourceGeneration.current.isCurrent(ticket) && identityIsCurrent(identity))
+    if (result && sourceGeneration.current.isCurrent(ticket) && identityIsCurrent(identity)) {
+      setOriginalSource({
+        text: sourceText,
+        format: sourceFormat,
+        specId: identity.specId,
+        revision: identity.revision,
+      })
+      revisionAllocator.current.reset(identity.revision)
+      patchState({ imported: true, step: 2, sourceFormat })
+    }
   }
 
   const validate = async () => {
     const identity = captureIdentity()
+    const ticket = sourceGeneration.current.begin({ ...identity, phase: 'source-validate' })
     const result = await run('validate', () => api.post(
       `${base}/specs/${encodeURIComponent(identity.specId)}/revisions/${identity.revision}/validate`,
-    ), '后端验证通过')
-    if (result && identityIsCurrent(identity)) patchState({ validated: true, step: 3 })
+    ), '原始规范后端验证通过', () => sourceGeneration.current.isCurrent(ticket) && identityIsCurrent(identity))
+    if (!result || !sourceGeneration.current.isCurrent(ticket) || !identityIsCurrent(identity)) return
+    try {
+      const catalog = safeOperationCatalog(result.data?.preview?.operations)
+      setOperationCatalog(catalog)
+      setValidationPreview(result.data?.preview || null)
+      patchState({ validated: true, step: 3 })
+    } catch (metadataError) {
+      setOperationCatalog([])
+      setValidationPreview(null)
+      setError(metadataError.message)
+    }
+  }
+
+  const changeCompositeTools = (nextTools) => {
+    identityVersion.current += 1
+    sourceGeneration.current.invalidate()
+    setCompositeTools(nextTools)
+    setCompositeImported(false)
+    setCompositeValidated(false)
+    setValidationPreview(null)
+    setTools([])
+    setPolicies([])
+    setCredentialSchema(null)
+    setCredentialsText('{}')
+    setState((current) => ({
+      ...current,
+      ...(nextTools.length === 0 && originalSource ? {
+        specId: originalSource.specId,
+        revision: originalSource.revision,
+        imported: true,
+        validated: true,
+        step: 3,
+      } : {}),
+      published: false,
+      mappingReviewed: false,
+      credentialsSaved: false,
+      policiesSaved: false,
+      tested: false,
+      activated: false,
+    }))
+    setBusy('')
+    setError('')
+  }
+
+  const importCompositeRevision = async () => {
+    if (!originalSource || !operationCatalog.length || !compositeTools.length) return
+    let mergedDocument
+    try {
+      buildMcpToolsExtension(compositeTools, operationCatalog)
+      mergedDocument = mergeMcpToolsExtension(
+        originalSource.text,
+        originalSource.format,
+        compositeTools,
+        operationCatalog,
+      )
+    } catch (builderError) {
+      setError(builderError.message)
+      return
+    }
+    identityVersion.current += 1
+    const nextIdentity = {
+      specId: originalSource.specId,
+      revision: revisionAllocator.current.reserve(),
+      version: identityVersion.current,
+    }
+    const ticket = sourceGeneration.current.begin({ ...nextIdentity, phase: 'merged-import' })
+    const result = await run('composite-import', () => api.post(`${base}/specs/import`, {
+      document: mergedDocument,
+      spec_id: nextIdentity.specId,
+      revision: nextIdentity.revision,
+    }), '组合工具已导入为新的不可变草稿修订', () => sourceGeneration.current.isCurrent(ticket))
+    if (!result || !sourceGeneration.current.isCurrent(ticket)) return
+    setState((current) => ({
+      ...invalidateWizardState(current, 'source'),
+      specId: nextIdentity.specId,
+      revision: nextIdentity.revision,
+      sourceText: originalSource.text,
+      imported: true,
+      step: 2,
+    }))
+    setCompositeImported(true)
+    setCompositeValidated(false)
+    setValidationPreview(null)
+  }
+
+  const validateCompositeRevision = async () => {
+    if (!compositeImported) return
+    const identity = captureIdentity()
+    const ticket = sourceGeneration.current.begin({ ...identity, phase: 'merged-validate' })
+    const result = await run('composite-validate', () => api.post(
+      `${base}/specs/${encodeURIComponent(identity.specId)}/revisions/${identity.revision}/validate`,
+    ), '组合工具草稿后端验证通过', () => sourceGeneration.current.isCurrent(ticket) && identityIsCurrent(identity))
+    if (!result || !sourceGeneration.current.isCurrent(ticket) || !identityIsCurrent(identity)) return
+    try {
+      safeOperationCatalog(result.data?.preview?.operations)
+      if (!Array.isArray(result.data?.preview?.tools) || result.data.preview.tools.length < 1) {
+        throw new Error('后端未返回组合工具安全预览')
+      }
+      setValidationPreview(result.data.preview)
+      setCompositeValidated(true)
+      patchState({ validated: true, step: 3 })
+    } catch (previewError) {
+      setCompositeValidated(false)
+      setValidationPreview(null)
+      setError(previewError.message)
+    }
   }
 
   const publish = async () => {
     const identity = captureIdentity()
+    const ticket = sourceGeneration.current.begin({ ...identity, phase: 'publish' })
     const result = await run('publish', () => api.post(
       `${base}/specs/${encodeURIComponent(identity.specId)}/revisions/${identity.revision}/publish`,
-    ), '待激活修订已发布')
-    if (!result || !identityIsCurrent(identity)) return
-    const toolResponse = await run('tools', () => api.get(`${base}/tools`))
-    if (!toolResponse || !identityIsCurrent(identity)) return
+    ), '待激活修订已发布', () => sourceGeneration.current.isCurrent(ticket) && identityIsCurrent(identity))
+    if (!result || !sourceGeneration.current.isCurrent(ticket) || !identityIsCurrent(identity)) return
+    const toolResponse = await run('tools', () => api.get(`${base}/tools`), '', () => (
+      sourceGeneration.current.isCurrent(ticket) && identityIsCurrent(identity)
+    ))
+    if (!toolResponse || !sourceGeneration.current.isCurrent(ticket) || !identityIsCurrent(identity)) return
     setTools(toolResponse.data?.items || [])
     setCredentialSchema(toolResponse.data?.credential_schema || null)
     setPolicies([])
@@ -255,11 +415,58 @@ export default function DeclarativeSpecWizard({ connection, active = true, onCha
           </Form.Item>
         </Form>
         <Space wrap>
-          <Button type="primary" disabled={state.mustDisable || state.published} loading={busy === 'import'} onClick={importSpec}>导入规范</Button>
-          <Button disabled={!state.imported || state.published} loading={busy === 'validate'} onClick={validate}>后端验证</Button>
-          <Button disabled={!state.validated} loading={busy === 'publish' || busy === 'tools'} onClick={publish}>发布待激活修订</Button>
+          <Button type="primary" disabled={state.mustDisable || state.published || Boolean(originalSource)} loading={busy === 'import'} onClick={importSpec}>导入原始规范</Button>
+          <Button disabled={!state.imported || state.published || Boolean(operationCatalog.length) || compositeImported} loading={busy === 'validate'} onClick={validate}>验证原始修订并读取安全操作</Button>
+          <Button disabled={!state.validated || (compositeTools.length > 0 && !compositeValidated)} loading={busy === 'publish' || busy === 'tools'} onClick={publish}>发布待激活修订</Button>
         </Space>
       </div>
+
+      {operationCatalog.length > 0 && !state.published && (
+        <div className="declarative-stage">
+          <header><Text strong>构建多操作工具</Text><Tag color="cyan">仅使用后端批准元数据</Tag></header>
+          <Paragraph type="secondary">原始修订保持不变。引用只能从下拉框选择工具输入或前序步骤的显式输出；如果不添加组合工具，将继续既有单操作工具流程。</Paragraph>
+          <DeclarativeToolBuilder
+            operationCatalog={operationCatalog}
+            tools={compositeTools}
+            disabled={busy !== ''}
+            onChange={changeCompositeTools}
+          />
+          {compositeTools.length > 0 && (
+            <Space wrap>
+              <Button type="primary" disabled={compositeImported} loading={busy === 'composite-import'} onClick={importCompositeRevision}>导入为新草稿修订</Button>
+              <Button disabled={!compositeImported || compositeValidated} loading={busy === 'composite-validate'} onClick={validateCompositeRevision}>再次后端验证</Button>
+              {compositeValidated && <Tag color="green">新草稿修订已验证，可发布</Tag>}
+            </Space>
+          )}
+        </div>
+      )}
+
+      {compositeValidated && validationPreview && !state.published && (
+        <div className="declarative-stage">
+          <header><Text strong>后端安全组合工具预览</Text><Tag color="green">验证通过</Tag></header>
+          <Paragraph type="secondary">这里只展示后端 allowlist 中的工具、schema 与步骤摘要；不会展示传输、认证、路径或 secret 元数据。</Paragraph>
+          <div className="declarative-tool-list">
+            {(validationPreview.tools || []).map((tool) => (
+              <div className="declarative-tool" key={tool.tool_key}>
+                <Space wrap>
+                  <Text code>{tool.mcp_name || tool.tool_key}</Text>
+                  <Tag color={tool.operation_kind === 'write' ? 'orange' : 'blue'}>{tool.operation_kind === 'write' ? '写操作' : '只读'}</Tag>
+                </Space>
+                {tool.description && <Text type="secondary">{tool.description}</Text>}
+                <details><summary>后端批准的输入 schema</summary><pre>{schemaSummary(schemaMetadataSummary(tool.input_schema))}</pre></details>
+                <details><summary>后端批准的输出 schema</summary><pre>{schemaSummary(schemaMetadataSummary(tool.output_schema))}</pre></details>
+                <div>
+                  <Text type="secondary">有序步骤：</Text>
+                  <Space wrap>{(tool.steps || []).map((step) => (
+                    <Tag key={`${step.step_id}-${step.operation_key}`}>{step.step_id} → {step.operation_key} · {step.operation_kind === 'write' ? '写' : '只读'}</Tag>
+                  ))}</Space>
+                </div>
+              </div>
+            ))}
+          </div>
+          <Alert showIcon type="info" message="发布仍是独立操作" description="确认此后端预览后，使用上方“发布待激活修订”；系统不会覆盖或发布原始已验证修订。" />
+        </div>
+      )}
 
       {state.published && (
         <div className="declarative-stage">

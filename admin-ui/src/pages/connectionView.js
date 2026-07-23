@@ -5,6 +5,26 @@ function cleanText(value) {
   return String(value ?? '').trim()
 }
 
+export function connectionCollectionEndpoint(scope = 'admin', tenantId = '') {
+  if (scope === 'tenant') return '/tenant/connections'
+  return `/admin/tenants/${encodeURIComponent(cleanText(tenantId))}/connections`
+}
+
+export function connectionResourceEndpoint(scope = 'admin', connectionId = '', suffix = '') {
+  const prefix = scope === 'tenant' ? '/tenant/connections' : '/admin/connections'
+  const resource = `${prefix}/${encodeURIComponent(cleanText(connectionId))}`
+  const normalizedSuffix = cleanText(suffix).replace(/^\/+|\/+$/g, '')
+  return normalizedSuffix ? `${resource}/${normalizedSuffix}` : resource
+}
+
+export function apiClientEndpoint(apiClient, endpoint) {
+  const baseUrl = cleanText(apiClient?.defaults?.baseURL).replace(/\/+$/, '')
+  if (baseUrl && (endpoint === baseUrl || endpoint.startsWith(`${baseUrl}/`))) {
+    return endpoint.slice(baseUrl.length) || '/'
+  }
+  return endpoint
+}
+
 export function buildConnectionMcpConfig(connection, origin) {
   const connectionId = cleanText(connection?.connection_id)
   const rawToken = cleanText(connection?.initial_token ?? connection?.token)

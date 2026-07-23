@@ -6,13 +6,15 @@ import {
   ApiOutlined, CopyOutlined, FileSearchOutlined, PlusOutlined, ReloadOutlined,
   SafetyCertificateOutlined, SyncOutlined,
 } from '@ant-design/icons'
-import api from '../api.js'
+import defaultApi from '../api.js'
 import DeclarativeSpecWizard from './DeclarativeSpecWizard.jsx'
 import {
   buildConnectionMcpConfig, canEnableWriteTool, closeTokenModal, safeServerError,
+  apiClientEndpoint, connectionCollectionEndpoint, connectionResourceEndpoint,
   createConnectionMutationSequence, createRequestSequence, isActiveDeclarativeConfigReadOnly, selectActiveTokenHint,
   setExplicitToolPolicy,
 } from './connectionView.js'
+import { CONNECTOR_CARDS, connectorCard } from './servicesView.js'
 import './Connections.css'
 
 const { Paragraph, Text, Title } = Typography
@@ -36,7 +38,7 @@ function endpoint(connectionId) {
   return `${window.location.origin}/mcp/${encodeURIComponent(connectionId)}`
 }
 
-export default function Connections({ tenantId = '', initialConnectionId = '', embedded = false, onViewLogs = () => {} }) {
+export default function Connections({ scope = 'admin', apiClient = defaultApi, tenantId = '', initialConnectionId = '', embedded = false, onViewLogs = () => {} }) {
   const [tenants, setTenants] = useState([])
   const [scopeTenant, setScopeTenant] = useState(tenantId)
   const [items, setItems] = useState([])
@@ -51,6 +53,7 @@ export default function Connections({ tenantId = '', initialConnectionId = '', e
   const [drawerBusy, setDrawerBusy] = useState('')
   const [createOpen, setCreateOpen] = useState(false)
   const [createBusy, setCreateBusy] = useState(false)
+  const [selectedConnector, setSelectedConnector] = useState('wecom')
   const [credentialsText, setCredentialsText] = useState('{}')
   const [configText, setConfigText] = useState('{}')
   const [tokenLabel, setTokenLabel] = useState('')
@@ -72,6 +75,7 @@ export default function Connections({ tenantId = '', initialConnectionId = '', e
   const mounted = useRef(true)
   const openedInitialConnection = useRef('')
   const openDetailId = useRef('')
+  const tenantScope = scope === 'tenant'
 
   const isDetailCurrent = (requestId, connectionId, controller) => (
     mounted.current && !controller.signal.aborted
@@ -108,21 +112,25 @@ export default function Connections({ tenantId = '', initialConnectionId = '', e
     setLoading(true)
     setLoadError('')
     try {
-      let tenantRows = tenants
-      if (!tenantId || tenantRows.length === 0) {
-        const tenantResponse = await api.get('/admin/tenants', { signal: controller.signal })
-        if (!mounted.current || controller.signal.aborted || !listSequence.current.isCurrent(requestId)) return
-        tenantRows = tenantResponse.data?.items || []
-        setTenants(tenantRows)
+      let responses
+      if (tenantScope) {
+        responses = [await apiClient.get(apiClientEndpoint(apiClient, connectionCollectionEndpoint(scope)), { signal: controller.signal })]
+      } else {
+        let tenantRows = tenants
+        if (!tenantId || tenantRows.length === 0) {
+          const tenantResponse = await apiClient.get('/admin/tenants', { signal: controller.signal })
+          if (!mounted.current || controller.signal.aborted || !listSequence.current.isCurrent(requestId)) return
+          tenantRows = tenantResponse.data?.items || []
+          setTenants(tenantRows)
+        }
+        const tenantIds = scopeTenant ? [scopeTenant] : tenantRows.map((tenant) => tenant.tenant_id)
+        responses = await Promise.all(tenantIds.map((id) => apiClient.get(connectionCollectionEndpoint(scope, id), { signal: controller.signal })))
       }
-      const tenantIds = scopeTenant ? [scopeTenant] : tenantRows.map((tenant) => tenant.tenant_id)
-      const responses = await Promise.all(tenantIds.map((id) => api.get(`/admin/tenants/${encodeURIComponent(id)}/connections`, { signal: controller.signal })))
       const listed = responses.flatMap((response) => response.data?.items || [])
       const enriched = await Promise.all(listed.map(async (connection) => {
-        const id = encodeURIComponent(connection.connection_id)
         const [detailResponse, toolResponse] = await Promise.all([
-          api.get(`/admin/connections/${id}`, { signal: controller.signal }).catch(() => null),
-          api.get(`/admin/connections/${id}/tools`, { signal: controller.signal }).catch(() => null),
+          apiClient.get(apiClientEndpoint(apiClient, connectionResourceEndpoint(scope, connection.connection_id)), { signal: controller.signal }).catch(() => null),
+          apiClient.get(apiClientEndpoint(apiClient, connectionResourceEndpoint(scope, connection.connection_id, 'tools')), { signal: controller.signal }).catch(() => null),
         ])
         return {
           ...connection,
@@ -138,7 +146,7 @@ export default function Connections({ tenantId = '', initialConnectionId = '', e
     } finally {
       if (mounted.current && !controller.signal.aborted && listSequence.current.isCurrent(requestId)) setLoading(false)
     }
-  }, [scopeTenant, tenantId, tenants.length])
+  }, [apiClient, scope, scopeTenant, tenantId, tenantScope, tenants.length])
 
   useEffect(() => {
     listSequence.current.invalidate()
@@ -198,8 +206,8 @@ export default function Connections({ tenantId = '', initialConnectionId = '', e
     setDrawerBusy('detail')
     try {
       const [detailResponse, toolResponse] = await Promise.all([
-        api.get(`/admin/connections/${encodeURIComponent(row.connection_id)}`, { signal: controller.signal }),
-        api.get(`/admin/connections/${encodeURIComponent(row.connection_id)}/tools`, { signal: controller.signal }).catch(() => ({ data: { items: [] } })),
+        apiClient.get(apiClientEndpoint(apiClient, connectionResourceEndpoint(scope, row.connection_id)), { signal: controller.signal }),
+        apiClient.get(apiClientEndpoint(apiClient, connectionResourceEndpoint(scope, row.connection_id, 'tools')), { signal: controller.signal }).catch(() => ({ data: { items: [] } })),
       ])
       if (!isDetailCurrent(requestId, row.connection_id, controller)) return
       const next = detailResponse.data?.connection || row
@@ -212,7 +220,7 @@ export default function Connections({ tenantId = '', initialConnectionId = '', e
     } finally {
       if (isDetailCurrent(requestId, row.connection_id, controller)) setDrawerBusy('')
     }
-  }, [messageApi])
+  }, [apiClient, messageApi, scope])
 
   useEffect(() => {
     detailSequence.current.invalidate()
@@ -271,10 +279,9 @@ export default function Connections({ tenantId = '', initialConnectionId = '', e
   }
 
   const refreshDrawerDetail = async (connection, ticket, controller) => {
-    const id = encodeURIComponent(connection.connection_id)
     const [detailResponse, toolResponse] = await Promise.all([
-      api.get(`/admin/connections/${id}`, { signal: controller.signal }),
-      api.get(`/admin/connections/${id}/tools`, { signal: controller.signal }).catch(() => ({ data: { items: [] } })),
+      apiClient.get(apiClientEndpoint(apiClient, connectionResourceEndpoint(scope, connection.connection_id)), { signal: controller.signal }),
+      apiClient.get(apiClientEndpoint(apiClient, connectionResourceEndpoint(scope, connection.connection_id, 'tools')), { signal: controller.signal }).catch(() => ({ data: { items: [] } })),
     ])
     if (!isDrawerMutationCurrent(ticket, controller)) return
     const next = detailResponse.data?.connection || connection
@@ -289,6 +296,7 @@ export default function Connections({ tenantId = '', initialConnectionId = '', e
     createController.current?.abort()
     setCreateBusy(false)
     setCreateOpen(false)
+    setSelectedConnector('wecom')
     form.resetFields()
   }
 
@@ -302,9 +310,10 @@ export default function Connections({ tenantId = '', initialConnectionId = '', e
     try {
       const values = await form.validateFields()
       if (!isCurrent()) return
-      const connectorKey = String(values.connector_key || '').trim()
+      const connectorKey = connectorCard(selectedConnector)?.key
+      if (!connectorKey) throw new Error('请选择连接器')
       const declarative = connectorKey === 'http_declarative'
-      const response = await api.post(`/admin/tenants/${encodeURIComponent(values.tenant_id)}/connections`, {
+      const response = await apiClient.post(apiClientEndpoint(apiClient, connectionCollectionEndpoint(scope, values.tenant_id)), {
         connector_key: connectorKey,
         display_name: values.display_name.trim(),
         data_mode: values.data_mode,
@@ -315,6 +324,7 @@ export default function Connections({ tenantId = '', initialConnectionId = '', e
       if (!isCurrent()) return
       const connection = response.data.connection
       form.resetFields()
+      setSelectedConnector('wecom')
       setCreateOpen(false)
       showToken(connection, response.data.initial_token)
       messageApi.success('连接已创建；Token 只显示这一次')
@@ -338,7 +348,7 @@ export default function Connections({ tenantId = '', initialConnectionId = '', e
     setDrawerBusy('config')
     try {
       const publicConfig = parseObject(configText, '公开配置')
-      const response = await api.put(`/admin/connections/${encodeURIComponent(connection.connection_id)}`, {
+      const response = await apiClient.put(apiClientEndpoint(apiClient, connectionResourceEndpoint(scope, connection.connection_id)), {
         display_name: connection.display_name,
         data_mode: connection.data_mode,
         public_config: publicConfig,
@@ -362,7 +372,7 @@ export default function Connections({ tenantId = '', initialConnectionId = '', e
     setDrawerBusy('credentials')
     try {
       const credentials = parseObject(credentialsText, '新凭据')
-      await api.put(`/admin/connections/${encodeURIComponent(connection.connection_id)}/credentials`, {
+      await apiClient.put(apiClientEndpoint(apiClient, connectionResourceEndpoint(scope, connection.connection_id, 'credentials')), {
         credentials,
       }, { signal: controller.signal })
       if (!isDrawerMutationCurrent(ticket, controller)) return
@@ -382,8 +392,8 @@ export default function Connections({ tenantId = '', initialConnectionId = '', e
     const { ticket, controller } = beginDrawerMutation(connection.connection_id)
     setDrawerBusy('token')
     try {
-      const response = await api.post(
-        `/admin/connections/${encodeURIComponent(connection.connection_id)}/tokens${rotate ? '/rotate' : ''}`,
+      const response = await apiClient.post(
+        apiClientEndpoint(apiClient, connectionResourceEndpoint(scope, connection.connection_id, `tokens${rotate ? '/rotate' : ''}`)),
         { label },
         { signal: controller.signal },
       )
@@ -410,7 +420,7 @@ export default function Connections({ tenantId = '', initialConnectionId = '', e
       const { ticket, controller } = beginDrawerMutation(connection.connection_id)
       setDrawerBusy('token')
       try {
-        await api.delete(`/admin/connections/${encodeURIComponent(connection.connection_id)}/tokens/${encodeURIComponent(token.token_id)}`, {
+        await apiClient.delete(apiClientEndpoint(apiClient, connectionResourceEndpoint(scope, connection.connection_id, `tokens/${encodeURIComponent(token.token_id)}`)), {
           signal: controller.signal,
         })
         if (!isDrawerMutationCurrent(ticket, controller)) return
@@ -442,7 +452,7 @@ export default function Connections({ tenantId = '', initialConnectionId = '', e
     const { ticket, controller } = beginDrawerMutation(connection.connection_id)
     setDrawerBusy('tools')
     try {
-      await api.put(`/admin/connections/${encodeURIComponent(connection.connection_id)}/tools`, {
+      await apiClient.put(apiClientEndpoint(apiClient, connectionResourceEndpoint(scope, connection.connection_id, 'tools')), {
         policies,
       }, { signal: controller.signal })
       if (!isDrawerMutationCurrent(ticket, controller)) return
@@ -460,7 +470,7 @@ export default function Connections({ tenantId = '', initialConnectionId = '', e
     const { ticket, controller } = beginDrawerMutation(connection.connection_id)
     setDrawerBusy(name)
     try {
-      const response = await api.post(`/admin/connections/${encodeURIComponent(connection.connection_id)}/${path}`, undefined, {
+      const response = await apiClient.post(apiClientEndpoint(apiClient, connectionResourceEndpoint(scope, connection.connection_id, path)), undefined, {
         signal: controller.signal,
       })
       if (!isDrawerMutationCurrent(ticket, controller)) return
@@ -508,7 +518,7 @@ export default function Connections({ tenantId = '', initialConnectionId = '', e
     {
       key: 'operate', label: '测试与同步', children: <div className="connection-editor"><div className="connection-operation-grid"><Button icon={<SafetyCertificateOutlined />} loading={drawerBusy === 'test'} onClick={() => action('test', 'test', '安全连接测试通过')}>安全测试</Button><Button icon={<SyncOutlined />} disabled={detail.data_mode === 'direct' || detail.status !== 'active'} loading={drawerBusy === 'sync'} onClick={() => action('sync', 'sync', '同步已触发')}>立即同步</Button><Button danger disabled={detail.status === 'disabled'} loading={drawerBusy === 'disable'} onClick={() => action('disable', 'disable', '连接已停用')}>停用连接</Button><Button icon={<FileSearchOutlined />} onClick={() => onViewLogs(detail)}>查看该连接日志</Button></div></div>,
     },
-    ...(detail.connector_key === 'http_declarative' ? [{ key: 'wizard', label: '声明式向导', children: <DeclarativeSpecWizard active={activeTab === 'wizard'} connection={detail} onChanged={(next) => { if (next && openDetailId.current === next.connection_id) setDetail(next); load() }} /> }] : []),
+    ...(!tenantScope && detail.connector_key === 'http_declarative' ? [{ key: 'wizard', label: '声明式向导', children: <DeclarativeSpecWizard active={activeTab === 'wizard'} connection={detail} onChanged={(next) => { if (next && openDetailId.current === next.connection_id) setDetail(next); load() }} /> }] : []),
   ] : []
 
   return (
@@ -524,8 +534,8 @@ export default function Connections({ tenantId = '', initialConnectionId = '', e
 
       <section className="connection-panel">
         <div className="connection-toolbar">
-          {!tenantId && <Select aria-label="按租户筛选连接实例" allowClear showSearch optionFilterProp="label" placeholder="全部租户" value={scopeTenant || undefined} options={tenants.map((tenant) => ({ value: tenant.tenant_id, label: tenant.display_name ? `${tenant.display_name} · ${tenant.tenant_id}` : tenant.tenant_id }))} onChange={(value) => setScopeTenant(value || '')} />}
-          <Input aria-label="搜索连接实例" allowClear value={query} placeholder="搜索名称、连接 ID 或租户" onChange={(event) => setQuery(event.target.value)} />
+          {!tenantScope && !tenantId && <Select aria-label="按租户筛选连接实例" allowClear showSearch optionFilterProp="label" placeholder="全部租户" value={scopeTenant || undefined} options={tenants.map((tenant) => ({ value: tenant.tenant_id, label: tenant.display_name ? `${tenant.display_name} · ${tenant.tenant_id}` : tenant.tenant_id }))} onChange={(value) => setScopeTenant(value || '')} />}
+          <Input aria-label="搜索连接实例" allowClear value={query} placeholder={tenantScope ? '搜索名称或连接 ID' : '搜索名称、连接 ID 或租户'} onChange={(event) => setQuery(event.target.value)} />
           <Select aria-label="按连接器筛选连接实例" value={connectorFilter} options={[{ value: 'all', label: '全部连接器' }, ...[...new Set(items.map((item) => item.connector_key))].map((value) => ({ value, label: value }))]} onChange={setConnectorFilter} />
           <Select aria-label="按状态筛选连接实例" value={statusFilter} options={[{ value: 'all', label: '全部状态' }, ...Object.entries(STATUS_META).map(([value, meta]) => ({ value, label: meta.label }))]} onChange={setStatusFilter} />
           <Button icon={<ReloadOutlined />} loading={loading} onClick={load}>刷新</Button>
@@ -540,13 +550,27 @@ export default function Connections({ tenantId = '', initialConnectionId = '', e
       </Drawer>
 
       <Modal title="新建连接实例" open={createOpen} onCancel={closeCreate} onOk={create} confirmLoading={createBusy} okText="创建连接" cancelText="取消" width={620}>
-        <Form form={form} layout="vertical" initialValues={{ tenant_id: tenantId || scopeTenant || undefined, connector_key: 'wecom', data_mode: 'direct', public_config: '{}', credentials: '{}' }}>
-          <Form.Item name="tenant_id" label="租户" rules={[{ required: true, message: '请选择租户' }]}><Select disabled={Boolean(tenantId)} showSearch optionFilterProp="label" options={tenants.map((tenant) => ({ value: tenant.tenant_id, label: tenant.display_name ? `${tenant.display_name} · ${tenant.tenant_id}` : tenant.tenant_id }))} /></Form.Item>
+        <Form form={form} layout="vertical" initialValues={{ tenant_id: tenantId || scopeTenant || undefined, data_mode: 'direct', public_config: '{}', credentials: '{}' }}>
+          {!tenantScope && <Form.Item name="tenant_id" label="租户" rules={[{ required: true, message: '请选择租户' }]}><Select disabled={Boolean(tenantId)} showSearch optionFilterProp="label" options={tenants.map((tenant) => ({ value: tenant.tenant_id, label: tenant.display_name ? `${tenant.display_name} · ${tenant.tenant_id}` : tenant.tenant_id }))} /></Form.Item>}
           <Form.Item name="display_name" label="连接名称" rules={[{ required: true, whitespace: true, max: 128 }]}><Input placeholder="例如 华东企微生产连接" /></Form.Item>
-          <Form.Item name="connector_key" label="连接器 Key" rules={[{ required: true }, { pattern: /^[a-z][a-z0-9_-]{0,63}$/, message: '使用小写字母开头，仅含小写字母、数字、_ 或 -' }]}><Input aria-label="连接器 Key" list="known-connector-keys" placeholder="输入已注册的连接器 Key" /></Form.Item>
-          <datalist id="known-connector-keys"><option value="wecom">企业微信</option><option value="http_declarative">HTTP 声明式</option></datalist>
+          <Form.Item label="连接器" required>
+            <div role="group" aria-label="选择连接器" style={{ display: 'grid', gridTemplateColumns: 'repeat(auto-fit, minmax(210px, 1fr))', gap: 12 }}>
+              {CONNECTOR_CARDS.map((card) => (
+                <Button
+                  key={card.key}
+                  type={selectedConnector === card.key ? 'primary' : 'default'}
+                  aria-pressed={selectedConnector === card.key}
+                  onClick={() => setSelectedConnector(card.key)}
+                  style={{ height: 'auto', minHeight: 76, padding: 14, textAlign: 'left', whiteSpace: 'normal' }}
+                >
+                  <strong style={{ display: 'block' }}>{card.title}</strong>
+                  <span>{card.description}</span>
+                </Button>
+              ))}
+            </div>
+          </Form.Item>
           <Form.Item name="data_mode" label="数据模式" rules={[{ required: true }]}><Select aria-label="新连接数据模式" options={Object.entries(DATA_MODE).map(([value, label]) => ({ value, label }))} /></Form.Item>
-          <Form.Item noStyle shouldUpdate={(previous, current) => previous.connector_key !== current.connector_key}>{({ getFieldValue }) => getFieldValue('connector_key') === 'http_declarative' ? <Alert type="info" showIcon message="连接将以草稿创建" description="创建后进入声明式向导导入 JSON/YAML；这里不会接受代码、模板或预置凭据。" /> : <><Form.Item name="public_config" label="公开配置（JSON 对象）"><Input.TextArea aria-label="新连接公开配置 JSON" rows={5} /></Form.Item><Form.Item name="credentials" label="初始凭据（JSON 对象）"><Input.TextArea aria-label="新连接初始凭据 JSON" rows={5} /></Form.Item></>}</Form.Item>
+          {selectedConnector === 'http_declarative' ? <Alert type="info" showIcon message="连接将以草稿创建" description="创建后进入声明式向导导入 JSON/YAML；这里不会接受代码、模板或预置凭据。" /> : <><Form.Item name="public_config" label="公开配置（JSON 对象）"><Input.TextArea aria-label="新连接公开配置 JSON" rows={5} /></Form.Item><Form.Item name="credentials" label="初始凭据（JSON 对象）"><Input.TextArea aria-label="新连接初始凭据 JSON" rows={5} /></Form.Item></>}
         </Form>
       </Modal>
 

@@ -30,6 +30,8 @@ TL;DR：先备份 MySQL，再部署连接平台表和应用。保留旧模型上
 | `ADMIN_SESSION_TTL_MIN` | 管理会话有效分钟数 |
 | `CREDENTIAL_KEY` | 凭证加密密钥，生产至少 32 个 UTF-8 字节 |
 | `MCP_TOKEN_HMAC_KEY` | Token 基于哈希的消息认证码（HMAC）密钥，生产至少 32 个 UTF-8 字节，必须使用非示例值 |
+| `MCP_TOKEN_PLAINTEXT_KEY` | 可揭示服务 Token 的密文密钥，生产至少 32 个 UTF-8 字节，必须使用非示例值 |
+| `MCP_SERVICE_ENABLED` | 服务路由和租户服务自助开关；首次发布保持 `false` |
 | `CONNECTOR_ALLOWLIST` | 已审核连接器入口名的逗号分隔精确列表 |
 | `MCP_BASE_URL` | 对外 HTTPS 基础地址，也参与 Host 许可判断 |
 | `MCP_ALLOWED_HOSTS` | 反向代理 Host 的逗号分隔精确列表 |
@@ -39,7 +41,11 @@ TL;DR：先备份 MySQL，再部署连接平台表和应用。保留旧模型上
 | `SYNC_INTERVAL_APPROVAL_MIN` | 企微审批同步间隔 |
 | `SYNC_INTERVAL_SMARTTABLE_MIN` | 企微智能表格同步间隔 |
 
-`CREDENTIAL_KEY` 与 `MCP_TOKEN_HMAC_KEY` 必须独立。轮换 `CREDENTIAL_KEY` 前先重加密全部凭证，否则旧密文无法解密。轮换 `MCP_TOKEN_HMAC_KEY` 会让所有现有 MCP Token 摘要失配，请先为每个连接签发新 Token，再切换密钥。
+三个密钥必须两两不同并独立轮换，不能把“换环境变量”当作轮换完成：
+
+- `CREDENTIAL_KEY`：先用旧密钥解密并用新密钥重加密全部连接/租户凭证，再切换。
+- `MCP_TOKEN_HMAC_KEY`：当前运行时只接受一个 HMAC key，没有双 key 验证窗口；旧 key 下“预签发”的 Token 切换后同样失效。先盘点并记录全部旧连接/服务 token ID 及使用方，在批准的维护窗口切换 key 并重启；随后只在新 key 下逐一签发、分发和验证新 Token，最后核对清单中所有旧 token ID 已失效/撤销。窗口内客户端会短暂不可用，不能声称预签发可保持连续可用。
+- `MCP_TOKEN_PLAINTEXT_KEY`：切换前必须把每条**未撤销**的 `mcp_service_token.encrypted_token` 用旧密钥解密、用新密钥重加密并完成数量核对；已撤销行的密文已清空，不能恢复也不需要迁移。无法完成重加密时应重新签发服务 Token，不得直接切换。
 
 `CONNECTOR_ALLOWLIST` 使用 `wbsysc.connectors` 入口名，不使用 Python 包导入路径。平台去除首尾空白，将名称转为小写，并把连续的 `-`、`_`、`.` 归一为单个 `-`，然后执行精确匹配。例如，已审核入口 `reviewed_connector_name` 应写为 `reviewed-connector-name`。
 
@@ -54,6 +60,8 @@ DB_USER=least_privilege_user
 DB_PASSWORD=database_password_here
 CREDENTIAL_KEY=replace_with_credential_key
 MCP_TOKEN_HMAC_KEY=replace_with_hmac_key
+MCP_TOKEN_PLAINTEXT_KEY=replace_with_plaintext_key
+MCP_SERVICE_ENABLED=false
 CONNECTOR_ALLOWLIST=reviewed-connector-name
 ```
 
@@ -65,13 +73,13 @@ CONNECTOR_ALLOWLIST=reviewed-connector-name
 2. 对中心库和所有 `wbd_*` 租户 schema 做一致性备份
 3. 验证备份可列出 `tenant_config`、业务表和 `audit_log`
 4. 将备份时间与二进制日志位置登记为恢复点
-5. 使用独立迁移账户和 MySQL 5.7 客户端执行 `sql/004_gateway_hardening.sql`
-6. 使用同一账户执行 `sql/005_mcp_call_log.sql`
-7. 使用同一账户执行 `sql/006_connection_platform.sql`
-8. 启动新应用，让启动迁移创建缺失对象并执行旧企微回填
-9. 核对每个旧租户只有一个确定性默认 `wecom` 连接
-10. 并行调用旧 `/mcp` 和新 `/mcp/{connection_id}`，比较工具和结果
-11. 通过兼容门禁后，逐批把客户端切到新地址
+5. 使用独立迁移账户和 MySQL 5.7 客户端严格执行 `004` → `005` → `006` → `007` → `008`
+6. 保持 `MCP_SERVICE_ENABLED=false`，重建应用并等待 `/health` 明确返回 `mcp_service_enabled:false`
+7. 核对每个旧租户只有一个确定性默认 `wecom` 连接，旧 `/mcp` 与 `/mcp/{connection_id}` 正常
+8. 如本次批准启用服务，改为 `true` 后**重建**应用，并等待健康响应明确返回 `mcp_service_enabled:true`
+9. 核对默认服务回填、服务路由和租户控制台，再逐批切换客户端
+
+顺序不可跳跃：`008_mcp_service.sql` 依赖 `005` 的 `mcp_call_log` 和 `006` 的连接表，`007` 提供租户登录。结构迁移只前进，不因功能回滚删除。推荐使用 `deploy/server_deploy.sh`，它会在拉取/启动前执行精确顺序，并先以关闭状态启动、健康检查，再按原请求值启用。
 
 旧企微回填使用完成水位 `legacy_wecom_backfill_v1`。迁移只在事务成功提交后写水位，重启会重试未完成租户，重复执行不会创建第二个默认连接，也不会删除旧企微数据。
 
@@ -103,7 +111,20 @@ CONNECTOR_ALLOWLIST=reviewed-connector-name
 - **查看日志**：调用 `GET /admin/mcp-logs?tenant_id={tenant_id}&connection_id={connection_id}`，同时使用两个过滤维度
 - **修改保留期**：调用 `PUT /admin/mcp-log-settings`，变更前记录旧值，变更后检查清理任务计数
 
-Token 只在签发响应中返回一次。不要把 Authorization、Cookie、Token、凭证、原始请求正文或原始响应正文写入工单和日志。
+连接 Token 只在签发响应显示一次，之后不可揭示。未撤销的**服务 Token**可由当前平台管理员或该服务所属租户的当前登录会话，通过限流、审计且响应带 `Cache-Control: no-store` 的 reveal 端点再次查看；其他租户、过期会话和已撤销 Token 均不得揭示。揭示不是绕过审计的“复制数据库密文”。不要把 Authorization、Cookie、Token、凭证、原始请求正文或原始响应正文写入工单和日志。
+
+## 租户密码与会话
+
+- 创建租户时可选设置初始密码；未填写时不创建登录账户，后台只显示 `has_login_account=false`/无状态，不读取既有密码。
+- 管理员可通过 `PUT /admin/tenants/{tenant_id}/login-password` 设置或重置密码；成功后账户为可登录状态并撤销该租户全部已有会话，用户须重新登录。
+- `PUT /admin/tenants/{tenant_id}/login-status` 只接受明确的启用/禁用状态；禁用会撤销全部租户会话。普通租户资料编辑不得意外重新启用已禁用登录。
+- 租户自行修改密码同样撤销全部会话并清除当前 Cookie。工单、日志和浏览器状态中都不得保存密码或密码派生提示。
+
+## 默认服务回填与功能回滚
+
+默认服务回填仅在 `MCP_SERVICE_ENABLED=true` 的应用重启中、可信连接器注册完成后运行。它使用水位、可重复执行，为已有连接创建确定性默认服务及当前启用工具的绑定，**不会复制连接 Token 行**。
+
+服务功能异常时，把 `.env` 中 `MCP_SERVICE_ENABLED=false`，执行容器重建（仅 restart 不保证重新读取环境），并验证 `/health` 返回 `mcp_service_enabled:false`。此回滚保留 `008` 表和数据，关闭 `/mcp/service/{service_id}`、租户服务管理 UI/API 和服务运行时；旧 `/mcp`、`/mcp/{connection_id}` 及连接 Token 继续工作；经过认证的平台管理员服务管理 API 继续可用，以便精确撤销 Token、禁用服务和清理。若启用阶段健康检查失败，发布脚本会自动恢复 `false`、重建并验证关闭态，然后以非零状态退出。
 
 ## 发布连接器包
 
@@ -151,35 +172,37 @@ Token 只在签发响应中返回一次。不要把 Authorization、Cookie、Tok
 
 入口切换回滚只影响目标客户端和目标连接缓存。非默认第三方连接可以直接禁用；默认企微连接不能依赖旧入口绕过禁用状态。若数据库结构损坏或多个租户出现同类故障，请停止应用并执行完整备份恢复流程。
 
-## 执行非生产冒烟检查
+## 经授权的可逆冒烟
 
-只在获得授权的非生产浏览器和 MySQL 环境中执行本节。使用非生产 ID 和唯一前缀，例如 `smoke_1234567890123`，并在开始前记录当前日志保留天数。
+生产冒烟默认禁止。开始前必须具备书面变更授权、维护窗口、明确生产目标、一次性 schema 权限、具名操作人和复核人、备份/恢复点以及清理批准。生产运行须显式设置 `MCP_SMOKE_MODE=production`、`MCP_SMOKE_PRODUCTION_OPT_IN=I_ACCEPT_PRODUCTION_SMOKE` 与 `MCP_SMOKE_WRITTEN_AUTHORIZATION=I_HAVE_WRITTEN_AUTHORIZATION`；这三个值只是防误触门禁，可访问或可解析的地址绝不视为授权。生产基础 URL 必须为 HTTPS，`MCP_SMOKE_PRODUCTION_HOST` 必须与 URL host 精确一致，并拒绝 loopback、非全局 IP、单标签、`.test`/`.invalid`/`.example`/`.localhost`、`example.com`/`.net`/`.org` 及其全部子域，以及已知测试/模板 host；本地模式只允许 loopback。URL 端口或 IPv6 语法错误会在联网前用固定错误码拒绝。
 
-1. 在浏览器创建测试租户和企微连接
-2. 保存只显示一次的 Token，并调用 `/mcp/{connection_id}`
-3. 轮换 Token，确认旧 Token 失败且新 Token 成功
-4. 禁用一个工具，确认工具列表立即移除它
-5. 按测试租户和连接查看日志
-6. 导入只访问许可 HTTPS 主机的安全规范并发布 revision
-7. 导入指向环回或私网的 URL，确认系统拒绝
-8. 恢复冒烟前的日志保留天数
-9. 执行清理并确认查询结果为零
+基础 URL、两个 connection ID/完整 endpoint/Token、real service ID/完整 endpoint/Token、wrong service ID/完整 endpoint、`MCP_SMOKE_BAD_CONNECTION_TOKEN`、`MCP_SMOKE_BAD_SERVICE_TOKEN`、三组精确预期 alias，以及三个仅访问已批准一次性数据的 call alias/JSON 参数必须逐项显式提供。资源 ID 的**输入原文**必须是平台实际持久化的规范小写 UUID（API 创建为 v4，确定性默认服务可为 v5），不能先转小写再接受；并对低多样性、周期和明显顺序 UUID 模板做保守预检。`your-*-here`、`dummy`、`todo` 等文档模板不能运行。
 
-管理 API 可以撤销 Token 和禁用连接，但当前不提供删除连接的端点。完成冒烟后，先撤销 Token 并禁用连接，再在备份后执行以下 MySQL 5.7 事务。执行前替换描述性占位值，并确认它们只匹配本次唯一前缀：
+连接 Token 必须匹配 `mcp_` 加 43 个 URL-safe Base64 字符，服务 Token 必须匹配 `mcp_svc_` 加 43 个字符；后缀还必须规范解码为恰好 32 bytes。两个 bad Token 也必须分别采用正确类别形状，但与全部有效 Token 不同。联网前会拒绝单一/低多样性、明显顺序 payload，以及任何至少出现两次的 proper-period 前缀重复（包括 10-byte motif 重复后截断和 16-byte motif 重复）。这只是“明显占位/低多样性预检”，**不能证明密码学熵、真实签发或授权**；生产值仍必须来自平台的 `token_urlsafe(32)` 签发流程和本次受控记录。所有 Token 保留原字节，任何首尾空白直接拒绝，不能 `strip` 后继续。
 
-```sql
-START TRANSACTION;
-DELETE FROM declarative_spec_operation WHERE connection_id = 'smoke_connection_id';
-DELETE FROM declarative_spec_revision WHERE connection_id = 'smoke_connection_id';
-DELETE FROM connection_sync_state WHERE connection_id = 'smoke_connection_id';
-DELETE FROM connection_tool_policy WHERE connection_id = 'smoke_connection_id';
-DELETE FROM connection_token WHERE connection_id = 'smoke_connection_id';
-DELETE FROM connection_credential WHERE connection_id = 'smoke_connection_id';
-DELETE FROM mcp_call_log WHERE tenant_id = 'smoke_tenant_id'
-  AND connection_id = 'smoke_connection_id';
-DELETE FROM connection_instance WHERE tenant_id = 'smoke_tenant_id'
-  AND connection_id = 'smoke_connection_id';
-COMMIT;
-```
+检查按固定顺序产生 3 个接受检查和 11 个拒绝检查：两个 bad Token 分别覆盖其真实目标和第二目标，服务 Token 用于 connection 1/2，connection 1/2 Token 用于服务，两个连接间 Token 双向交叉，以及服务 Token 用于 wrong service。只有明确的 MCP/HTTP 401/403 算拒绝成功，DNS/TLS/timeout/transport/protocol/程序错误和取消都算失败。工具 alias 必须与预期集合完全相等，不允许额外暴露。CLI 最外层把取消、异常组及其他基础异常转成固定非零结果，不输出 traceback 或异常文本；SystemExit 仅保留 `1..125`，其他值固定为 `1`，KeyboardInterrupt 固定为 `130`。输出不记录 Cookie、Authorization、原始 Token、工具返回体或任意异常消息。
 
-再清理管理操作审计中带唯一前缀的测试记录，并删除测试租户。删除租户只移除中心配置，不会删除对应的 `wbd_*` 历史 schema。冒烟必须使用专用的可丢弃 schema；数据库管理员应先从租户配置核对 schema 名、确认它带本次唯一前缀且不被其他租户引用，再删除该精确 schema，并复查业务表、`sync_cursor` 和 `audit_log` 均无残留。若无法满足这些条件，请保留 schema 并登记残留，不能使用通配删除。若冒烟修改了 `gateway_setting` 中的日志保留值，请通过 `PUT /admin/mcp-log-settings` 恢复记录值，不要删除其他环境设置。
+1. 在本地生成一个高熵 run ID。操作表记录精确的 tenant ID、完整 schema 名、两个 connection ID/alias、全部 service ID/key（包括精确 tenant ID 查出的自动回填服务）、binding ID、service/connection token ID 与安全 prefix、spec/revision/operation ID、原日志保留值和每张相关表的冒烟前计数；原始 Token/密码/Cookie 不入表。
+2. 创建一次性租户和初始密码，验证登录、退出、管理员重置、登录状态和会话撤销；验证过程不保存密码/Cookie。
+3. 创建恰好两个一次性连接，其中一个为受控 OpenAPI 连接；发布只访问已授权一次性上游的两步组合工具。
+4. 创建一个绑定两个连接工具的服务，验证别名唯一、`tools/list`/受控调用、服务 Token 对第二个服务的错误绑定拒绝、签发/揭示/复制、撤销后揭示与认证拒绝、租户范围日志，以及旧连接入口兼容。
+5. 保存所需审计证据后，先经 API 撤销每个服务和连接 Token，再禁用服务及两个连接；通过 API 恢复原日志保留设置并读取确认。
+
+### 精确清理门禁
+
+不得使用 `LIKE`、前缀匹配、通配 schema 名或未绑定 tenant ID 的删除。先把记录的 ID 装入会话临时表（示意名 `smoke_service_ids`、`smoke_connection_ids`、`smoke_token_ids`），逐项比较精确所有权及期望计数；任何断言不符立即 `ROLLBACK` 并保留现场。确认子表计数后，在**一个事务**中按子到父删除：
+
+1. `mcp_service_token`
+2. `mcp_service_tool_binding`
+3. 精确 tenant/service/connection 维度的 `mcp_call_log`
+4. `mcp_service`
+5. `declarative_spec_operation`、`declarative_spec_revision`
+6. `connection_sync_state`、`connection_tool_policy`、`connection_token`、`connection_credential`
+7. 两条精确 `connection_instance`
+8. `tenant_session`、`tenant_account`
+9. 精确 tenant 的 `domain_verify_file`
+10. 最后删除精确 `tenant_config`
+
+每条语句使用记录的完整 ID 集合和 tenant ID，并检查 `ROW_COUNT()` 等于批准值；只有全部所有权/计数断言都满足才 `COMMIT`。随后对上述每张表用同一精确 ID 集合验证零行、零存活 Token，确认设置等于原值且非测试租户总计数没有意外变化。
+
+schema 删除必须是独立的第二阶段：从已记录的 `tenant_config` 证据证明 schema 名与创建时的**完整 run ID** 完全对应，并查询确认没有其他 `tenant_config` 行引用该精确 schema，才可对转义后的完整标识执行一次精确 `DROP DATABASE`。无法证明时保留 schema 并登记，不得猜测。最后确认 schema 不存在（或明确登记保留）、旧 `/mcp` 和 `/mcp/{connection_id}` 仍健康。清理 SQL 应由 DBA 根据记录 ID 生成并由复核人逐条核对，不在通用文档提供可被误用的宽泛删除模板。

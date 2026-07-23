@@ -23,7 +23,11 @@ services:
     # 注意：不挂载 .env 文件进容器（避免容器内appuser读文件无权限 + MCP SDK读.env崩）
     # env_file 已注入环境变量，pydantic-settings 直接从 env 读，绕开文件权限问题
     healthcheck:
-      test: ["CMD", "curl", "-fs", "http://localhost:8001/health"]
+      test:
+        - CMD-SHELL
+        - >-
+          curl -fsS http://localhost:8001/health |
+          python -c 'import json,sys; payload=json.load(sys.stdin); sys.exit(0 if payload.get("status") == "ok" and isinstance(payload.get("mcp_service_enabled"), bool) else 1)'
       interval: 30s
       timeout: 5s
       retries: 3

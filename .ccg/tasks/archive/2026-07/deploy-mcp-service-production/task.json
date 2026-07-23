@@ -1,0 +1,12 @@
+{
+  "id": "deploy-mcp-service-production",
+  "title": "将已合并的 MCP 服务层部署到生产服务器",
+  "status": "completed",
+  "complexity": "M",
+  "risk": "high",
+  "domain": "devops",
+  "currentPhase": "completed",
+  "nextAction": "归档任务记录",
+  "createdAt": "2026-07-23T03:17:15Z",
+  "branch": "main"
+}

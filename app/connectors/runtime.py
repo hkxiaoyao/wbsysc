@@ -351,6 +351,25 @@ class ConnectorRuntime:
             enabled_tools.append(_public_tool_copy(tool))
         return tuple(enabled_tools)
 
+    def require_enabled_tool(
+        self,
+        context: ConnectionContext,
+        source_tool_key: str,
+    ) -> ToolSpec:
+        """Resolve one stable source key after connection/tool policy checks."""
+        if context.connection.status != "active":
+            raise ConnectionUnavailableError("connection is unavailable")
+        spec = self._connector_resolver.spec_for(context)
+        tool = next(
+            (item for item in spec.tools if item.tool_key == source_tool_key),
+            None,
+        )
+        if tool is None:
+            raise ToolDisabledError("tool is unavailable for this connection")
+        policy = self._policy_for(context, tool)
+        self._policy_guard.assert_allowed(tool, policy)
+        return _public_tool_copy(tool)
+
     async def execute(
         self,
         context: ConnectionContext,

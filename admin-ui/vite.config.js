@@ -13,6 +13,7 @@ export default defineConfig({
     port: 5178,
     proxy: {
       '/admin': 'http://localhost:8001',
+      '/tenant': 'http://localhost:8001',
     },
   },
   build: {

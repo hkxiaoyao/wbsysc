@@ -25,6 +25,7 @@ pydantic>=2.9.0
 pydantic-settings>=2.5.0
 python-dotenv>=1.0.0
 PyYAML>=6.0
+argon2-cffi>=23.1.0
 
 # 调度（一期定时轮询）
 apscheduler>=3.10.0

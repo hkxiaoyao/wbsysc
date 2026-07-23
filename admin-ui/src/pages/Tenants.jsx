@@ -1,4 +1,4 @@
-import { useEffect, useMemo, useState } from 'react'
+import { useEffect, useMemo, useRef, useState } from 'react'
 import {
   Alert,
   Badge,
@@ -37,7 +37,22 @@ import {
 } from '@ant-design/icons'
 import api from '../api.js'
 import Connections from './Connections.jsx'
-import { EMPTY_FILTERS, filterTenants, getDirectModeReason, getTenantStats } from './tenantsView.js'
+import {
+  EMPTY_FILTERS,
+  buildTenantLoginPatch,
+  buildTenantLoginStatusPatch,
+  buildTenantPasswordReset,
+  confirmedTenantLoginStatus,
+  createTenantActionLock,
+  createTenantRequestGeneration,
+  filterTenants,
+  getDirectModeReason,
+  getTenantStats,
+  projectTenantLoginState,
+  tenantLoginPasswordEndpoint,
+  tenantLoginStatusEndpoint,
+  tenantPasswordValidationError,
+} from './tenantsView.js'
 import './Tenants.css'
 
 const { Text, Paragraph, Link } = Typography
@@ -68,10 +83,12 @@ export default function Tenants({ onViewLogs = () => {}, onViewConnections = () 
   const [loadError, setLoadError] = useState('')
   const [filters, setFilters] = useState({ ...EMPTY_FILTERS })
   const [rowActions, setRowActions] = useState(() => new Set())
+  const rowActionLocks = useRef(createTenantActionLock())
   const [editorOpen, setEditorOpen] = useState(false)
   const [editorDirty, setEditorDirty] = useState(false)
   const [editing, setEditing] = useState(null)
   const [saving, setSaving] = useState(false)
+  const [resetPassword, setResetPassword] = useState('')
   const [mcpLoadingTenant, setMcpLoadingTenant] = useState(null)
   const [connectionTenant, setConnectionTenant] = useState(null)
   const [mcpModal, setMcpModal] = useState({ open: false, title: '', text: '' })
@@ -83,25 +100,84 @@ export default function Tenants({ onViewLogs = () => {}, onViewConnections = () 
   const [messageApi, messageContextHolder] = message.useMessage()
   const screens = Grid.useBreakpoint()
   const compactTable = !screens.md
+  const mounted = useRef(true)
+  const editorTenantId = useRef('')
+  const listGeneration = useRef(createTenantRequestGeneration())
+  const listController = useRef(null)
+  const editorMutationGeneration = useRef(createTenantRequestGeneration())
+  const editorMutationController = useRef(null)
 
   const stats = useMemo(() => getTenantStats(data), [data])
   const visibleTenants = useMemo(() => filterTenants(data, filters), [data, filters])
+  const editingLoginState = useMemo(() => projectTenantLoginState(editing || {}), [editing])
   const hasFilters = Boolean(filters.query) || filters.dataMode !== 'all' || filters.enabled !== 'all'
 
   const load = async () => {
+    const ticket = listGeneration.current.begin('__list__', 'load')
+    listController.current?.abort()
+    const controller = new AbortController()
+    listController.current = controller
+    const isCurrent = () => mounted.current && !controller.signal.aborted
+      && listGeneration.current.isCurrent(ticket, '__list__', 'load')
     setLoading(true)
     setLoadError('')
     try {
-      const r = await api.get('/admin/tenants')
+      const r = await api.get('/admin/tenants', { signal: controller.signal })
+      if (!isCurrent()) return
       setData(r.data.items || [])
+      setEditing((current) => {
+        if (!current || current.tenant_id !== editorTenantId.current) return current
+        return (r.data.items || []).find((row) => row.tenant_id === current.tenant_id) || current
+      })
+      return r.data.items || []
     } catch (e) {
-      setLoadError('租户列表加载失败：' + (e.response?.data?.detail || e.message))
-    } finally { setLoading(false) }
+      if (isCurrent()) setLoadError('租户列表加载失败：' + (e.response?.data?.detail || e.message))
+      return null
+    } finally {
+      if (isCurrent()) setLoading(false)
+    }
   }
 
-  useEffect(() => { load() }, [])
+  useEffect(() => {
+    mounted.current = true
+    load()
+    return () => {
+      mounted.current = false
+      listGeneration.current.invalidate()
+      editorMutationGeneration.current.invalidate()
+      listController.current?.abort()
+      editorMutationController.current?.abort()
+    }
+  }, [])
+
+  const invalidateEditorMutation = () => {
+    editorMutationGeneration.current.invalidate()
+    editorMutationController.current?.abort()
+  }
+
+  const beginEditorMutation = (tenantId, action) => {
+    listGeneration.current.invalidate()
+    listController.current?.abort()
+    if (mounted.current) setLoading(false)
+    editorMutationController.current?.abort()
+    const controller = new AbortController()
+    editorMutationController.current = controller
+    return {
+      controller,
+      ticket: editorMutationGeneration.current.begin(tenantId, action),
+    }
+  }
+
+  const isEditorMutationCurrent = (ticket, controller, tenantId, action) => (
+    mounted.current && !controller.signal.aborted
+    && editorTenantId.current === tenantId
+    && editorMutationGeneration.current.isCurrent(ticket, tenantId, action)
+  )
 
   const openCreate = () => {
+    invalidateEditorMutation()
+    editorTenantId.current = ''
+    setResetPassword('')
     setEditing(null)
     form.resetFields()
     form.setFieldsValue({
@@ -115,10 +191,19 @@ export default function Tenants({ onViewLogs = () => {}, onViewConnections = () 
   }
 
   const openEdit = (row) => {
+    invalidateEditorMutation()
+    editorTenantId.current = row.tenant_id
+    setResetPassword('')
     setEditing(row)
     form.resetFields()
     form.setFieldsValue({
-      ...row,
+      tenant_id: row.tenant_id,
+      display_name: row.display_name,
+      corpid: row.corpid,
+      enabled: row.enabled,
+      data_mode: row.data_mode,
+      sync_interval_min: row.sync_interval_min,
+      checkin_userids: row.checkin_userids,
       enabled_modules: (row.enabled_modules || '').split(',').filter(Boolean),
       secret: '',          // 编辑时密钥留空=不改
       contact_secret: '',
@@ -130,6 +215,9 @@ export default function Tenants({ onViewLogs = () => {}, onViewConnections = () 
   }
 
   const closeEditor = () => {
+    invalidateEditorMutation()
+    editorTenantId.current = ''
+    setResetPassword('')
     setEditorDirty(false)
     setEditorOpen(false)
     setEditing(null)
@@ -155,29 +243,52 @@ export default function Tenants({ onViewLogs = () => {}, onViewConnections = () 
   const submit = async () => {
     if (saving) return
     setSaving(true)
+    let mutationIsCurrent = () => mounted.current
+    let lockedRow = null
     try {
       const v = await form.validateFields()
       const payload = {
-        ...v,
+        tenant_id: v.tenant_id,
+        display_name: v.display_name || '',
+        corpid: v.corpid,
+        enabled: Boolean(v.enabled),
+        data_mode: v.data_mode,
+        sync_interval_min: v.sync_interval_min,
         enabled_modules: (v.enabled_modules || []).join(','),
         checkin_userids: v.checkin_userids || '',
         trusted_domain: (v.trusted_domain || '').trim(),
+        mcp_token: v.mcp_token || '',
+        secret: v.secret || '',
+        contact_secret: v.contact_secret || '',
       }
+      const tenantId = editing?.tenant_id || ''
+      const action = editing ? 'save' : 'create'
       if (editing) {
-        await api.put(`/admin/tenants/${editing.tenant_id}`, payload)
+        if (!beginRowAction(editing, action)) return
+        lockedRow = editing
+      }
+      const { ticket, controller } = beginEditorMutation(tenantId, action)
+      const isCurrent = () => isEditorMutationCurrent(ticket, controller, tenantId, action)
+      mutationIsCurrent = isCurrent
+      if (editing) {
+        await api.put(`/admin/tenants/${encodeURIComponent(editing.tenant_id)}`, payload, { signal: controller.signal })
+        if (!isCurrent()) return
         messageApi.success('已更新')
       } else {
-        await api.post('/admin/tenants', payload)
+        Object.assign(payload, buildTenantLoginPatch(v.tenant_password))
+        await api.post('/admin/tenants', payload, { signal: controller.signal })
+        if (!isCurrent()) return
         messageApi.success('已新增(已建schema)')
       }
       closeEditor()
       load()
     } catch (e) {
-      if (!e.errorFields) {
+      if (!e.errorFields && mutationIsCurrent()) {
         messageApi.error('保存失败: ' + (e.response?.data?.detail || e.message))
       }
     } finally {
-      setSaving(false)
+      if (lockedRow) endRowAction(lockedRow, 'save')
+      if (mounted.current) setSaving(false)
     }
   }
 
@@ -199,24 +310,30 @@ export default function Tenants({ onViewLogs = () => {}, onViewConnections = () 
     })
   }
 
-  const rowActionKey = (row, action) => `${row.tenant_id}:${action}`
-  const beginRowAction = (row, action) => setRowActions((current) => {
-    const next = new Set(current)
-    next.add(rowActionKey(row, action))
-    return next
-  })
-  const endRowAction = (row, action) => setRowActions((current) => {
-    const next = new Set(current)
-    next.delete(rowActionKey(row, action))
-    return next
-  })
-  const isRowBusy = (row) => [...rowActions].some((key) => key.startsWith(`${row.tenant_id}:`))
+  const beginRowAction = (row, action) => {
+    if (!rowActionLocks.current.acquire(row.tenant_id, action)) return false
+    setRowActions((current) => {
+      const next = new Set(current)
+      next.add(row.tenant_id)
+      return next
+    })
+    return true
+  }
+  const endRowAction = (row, action) => {
+    if (!rowActionLocks.current.release(row.tenant_id, action) || !mounted.current) return
+    setRowActions((current) => {
+      const next = new Set(current)
+      next.delete(row.tenant_id)
+      return next
+    })
+  }
+  const isRowBusy = (row) => rowActions.has(row.tenant_id)
 
   const syncNow = async (row, opts = {}) => {
     const lookback = opts.lookback_days ?? 30
     const reset = !!opts.reset_cursor
     const action = reset ? 'force-sync' : 'sync'
-    beginRowAction(row, action)
+    if (!beginRowAction(row, action)) return
     try {
       const qs = new URLSearchParams({
         lookback_days: String(lookback),
@@ -261,7 +378,7 @@ export default function Tenants({ onViewLogs = () => {}, onViewConnections = () 
   }
 
   const diagnoseSync = async (row) => {
-    beginRowAction(row, 'diagnose')
+    if (!beginRowAction(row, 'diagnose')) return
     try {
       const r = await api.get(`/admin/tenants/${row.tenant_id}/sync-diagnose`, {
         params: { lookback_days: 90 },
@@ -301,6 +418,107 @@ export default function Tenants({ onViewLogs = () => {}, onViewConnections = () 
     } finally {
       endRowAction(row, 'diagnose')
     }
+  }
+
+  const resetTenantLoginPassword = (row) => {
+    const validationError = tenantPasswordValidationError(resetPassword)
+    if (validationError) {
+      messageApi.error(validationError)
+      return
+    }
+    const exactPassword = resetPassword
+    modal.confirm({
+      title: `重置登录密码 · ${row.display_name || row.tenant_id}`,
+      content: '重置后现有租户登录会话将失效。确认使用刚输入的新密码？',
+      okText: '确认重置',
+      cancelText: '取消',
+      okButtonProps: { danger: true },
+      onOk: async () => {
+        if (!beginRowAction(row, 'login-reset')) return
+        const tenantId = row.tenant_id
+        const action = 'login-reset'
+        const { ticket, controller } = beginEditorMutation(tenantId, action)
+        const isCurrent = () => isEditorMutationCurrent(ticket, controller, tenantId, action)
+        try {
+          await api.put(
+            tenantLoginPasswordEndpoint(tenantId),
+            buildTenantPasswordReset(exactPassword),
+            { signal: controller.signal },
+          )
+          if (!isCurrent()) return
+          setResetPassword('')
+          messageApi.success('租户登录密码已重置，旧会话已失效')
+          await load()
+        } catch (e) {
+          if (isCurrent()) messageApi.error('重置失败: ' + (e.response?.data?.detail || e.message))
+        } finally {
+          endRowAction(row, action)
+        }
+      },
+    })
+  }
+
+  const updateTenantLoginStatus = (row, status) => {
+    const destructive = status === 'disabled'
+    const run = async () => {
+      if (!beginRowAction(row, 'login-status')) return
+      const tenantId = row.tenant_id
+      const action = 'login-status'
+      const { ticket, controller } = beginEditorMutation(tenantId, action)
+      const isCurrent = () => isEditorMutationCurrent(ticket, controller, tenantId, action)
+      try {
+        const response = await api.put(
+          tenantLoginStatusEndpoint(tenantId),
+          buildTenantLoginStatusPatch(status),
+          { signal: controller.signal },
+        )
+        if (!isCurrent()) return
+        const confirmedStatus = confirmedTenantLoginStatus(response.data, status)
+        if (!confirmedStatus) throw new Error('租户登录状态响应未确认')
+        const refreshedItems = await load()
+        if (!isCurrent()) return
+        const refreshed = Array.isArray(refreshedItems)
+          ? refreshedItems.find((item) => item.tenant_id === tenantId)
+          : null
+        if (projectTenantLoginState(refreshed).status !== confirmedStatus) {
+          setEditing((current) => current?.tenant_id === tenantId ? {
+            ...current, has_login_account: true, login_status: null,
+          } : current)
+          messageApi.error('登录状态尚未得到列表确认，请刷新后重试')
+          return
+        }
+        setResetPassword('')
+        messageApi.success(status === 'active' ? '租户登录已启用' : '租户登录已禁用，现有会话已失效')
+      } catch (e) {
+        if (!isCurrent()) return
+        if (e.response?.status === 409) {
+          setEditing((current) => current?.tenant_id === tenantId ? {
+            ...current, has_login_account: false, login_status: null,
+          } : current)
+          messageApi.error('该租户尚未设置登录密码；请先重置密码，再启用登录')
+        } else {
+          setEditing((current) => current?.tenant_id === tenantId ? {
+            ...current, has_login_account: true, login_status: null,
+          } : current)
+          messageApi.error('登录状态更新失败，当前状态未知，请刷新后重试')
+        }
+      } finally {
+        endRowAction(row, action)
+      }
+    }
+
+    if (!destructive) {
+      run()
+      return
+    }
+    modal.confirm({
+      title: `禁用登录 · ${row.display_name || row.tenant_id}`,
+      content: '禁用后该租户无法登录，现有登录会话也会立即失效。',
+      okText: '确认禁用',
+      cancelText: '取消',
+      okButtonProps: { danger: true },
+      onOk: run,
+    })
   }
 
   const openMcpConfig = async (row) => {
@@ -697,7 +915,12 @@ export default function Tenants({ onViewLogs = () => {}, onViewConnections = () 
         footer={(
           <div className="tenant-editor-footer">
             <Button onClick={requestCloseEditor} disabled={saving}>取消</Button>
-            <Button type="primary" onClick={submit} loading={saving}>保存配置</Button>
+            <Button
+              type="primary"
+              onClick={submit}
+              loading={saving}
+              disabled={Boolean(editing && isRowBusy(editing))}
+            >保存配置</Button>
           </div>
         )}
       >
@@ -754,7 +977,85 @@ export default function Tenants({ onViewLogs = () => {}, onViewConnections = () 
             >
               <Input.Password placeholder="可选" />
             </Form.Item>
+            {!editing && (
+              <Form.Item
+                name="tenant_password"
+                label="租户初始登录密码（可选）"
+                extra="仅创建时设置；12–256 个字符，首尾不能有空格，且不能包含 password（不区分大小写）。系统不会回显密码。"
+                rules={[{
+                  validator: (_, value) => {
+                    const error = tenantPasswordValidationError(value ?? '', { optional: true })
+                    return error ? Promise.reject(new Error(error)) : Promise.resolve()
+                  },
+                }]}
+              >
+                <Input.Password
+                  autoComplete="new-password"
+                  aria-label="租户初始登录密码"
+                  placeholder="留空则暂不创建登录账号"
+                />
+              </Form.Item>
+            )}
           </section>
+
+          {editing && (
+            <section className="tenant-form-section" aria-labelledby="tenant-login-security-heading">
+              <div className="tenant-form-section__heading">
+                <div>
+                  <h2 id="tenant-login-security-heading">租户登录安全</h2>
+                  <p>密码不会被读取或回显。重置密码和禁用登录都会撤销现有登录会话。</p>
+                </div>
+              </div>
+              <Space direction="vertical" size="middle" style={{ width: '100%' }}>
+                <div aria-live="polite">
+                  <Text>登录账号状态：</Text>{' '}
+                  {editingLoginState.kind === 'active' && <Tag color="success">已启用</Tag>}
+                  {editingLoginState.kind === 'disabled' && <Tag>已禁用</Tag>}
+                  {editingLoginState.kind === 'none' && <Tag color="warning">尚未设置密码</Tag>}
+                  {editingLoginState.kind === 'unknown' && <Tag color="warning">未知，暂不可更改</Tag>}
+                </div>
+                <Space wrap>
+                  <Button
+                    onClick={() => updateTenantLoginStatus(editing, 'active')}
+                    loading={isRowBusy(editing)}
+                    disabled={editingLoginState.kind === 'active'
+                      || editingLoginState.kind === 'none'
+                      || editingLoginState.kind === 'unknown'}
+                  >启用登录</Button>
+                  <Button
+                    danger
+                    onClick={() => updateTenantLoginStatus(editing, 'disabled')}
+                    loading={isRowBusy(editing)}
+                    disabled={editingLoginState.kind === 'disabled'
+                      || editingLoginState.kind === 'none'
+                      || editingLoginState.kind === 'unknown'}
+                  >禁用登录</Button>
+                </Space>
+                <div>
+                  <Text strong>设置或重置登录密码</Text>
+                  <Paragraph type="secondary" style={{ margin: '4px 0 8px' }}>
+                    输入会按原样提交，不会自动去除空格。要求 12–256 个字符，首尾不能有空格，且不能包含 password（不区分大小写）。
+                  </Paragraph>
+                  <Space.Compact style={{ width: '100%' }}>
+                    <Input.Password
+                      value={resetPassword}
+                      onChange={(event) => setResetPassword(event.target.value)}
+                      autoComplete="new-password"
+                      aria-label="租户新登录密码"
+                      placeholder="输入新的租户登录密码"
+                      disabled={isRowBusy(editing)}
+                    />
+                    <Button
+                      danger
+                      onClick={() => resetTenantLoginPassword(editing)}
+                      loading={isRowBusy(editing)}
+                      disabled={!resetPassword || isRowBusy(editing)}
+                    >确认重置</Button>
+                  </Space.Compact>
+                </div>
+              </Space>
+            </section>
+          )}
 
           <section className="tenant-form-section">
             <div className="tenant-form-section__heading">

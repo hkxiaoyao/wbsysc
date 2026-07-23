@@ -1,5 +1,6 @@
 from dataclasses import FrozenInstanceError
 from datetime import datetime, timedelta, timezone
+from pathlib import Path
 
 import pytest
 
@@ -84,7 +85,7 @@ def test_models_are_immutable_and_filters_validate_ranges():
         LogFilters(from_time=datetime.now(timezone.utc))
 
 
-def test_server_resolved_auth_and_protocol_targets_populate_only_connection_dimension():
+def test_server_resolved_auth_and_protocol_targets_populate_only_resolved_dimensions():
     auth = McpLogEvent(category="auth", target="conn-a")
     protocol = McpLogEvent(category="protocol", target="conn-b")
     anonymous = McpLogEvent(category="auth")
@@ -94,6 +95,26 @@ def test_server_resolved_auth_and_protocol_targets_populate_only_connection_dime
     assert anonymous.connection_id is None
     assert anonymous.connector_key is None
     assert anonymous.tool_key is None
+
+    service = McpLogEvent(
+        tenant_id="tenant-a",
+        service_id="service-a",
+        tool_alias="hq_wecom__get_users",
+        connection_id="conn-a",
+        tool_key="users.get",
+        category="tool",
+    )
+    assert service.service_id == "service-a"
+    assert service.tool_alias == "hq_wecom__get_users"
+
+    service_auth = McpLogEvent(
+        tenant_id="tenant-a",
+        service_id="service-a",
+        category="auth",
+        event_name="auth_ok",
+        target="service-a",
+    )
+    assert service_auth.connection_id is None
 
 
 @pytest.mark.parametrize(
@@ -110,7 +131,9 @@ def test_log_filters_reject_invalid_values(kwargs, message):
         LogFilters(**kwargs)
 
 
-@pytest.mark.parametrize("field", ["connection_id", "connector_key", "tool_key"])
+@pytest.mark.parametrize(
+    "field", ["service_id", "tool_alias", "connection_id", "connector_key", "tool_key"]
+)
 def test_connection_dimensions_reject_credential_bearing_labels(field):
     with pytest.raises(ValueError, match=field):
         McpLogEvent(**{field: "token=top-secret"})
@@ -138,9 +161,23 @@ def test_ensure_central_log_tables_executes_mysql57_ddl(monkeypatch):
     assert "`connection_id` VARCHAR(64) NULL" in sql
     assert "`connector_key` VARCHAR(64) NULL" in sql
     assert "`tool_key` VARCHAR(128) NULL" in sql
+    assert "`service_id` VARCHAR(64) NULL" in sql
+    assert "`tool_alias` VARCHAR(128) NULL" in sql
+    assert "idx_mcp_log_service_created" in sql
+    assert "idx_mcp_log_alias_created" in sql
     assert "idx_mcp_log_connection_created" in sql
     assert "UNIQUE KEY `uk_mcp_log_legacy` (`legacy_schema`, `legacy_id`)" in sql
     assert "CREATE TABLE IF NOT EXISTS `gateway_setting`" in sql
+    assert "ADD COLUMN IF NOT EXISTS" not in sql
+
+
+def test_service_sql_migrates_log_dimensions_with_mysql57_metadata_guards():
+    sql = Path("sql/008_mcp_service.sql").read_text(encoding="utf-8")
+
+    assert "COLUMN_NAME = 'service_id'" in sql
+    assert "COLUMN_NAME = 'tool_alias'" in sql
+    assert "idx_mcp_log_service_created" in sql
+    assert "idx_mcp_log_alias_created" in sql
     assert "ADD COLUMN IF NOT EXISTS" not in sql
 
 
@@ -202,6 +239,70 @@ def test_connection_dimensions_are_bound_and_filter_logs_without_crossing_connec
     assert result["items"] == [conn_a_log]
     assert "connection_id = :connection_id" in count_sql
     assert count_params["connection_id"] == "conn-a"
+
+
+def test_service_dimensions_are_bound_and_filter_materialized_aliases(monkeypatch):
+    item = {
+        "id": 8,
+        "tenant_id": "tenant-a",
+        "service_id": "service-a",
+        "tool_alias": "hq_wecom__get_users",
+        "connection_id": "conn-a",
+        "tool_key": "users.get",
+    }
+    connection = install_engine(
+        monkeypatch,
+        Result(),
+        Result(scalar_value=1),
+        Result(rows=[item]),
+    )
+    event = McpLogEvent(
+        tenant_id="tenant-a",
+        service_id="service-a",
+        tool_alias="hq_wecom__get_users",
+        connection_id="conn-a",
+        tool_key="users.get",
+        category="tool",
+        event_name="hq_wecom__get_users",
+    )
+
+    store.insert_event(event)
+    result = store.list_logs(
+        LogFilters(
+            tenant_id="tenant-a",
+            service_id="service-a",
+            tool_alias="hq_wecom__get_users",
+            connection_id="conn-a",
+            tool_key="users.get",
+        ),
+        page=1,
+        page_size=20,
+    )
+
+    insert_sql, insert_params = connection.statements[0]
+    count_sql, count_params = connection.statements[1]
+    assert result["items"] == [item]
+    assert ":service_id" in insert_sql and "service-a" not in insert_sql
+    assert insert_params["service_id"] == "service-a"
+    assert insert_params["tool_alias"] == "hq_wecom__get_users"
+    assert "service_id = :service_id" in count_sql
+    assert "tool_alias = :tool_alias" in count_sql
+    assert count_params["service_id"] == "service-a"
+    assert count_params["tool_alias"] == "hq_wecom__get_users"
+
+
+def test_admin_filter_contract_accepts_service_and_alias_dimensions():
+    from app import mcp_logs_admin
+
+    filters = mcp_logs_admin._new_filters(
+        service_id="service-a",
+        tool_alias="hq_wecom__get_users",
+        connection_id="conn-a",
+        tool_key="users.get",
+    )
+
+    assert filters.service_id == "service-a"
+    assert filters.tool_alias == "hq_wecom__get_users"
 
 
 def test_list_logs_escapes_like_metacharacters_and_paginates(monkeypatch):

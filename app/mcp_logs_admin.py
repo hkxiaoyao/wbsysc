@@ -35,6 +35,8 @@ SAFE_LOG_FIELDS = frozenset(
     (
         "id",
         "tenant_id",
+        "service_id",
+        "tool_alias",
         "connection_id",
         "connector_key",
         "tool_key",
@@ -124,6 +126,8 @@ def _complete_window(
 def _new_filters(
     *,
     tenant_id: str | None = None,
+    service_id: str | None = None,
+    tool_alias: str | None = None,
     connection_id: str | None = None,
     connector_key: str | None = None,
     tool_key: str | None = None,
@@ -148,6 +152,8 @@ def _new_filters(
     try:
         return LogFilters(
             tenant_id=tenant_id,
+            service_id=service_id,
+            tool_alias=tool_alias,
             connection_id=connection_id,
             connector_key=connector_key,
             tool_key=tool_key,
@@ -168,6 +174,8 @@ def _new_filters(
 
 def _query_filters(
     tenant_id: Annotated[str | None, Query(max_length=64)] = None,
+    service_id: Annotated[str | None, Query(max_length=64)] = None,
+    tool_alias: Annotated[str | None, Query(max_length=128)] = None,
     connection_id: Annotated[str | None, Query(max_length=64)] = None,
     connector_key: Annotated[str | None, Query(max_length=64)] = None,
     tool_key: Annotated[str | None, Query(max_length=128)] = None,
@@ -184,6 +192,8 @@ def _query_filters(
 ) -> LogFilters:
     return _new_filters(
         tenant_id=tenant_id,
+        service_id=service_id,
+        tool_alias=tool_alias,
         connection_id=connection_id,
         connector_key=connector_key,
         tool_key=tool_key,
@@ -205,6 +215,8 @@ class DeleteFilterBody(BaseModel):
     model_config = ConfigDict(extra="forbid", populate_by_name=True)
 
     tenant_id: str | None = Field(default=None, max_length=64)
+    service_id: str | None = Field(default=None, max_length=64)
+    tool_alias: str | None = Field(default=None, max_length=128)
     connection_id: str | None = Field(default=None, max_length=64)
     connector_key: str | None = Field(default=None, max_length=64)
     tool_key: str | None = Field(default=None, max_length=128)
@@ -244,6 +256,8 @@ class DeleteFilterBody(BaseModel):
             value not in (None, "")
             for value in (
                 self.tenant_id,
+                self.service_id,
+                self.tool_alias,
                 self.connection_id,
                 self.connector_key,
                 self.tool_key,
@@ -263,6 +277,8 @@ class DeleteFilterBody(BaseModel):
     def to_filters(self) -> LogFilters:
         return _new_filters(
             tenant_id=self.tenant_id,
+            service_id=self.service_id,
+            tool_alias=self.tool_alias,
             connection_id=self.connection_id,
             connector_key=self.connector_key,
             tool_key=self.tool_key,
@@ -398,6 +414,8 @@ def _filters_payload(filters: LogFilters) -> dict[str, Any]:
     payload: dict[str, Any] = {}
     for name in (
         "tenant_id",
+        "service_id",
+        "tool_alias",
         "connection_id",
         "connector_key",
         "tool_key",
@@ -553,6 +571,11 @@ def _safe_list_result(result: Any, page: int, page_size: int) -> dict[str, Any]:
     }
 
 
+def safe_log_list(result: Any, page: int, page_size: int) -> dict[str, Any]:
+    """Project a store list result through the shared public log schema."""
+    return _safe_list_result(result, page, page_size)
+
+
 def _safe_stats(stats: Any) -> dict[str, Any]:
     values = dict(stats)
     return {
@@ -567,6 +590,11 @@ def _safe_stats(stats: Any) -> dict[str, Any]:
             values.get("status_distribution", []), "result_status"
         ),
     }
+
+
+def safe_log_stats(stats: Any) -> dict[str, Any]:
+    """Project aggregate log data through the shared public stats schema."""
+    return _safe_stats(stats)
 
 
 def _safe_preview_result(result: Any) -> dict[str, int]:
@@ -597,7 +625,7 @@ def get_mcp_logs(
         filters,
         page,
         page_size,
-        transform=lambda result: _safe_list_result(result, page, page_size),
+        transform=lambda result: safe_log_list(result, page, page_size),
     )
 
 
@@ -607,7 +635,7 @@ def get_mcp_log_statistics(
     filters: Annotated[LogFilters, Depends(_query_filters)],
 ):
     _require_auth(request)
-    return _store_call(get_log_stats, filters, transform=_safe_stats)
+    return _store_call(get_log_stats, filters, transform=safe_log_stats)
 
 
 @router.post("/mcp-logs/delete-preview")

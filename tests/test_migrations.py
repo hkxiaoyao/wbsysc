@@ -84,6 +84,8 @@ def test_startup_migrations_upgrade_center_before_tenant_schemas(monkeypatch):
     events = []
     from app import mcp_log_store
     from app.connections import store as connection_store
+    from app.mcp_services import store as service_store
+    from app.tenant_auth import store as tenant_auth_store
 
     monkeypatch.setattr(
         db, "ensure_central_columns", lambda: events.append("center"), raising=False
@@ -102,6 +104,16 @@ def test_startup_migrations_upgrade_center_before_tenant_schemas(monkeypatch):
         connection_store,
         "ensure_connection_tables",
         lambda: events.append("connection_tables"),
+    )
+    monkeypatch.setattr(
+        service_store,
+        "ensure_mcp_service_tables",
+        lambda: events.append("service_tables"),
+    )
+    monkeypatch.setattr(
+        tenant_auth_store,
+        "ensure_tenant_auth_tables",
+        lambda: events.append("tenant_auth_tables"),
     )
     monkeypatch.setattr(
         connection_store,
@@ -125,6 +137,8 @@ def test_startup_migrations_upgrade_center_before_tenant_schemas(monkeypatch):
         "center",
         "log_tables",
         "connection_tables",
+        "service_tables",
+        "tenant_auth_tables",
         "connection_backfill",
         "enumerate",
         "wbd_a",
@@ -137,6 +151,8 @@ def test_startup_orders_connection_tables_before_legacy_wecom_backfill(monkeypat
     events = []
     from app.connections import store as connection_store
     from app import mcp_log_store
+    from app.mcp_services import store as service_store
+    from app.tenant_auth import store as tenant_auth_store
 
     monkeypatch.setattr(db, "ensure_central_columns", lambda: events.append("center"))
     monkeypatch.setattr(
@@ -146,6 +162,16 @@ def test_startup_orders_connection_tables_before_legacy_wecom_backfill(monkeypat
         connection_store,
         "ensure_connection_tables",
         lambda: events.append("connection_tables"),
+    )
+    monkeypatch.setattr(
+        service_store,
+        "ensure_mcp_service_tables",
+        lambda: events.append("service_tables"),
+    )
+    monkeypatch.setattr(
+        tenant_auth_store,
+        "ensure_tenant_auth_tables",
+        lambda: events.append("tenant_auth_tables"),
     )
     monkeypatch.setattr(
         connection_store,
@@ -158,18 +184,26 @@ def test_startup_orders_connection_tables_before_legacy_wecom_backfill(monkeypat
     db.run_startup_migrations()
 
     assert events.index("connection_tables") < events.index("connection_backfill")
+    assert events.index("connection_tables") < events.index("service_tables")
+    assert events.index("service_tables") < events.index("connection_backfill")
     assert events.index("log_tables") < events.index("connection_tables")
+    assert events.index("connection_tables") < events.index("tenant_auth_tables")
+    assert events.index("tenant_auth_tables") < events.index("connection_backfill")
     assert events.index("connection_backfill") < events.index("enumerate")
 
 
 def test_startup_migration_failure_propagates(monkeypatch):
     from app import mcp_log_store
     from app.connections import store as connection_store
+    from app.mcp_services import store as service_store
+    from app.tenant_auth import store as tenant_auth_store
 
     monkeypatch.setattr(db, "ensure_central_columns", lambda: None, raising=False)
     monkeypatch.setattr(mcp_log_store, "ensure_central_log_tables", lambda: None)
     monkeypatch.setattr(mcp_log_store, "migrate_legacy_logs", lambda days=90: None)
     monkeypatch.setattr(connection_store, "ensure_connection_tables", lambda: None)
+    monkeypatch.setattr(service_store, "ensure_mcp_service_tables", lambda: None)
+    monkeypatch.setattr(tenant_auth_store, "ensure_tenant_auth_tables", lambda: None)
     monkeypatch.setattr(
         connection_store,
         "migrate_legacy_wecom_connections",
@@ -283,3 +317,55 @@ def test_connection_platform_sql_matches_runtime_mysql57_tables():
     assert "add column if not exists" not in lower
     assert "`public_config_json` text" in lower
     assert "`created_at` datetime" in lower
+
+
+def test_tenant_auth_sql_matches_runtime_mysql57_tables():
+    sql = (ROOT / "sql" / "007_tenant_auth.sql").read_text(encoding="utf-8")
+    lower = sql.lower()
+
+    assert "create table if not exists `tenant_account`" in lower
+    assert "create table if not exists `tenant_session`" in lower
+    assert "`password_hash` varchar(255)" in lower
+    assert "unique key `uk_tenant_session_digest` (`session_digest`)" in lower
+    assert "add column if not exists" not in lower
+
+
+def test_mcp_service_sql_has_alias_snapshot_and_tenant_uniqueness_constraints():
+    sql = (ROOT / "sql" / "008_mcp_service.sql").read_text(encoding="utf-8")
+    lower = sql.lower()
+
+    assert "create table if not exists `mcp_service`" in lower
+    assert "create table if not exists `mcp_service_tool_binding`" in lower
+    assert "unique key `uk_mcp_service_tenant_key` (`tenant_id`, `service_key`)" in lower
+    assert "unique key `uk_service_tool_alias` (`service_id`, `tool_alias`)" in lower
+    assert (
+        "unique key `uk_service_source_tool` "
+        "(`service_id`, `connection_id`, `source_tool_key`)"
+    ) in " ".join(lower.split())
+    assert "`connection_alias` varchar(64)" in lower
+    assert "unique key `uk_connection_instance_tenant_alias`" in lower
+    assert "information_schema.columns" in lower
+    assert "information_schema.statistics" in lower
+    assert "add column if not exists" not in lower
+
+
+def test_startup_creates_mcp_service_tables_after_connection_tables(monkeypatch):
+    events = []
+    from app import mcp_log_store
+    from app.connections import store as connection_store
+    from app.mcp_services import store as service_store
+    from app.tenant_auth import store as tenant_auth_store
+
+    monkeypatch.setattr(db, "ensure_central_columns", lambda: events.append("center"))
+    monkeypatch.setattr(mcp_log_store, "ensure_central_log_tables", lambda: events.append("logs"))
+    monkeypatch.setattr(connection_store, "ensure_connection_tables", lambda: events.append("connections"))
+    monkeypatch.setattr(service_store, "ensure_mcp_service_tables", lambda: events.append("services"))
+    monkeypatch.setattr(tenant_auth_store, "ensure_tenant_auth_tables", lambda: events.append("auth"))
+    monkeypatch.setattr(connection_store, "migrate_legacy_wecom_connections", lambda: events.append("backfill"))
+    monkeypatch.setattr(db, "get_tenant_schema_names", lambda: [])
+    monkeypatch.setattr(mcp_log_store, "migrate_legacy_logs", lambda days=90: events.append("legacy_logs"))
+
+    db.run_startup_migrations()
+
+    assert events.index("connections") < events.index("services")
+    assert events.index("services") < events.index("backfill")

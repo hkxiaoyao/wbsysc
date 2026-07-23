@@ -61,11 +61,11 @@
 
 ```bash
 git clone https://github.com/hkxiaoyao/wbsysc.git && cd wbsysc
-cp .env.prod.example .env && vim .env    # 确认 WECOM_USE_MOCK=false，填写 DB_PASSWORD + ADMIN_PASSWORD + CREDENTIAL_KEY
+cp .env.prod.example .env && vim .env    # 填写密码和三个独立密钥；首次保持 MCP_SERVICE_ENABLED=false
 
 docker pull ghcr.io/hkxiaoyao/wbsysc:latest
 docker compose up -d
-curl http://localhost:8001/health        # 期望 {"status":"ok"}
+curl http://localhost:8001/health        # 同时核对 mcp_service_enabled 布尔值
 
 # 接入第一个租户
 docker compose exec wbsysc python -m app.tenant_init \
@@ -76,7 +76,7 @@ docker compose exec wbsysc python -m app.tenant_init \
 
 ### 生产升级（先迁移再切换）
 
-推荐执行 `bash deploy/server_deploy.sh`：脚本会先校验生产配置，再用独立的 `DB_MIGRATION_USER` 和宿主 `mysql` CLI 严格按顺序执行 `sql/004_gateway_hardening.sql`、`sql/005_mcp_call_log.sql` 和 `sql/006_connection_platform.sql`；任一迁移失败都会在拉取镜像和启动新应用前终止。迁移默认连接 `127.0.0.1`，远程 MySQL 可用 `DB_MIGRATION_HOST` 环境变量覆盖。迁移账户必须与运行时 `DB_USER` 不同，ROUTINE 权限不得授予运行时账户。`DB_MIGRATION_USER` 和 `DB_MIGRATION_PASSWORD` 只通过发布终端环境传入，不写入会注入应用容器的 `.env`。
+推荐执行 `bash deploy/server_deploy.sh`：脚本先校验三个生产密钥，再用独立迁移账户和宿主 `mysql` CLI 严格执行 `004` → `005` → `006` → `007` → `008`；任一迁移失败都会在拉取/启动前终止。随后脚本强制以 `MCP_SERVICE_ENABLED=false` 重建并验证健康，仅在原请求值为 `true` 时二次重建启用。启用检查失败会恢复 `false`、重建并验证关闭态后非零退出，且保留 `008` 数据。
 
 ```bash
 git pull
@@ -85,7 +85,7 @@ read -rsp "DB_MIGRATION_PASSWORD: " DB_MIGRATION_PASSWORD && export DB_MIGRATION
 bash deploy/server_deploy.sh
 ```
 
-需要手动升级时，顺序必须是“备份数据库 → 执行 `004` → 执行 `005` → 执行 `006` → 拉取新镜像 → 启动”。以下非敏感连接参数需与 `.env` 一致，密码通过 `MYSQL_PWD` 环境变量传递，不放在命令行参数中：
+需要手动升级时，顺序必须是“备份数据库 → `004` → `005` → `006` → `007` → `008` → 关闭态重建/健康检查 → 经批准启用并再次重建”。`008` 依赖 `005` 与 `006`。密码通过 `MYSQL_PWD` 环境变量传递：
 
 ```bash
 DB_MIGRATION_HOST=127.0.0.1
@@ -99,9 +99,14 @@ mysql --protocol=TCP --host="$DB_MIGRATION_HOST" --port="$DB_PORT" \
   --user="$DB_MIGRATION_USER" "$DB_NAME" < sql/005_mcp_call_log.sql
 mysql --protocol=TCP --host="$DB_MIGRATION_HOST" --port="$DB_PORT" \
   --user="$DB_MIGRATION_USER" "$DB_NAME" < sql/006_connection_platform.sql
+mysql --protocol=TCP --host="$DB_MIGRATION_HOST" --port="$DB_PORT" \
+  --user="$DB_MIGRATION_USER" "$DB_NAME" < sql/007_tenant_auth.sql
+mysql --protocol=TCP --host="$DB_MIGRATION_HOST" --port="$DB_PORT" \
+  --user="$DB_MIGRATION_USER" "$DB_NAME" < sql/008_mcp_service.sql
 unset MYSQL_PWD
 docker pull ghcr.io/hkxiaoyao/wbsysc:latest
-docker compose up -d
+# 先写 MCP_SERVICE_ENABLED=false，再 docker compose up -d --force-recreate 并核对 health
+# 仅经批准后改 true，再次 --force-recreate 并核对 health
 ```
 
 > `004_gateway_hardening.sql` 包含 `DELIMITER` 和存储过程语句，必须使用 MySQL `mysql` CLI 执行。`006_connection_platform.sql` 会幂等地将旧库的声明式文档列从 `TEXT` 扩容为 `MEDIUMTEXT`，以支持运行时允许的 256 KiB 文档。任一迁移失败时都不要启动新版本。
@@ -127,15 +132,17 @@ python tests/test_smoke_client.py
 | `ADMIN_PASSWORD` | 管理后台登录密码 | ✓ |
 | `CREDENTIAL_KEY` | 凭证加密主密钥（开发可留空；生产必配强随机） | 生产必填 |
 | `MCP_TOKEN_HMAC_KEY` | MCP Token HMAC 密钥，至少 32 个 UTF-8 字节且与 `CREDENTIAL_KEY` 独立 | 生产必填 |
+| `MCP_TOKEN_PLAINTEXT_KEY` | 未撤销服务 Token 密文密钥，至少 32 个 UTF-8 字节且与另两个密钥独立 | 生产必填 |
+| `MCP_SERVICE_ENABLED` | 服务路由/租户服务自助开关；首次发布为 `false` | 生产必填 |
 | `CONNECTOR_ALLOWLIST` | 已审核 `wbsysc.connectors` 入口名的归一化精确列表 | - |
 | `WECOM_USE_MOCK` | `true`=脱敏 mock；生产必须为 `false` 并配置租户凭证 | 生产必填 |
 | `SYNC_INTERVAL_*_MIN` | 同步间隔（report/approval/smarttable） | - |
 
 > 租户企微凭证（corpid/secret）**不进 .env**，通过管理后台或 `tenant_init` 写入 `tenant_config`（AES 加密）。
 >
-> 生产启动必须同时设置 `WECOM_USE_MOCK=false`、`CREDENTIAL_KEY`、`MCP_TOKEN_HMAC_KEY`、`ADMIN_PASSWORD` 和 `DB_PASSWORD`；缺失、密钥少于 32 个 UTF-8 字节或使用示例值时应用会拒绝启动。
+> 生产启动必须同时设置 `WECOM_USE_MOCK=false`、三个两两不同的密钥、`ADMIN_PASSWORD` 和 `DB_PASSWORD`；缺失、密钥少于 32 个 UTF-8 字节或使用示例值时应用会拒绝启动。
 
-轮换 `MCP_TOKEN_HMAC_KEY` 会使现有连接 Token 全部失效。先为每个连接签发新 Token，再切换 HMAC 密钥。部署、回滚、连接器发布和清理步骤见 [`docs/connection-platform-operations.md`](docs/connection-platform-operations.md)。
+连接 Token 只在签发时显示一次且不可揭示；未撤销服务 Token 仅当前平台管理员或所属租户可通过限流、审计且 `no-store` 的端点揭示。轮换 `CREDENTIAL_KEY` 前重加密凭证；当前 HMAC 仅支持单 key，须先盘点旧 token ID，在维护窗口切 key/重启后再用新 key 签发、分发、验证并核对旧 ID 全部失效（旧 key 下预签发不能保持可用）；轮换 plaintext 密钥前重加密全部未撤销服务 Token 密文。完整步骤见 [`docs/connection-platform-operations.md`](docs/connection-platform-operations.md)。
 
 ## 🔧 MCP 工具（6 个）
 
@@ -175,6 +182,8 @@ python tests/test_smoke_client.py
 | `PUT /admin/tenants/{id}` | 编辑租户（密钥留空=不改） |
 | `DELETE /admin/tenants/{id}` | 删除租户配置 |
 | `POST /admin/tenants/{id}/sync` | 手动触发该租户同步 |
+
+创建租户时可选设置初始密码；管理员可重置密码或启用/禁用登录，但后台从不读取、回填既有密码。重置密码、租户自行改密或禁用登录都会撤销该租户现有会话。服务功能仅在 `MCP_SERVICE_ENABLED=true` 的重启后开放；此时可信连接器注册完成后会幂等回填默认服务和工具绑定，不复制连接 Token。改回 `false` 并重建会关闭服务路由、租户服务 UI/API 和服务运行时，同时保留旧 MCP 入口、管理员清理能力及 `008` 数据。
 
 前端开发：`cd admin-ui && pnpm install && pnpm dev`（:5178 跨域代理后端）；`pnpm build` 产出 `app/static/dist`。
 

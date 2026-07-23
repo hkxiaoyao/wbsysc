@@ -22,13 +22,17 @@ from .models import (
     MAX_DOCUMENT_BYTES,
     MAX_MAPPING_DEPTH,
     MAX_OPERATION_COUNT,
+    MAX_TOOL_STEPS,
     AuthScheme,
     DeclarativeOperation,
     DeclarativeRevision,
+    DeclarativeStep,
+    DeclarativeTool,
     InputMapping,
     OutputMapping,
     SpecValidationError,
     SyncSpec,
+    ValueRef,
     _normalize_declaration_host,
     assert_safe_declaration_value,
 )
@@ -55,6 +59,49 @@ _PROTECTED_HEADERS = frozenset(
     }
 )
 _PATH_PARAMETER_RE = re.compile(r"\{([A-Za-z][A-Za-z0-9_.-]{0,127})\}")
+_VALUE_REFERENCE_MARKERS = ("$input.", "$steps.")
+_TOOL_KEYS = frozenset(
+    {
+        "tool_key",
+        "mcp_name",
+        "description",
+        "input_schema",
+        "output_schema",
+        "steps",
+        "result_map",
+    }
+)
+_STEP_KEYS = frozenset(
+    {"step_id", "operation_key", "input_map", "output_mappings"}
+)
+
+
+class _UniqueKeySafeLoader(yaml.SafeLoader):
+    """Safe YAML loader that rejects ambiguous mappings before normalization."""
+
+
+def _construct_unique_mapping(
+    loader: _UniqueKeySafeLoader,
+    node: yaml.nodes.MappingNode,
+    deep: bool = False,
+) -> dict[Any, Any]:
+    mapping: dict[Any, Any] = {}
+    for key_node, value_node in node.value:
+        key = loader.construct_object(key_node, deep=deep)
+        try:
+            duplicate = key in mapping
+        except TypeError:
+            raise SpecValidationError("specification mapping keys must be scalar") from None
+        if duplicate:
+            raise SpecValidationError("duplicate specification mapping key")
+        mapping[key] = loader.construct_object(value_node, deep=deep)
+    return mapping
+
+
+_UniqueKeySafeLoader.add_constructor(
+    yaml.resolver.BaseResolver.DEFAULT_MAPPING_TAG,
+    _construct_unique_mapping,
+)
 
 
 def _scan_yaml(text: str) -> None:
@@ -87,7 +134,7 @@ def load_revision_document(document: str | bytes | Mapping[str, Any]) -> dict[st
             raise SpecValidationError("specification document must be UTF-8") from None
         _scan_yaml(text)
         try:
-            value = yaml.safe_load(text)
+            value = yaml.load(text, Loader=_UniqueKeySafeLoader)
         except yaml.YAMLError:
             raise SpecValidationError("invalid specification document") from None
     elif isinstance(document, str):
@@ -95,7 +142,7 @@ def load_revision_document(document: str | bytes | Mapping[str, Any]) -> dict[st
             raise SpecValidationError("specification document exceeds size limit")
         _scan_yaml(document)
         try:
-            value = yaml.safe_load(document)
+            value = yaml.load(document, Loader=_UniqueKeySafeLoader)
         except yaml.YAMLError:
             raise SpecValidationError("invalid specification document") from None
     elif isinstance(document, Mapping):
@@ -122,6 +169,98 @@ def load_revision_document(document: str | bytes | Mapping[str, Any]) -> dict[st
 
 def _assert_safe_value(value: Any, *, depth: int = 0, counter: list[int] | None = None) -> None:
     assert_safe_declaration_value(value, depth=depth, counter=counter)
+
+
+def _assert_no_value_references(value: Any) -> None:
+    """Reject orchestration references everywhere except parsed map values."""
+    if isinstance(value, str):
+        assert_safe_declaration_value(value)
+        if any(marker in value for marker in _VALUE_REFERENCE_MARKERS):
+            raise SpecValidationError("value references are not supported in this position")
+        return
+    if isinstance(value, Mapping):
+        for key, child in value.items():
+            _assert_no_value_references(key)
+            _assert_no_value_references(child)
+        return
+    if isinstance(value, (list, tuple)):
+        for child in value:
+            _assert_no_value_references(child)
+        return
+    assert_safe_declaration_value(value)
+
+
+def _compile_tools(
+    raw_tools: Any,
+) -> tuple[DeclarativeTool, ...]:
+    if (
+        not isinstance(raw_tools, list)
+        or not raw_tools
+        or len(raw_tools) > MAX_OPERATION_COUNT
+    ):
+        raise SpecValidationError("x-mcp-tools must be a non-empty bounded list")
+    tools: list[DeclarativeTool] = []
+    for raw_tool in raw_tools:
+        if not isinstance(raw_tool, Mapping) or set(raw_tool) != _TOOL_KEYS:
+            raise SpecValidationError("invalid x-mcp-tools declaration")
+        for key in _TOOL_KEYS - {"steps", "result_map"}:
+            _assert_no_value_references(raw_tool[key])
+        raw_steps = raw_tool["steps"]
+        if (
+            not isinstance(raw_steps, list)
+            or not raw_steps
+            or len(raw_steps) > MAX_TOOL_STEPS
+        ):
+            raise SpecValidationError("invalid x-mcp-tools steps")
+        steps: list[DeclarativeStep] = []
+        for raw_step in raw_steps:
+            if not isinstance(raw_step, Mapping) or frozenset(raw_step) not in {
+                _STEP_KEYS,
+                frozenset({*_STEP_KEYS, "timeout_ms"}),
+            }:
+                raise SpecValidationError("invalid x-mcp-tools step")
+            for key in _STEP_KEYS - {"input_map"}:
+                _assert_no_value_references(raw_step[key])
+            if "timeout_ms" in raw_step:
+                _assert_no_value_references(raw_step["timeout_ms"])
+            raw_inputs = raw_step["input_map"]
+            if not isinstance(raw_inputs, Mapping):
+                raise SpecValidationError("step input map must be an object")
+            input_mappings: dict[str, ValueRef] = {}
+            for name, reference in raw_inputs.items():
+                _assert_no_value_references(name)
+                input_mappings[name] = ValueRef.parse(reference)
+            raw_outputs = raw_step["output_mappings"]
+            if not isinstance(raw_outputs, Mapping):
+                raise SpecValidationError("step output mappings must be an object")
+            steps.append(
+                DeclarativeStep(
+                    step_id=raw_step["step_id"],
+                    operation_key=raw_step["operation_key"],
+                    input_mappings=input_mappings,
+                    output_mappings=dict(raw_outputs),
+                    timeout_ms=raw_step.get("timeout_ms"),
+                )
+            )
+        raw_result_map = raw_tool["result_map"]
+        if not isinstance(raw_result_map, Mapping):
+            raise SpecValidationError("tool result map must be an object")
+        result_map: dict[str, ValueRef] = {}
+        for name, reference in raw_result_map.items():
+            _assert_no_value_references(name)
+            result_map[name] = ValueRef.parse(reference)
+        tools.append(
+            DeclarativeTool(
+                tool_key=raw_tool["tool_key"],
+                mcp_name=raw_tool["mcp_name"],
+                description=raw_tool["description"],
+                input_schema=raw_tool["input_schema"],
+                output_schema=raw_tool["output_schema"],
+                steps=tuple(steps),
+                result_map=result_map,
+            )
+        )
+    return tuple(tools)
 
 
 def _string(value: Any, message: str, *, maximum: int = 512) -> str:
@@ -622,6 +761,12 @@ def import_openapi_revision(
     returned revision and provide it to a connection explicitly.
     """
     data = load_revision_document(document)
+    if "x-mcp-tools" in data:
+        _assert_no_value_references(
+            {key: value for key, value in data.items() if key != "x-mcp-tools"}
+        )
+    else:
+        _assert_no_value_references(data)
     if not isinstance(data.get("openapi"), str) or not data["openapi"].startswith("3."):
         raise SpecValidationError("OpenAPI 3 document is required")
     servers = data.get("servers")
@@ -678,6 +823,7 @@ def import_openapi_revision(
         if token_host not in normalized_hosts:
             raise SpecValidationError("OAuth token host is absent from allowed hosts")
     compiled_sync = _sync_spec(sync_spec if sync_spec is not None else data.get("x-sync-spec"))
+    tools = _compile_tools(data["x-mcp-tools"]) if "x-mcp-tools" in data else ()
     return _canonical_revision(DeclarativeRevision(
         spec_id=spec_id,
         revision=revision,
@@ -687,6 +833,7 @@ def import_openapi_revision(
         base_url=base_url,
         allowed_hosts=normalized_hosts,
         operations=tuple(operations),
+        tools=tools,
         auth_scheme=auth_scheme,
         sync_spec=compiled_sync,
     ))

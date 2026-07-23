@@ -4,13 +4,69 @@ import {
   DEFAULT_LOG_FILTERS,
   buildDeleteSpec,
   buildLogQuery,
+  buildScopedLogQuery,
   formatDuration,
   isDeleteSelectionOverLimit,
   normalizeLogKeyword,
+  logCollectionEndpoint,
+  logScopeCopy,
+  parseScopedLogLocation,
   parseLogLocation,
   serializeLogFilters,
+  serializeScopedLogFilters,
   statusMeta,
 } from './mcpLogsView.js'
+
+test('tenant log endpoint and query never carry a tenant override', () => {
+  assert.equal(logCollectionEndpoint('tenant'), '/tenant/mcp-logs')
+  assert.deepEqual(buildScopedLogQuery('tenant', {
+    ...EXPLICIT_FILTERS,
+    serviceId: 'service-a',
+    toolAlias: 'public.users',
+    sourceToolKey: 'users.get',
+  }, 3, 50), {
+    service_id: 'service-a',
+    tool_alias: 'public.users',
+    connection_id: 'conn-a',
+    source_tool_key: 'users.get',
+    status: 'partial',
+    page: 3,
+    page_size: 50,
+  })
+  assert.equal(serializeScopedLogFilters('tenant', {
+    ...EXPLICIT_FILTERS,
+    serviceId: 'service-a',
+  }).includes('tenant_id'), false)
+  assert.equal(parseScopedLogLocation('tenant', '?tenant_id=tenant-b').tenantId, '')
+})
+
+test('admin log endpoint and existing query serialization remain unchanged', () => {
+  assert.equal(logCollectionEndpoint('admin'), '/admin/mcp-logs')
+  assert.deepEqual(buildScopedLogQuery('admin', EXPLICIT_FILTERS, 3, 50), buildLogQuery(EXPLICIT_FILTERS, 3, 50))
+  assert.equal(serializeScopedLogFilters('admin', EXPLICIT_FILTERS), serializeLogFilters(EXPLICIT_FILTERS))
+})
+
+test('tenant log scope copy identifies the current session tenant, never a global scope', () => {
+  assert.deepEqual(logScopeCopy('tenant', {}, '全部租户'), {
+    perspective: '当前租户视角',
+    identity: '当前会话租户',
+  })
+  assert.deepEqual(logScopeCopy('tenant', { connectionId: 'conn-a' }, '全部租户'), {
+    perspective: '当前租户视角',
+    identity: '当前会话租户 · conn-a',
+  })
+})
+
+test('admin log scope copy remains driven by explicit tenant and connection filters', () => {
+  assert.deepEqual(logScopeCopy('admin', {}, '全部租户'), {
+    perspective: '全局视角',
+    identity: '全部租户',
+  })
+  assert.deepEqual(logScopeCopy('admin', { tenantId: 'tenant-a' }, 'Tenant A'), {
+    perspective: '租户视角',
+    identity: 'Tenant A',
+  })
+})
 
 const EXPLICIT_FILTERS = Object.freeze({
   tenantId: 'tenant-a',

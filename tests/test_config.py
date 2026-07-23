@@ -14,6 +14,7 @@ def prod_settings(**overrides):
         "app_env": "prod",
         "credential_key": "k" * 32,
         "mcp_token_hmac_key": "h" * 32,
+        "mcp_token_plaintext_key": "p" * 32,
         "admin_password": "admin-password-123",
         "db_password": "db-password-123",
         "wecom_use_mock": False,
@@ -43,6 +44,7 @@ def test_prod_rejects_unsafe_values(field, value, message):
         "",
         "   ",
         "<强随机串>",
+        "PoC_DEFAULT_KEY_DO_NOT_USE_IN_PRODUCTION_32bytes!",
         "k" * 31,
         "密" * 10,
     ],
@@ -82,6 +84,49 @@ def test_prod_accepts_mcp_token_hmac_key_with_at_least_32_utf8_bytes():
 def test_prod_rejects_mcp_hmac_key_that_reuses_the_credential_key():
     with pytest.raises(ValidationError, match="MCP_TOKEN_HMAC_KEY"):
         prod_settings(mcp_token_hmac_key="k" * 32)
+
+
+@pytest.mark.parametrize(
+    "value",
+    [
+        "",
+        "   ",
+        "CHANGE_ME",
+        "<独立强随机串>",
+        "replace_with_plaintext_key",
+        "PoC_DEFAULT_KEY_DO_NOT_USE_IN_PRODUCTION_32bytes!",
+        "p" * 31,
+        "密" * 10,
+    ],
+)
+def test_prod_rejects_unsafe_mcp_token_plaintext_key(value):
+    with pytest.raises(ValidationError, match="MCP_TOKEN_PLAINTEXT_KEY"):
+        prod_settings(mcp_token_plaintext_key=value)
+
+
+@pytest.mark.parametrize("reused", ["credential_key", "mcp_token_hmac_key"])
+def test_prod_rejects_mcp_plaintext_key_that_reuses_another_key(reused):
+    values = {
+        "credential_key": "k" * 32,
+        "mcp_token_hmac_key": "h" * 32,
+    }
+    with pytest.raises(ValidationError, match="MCP_TOKEN_PLAINTEXT_KEY"):
+        prod_settings(mcp_token_plaintext_key=values[reused])
+
+
+def test_prod_rejects_hmac_key_that_reuses_plaintext_key():
+    with pytest.raises(ValidationError, match="MCP_TOKEN_HMAC_KEY"):
+        prod_settings(mcp_token_hmac_key="p" * 32)
+
+
+def test_settings_expose_service_flag_and_plaintext_key():
+    settings = Settings(
+        app_env="dev",
+        mcp_service_enabled=True,
+        mcp_token_plaintext_key="local-plaintext-key",
+    )
+    assert settings.mcp_service_enabled is True
+    assert settings.mcp_token_plaintext_key == "local-plaintext-key"
 
 
 def test_production_template_and_deployer_manage_a_distinct_hmac_key():

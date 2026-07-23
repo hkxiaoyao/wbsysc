@@ -142,6 +142,108 @@ def test_connection_a_token_cannot_reach_b_endpoint_or_credentials():
     assert resolver.credential_reads == []
 
 
+def test_service_route_never_enters_connection_gateway(monkeypatch):
+    entered: list[str] = []
+
+    class ConnectionGateway:
+        resolver = _Resolver({("service", "bad"): _ctx("service", "tenant_one")})
+        _runtime = None
+
+        async def __call__(self, scope, receive, send):
+            from starlette.responses import JSONResponse
+
+            entered.append("connection")
+            await JSONResponse({"detail": "connection"}, status_code=418)(
+                scope, receive, send
+            )
+
+    class ServiceGateway:
+        async def __call__(self, scope, receive, send):
+            from starlette.responses import JSONResponse
+
+            await JSONResponse({"detail": "unauthorized"}, status_code=401)(
+                scope, receive, send
+            )
+
+    settings = main.get_settings()
+    monkeypatch.setattr(
+        main,
+        "get_settings",
+        lambda: type(
+            "Settings",
+            (),
+            {
+                "mcp_service_enabled": True,
+                "app_env": settings.app_env,
+                "wecom_use_mock": settings.wecom_use_mock,
+            },
+        )(),
+    )
+    app = main.create_app(
+        gateway=ConnectionGateway(),
+        service_gateway=ServiceGateway(),
+    )
+    client = TestClient(app)
+
+    response = client.post(
+        "/mcp/service/service-a",
+        headers=_bearer("bad"),
+        json=TOOLS_LIST,
+    )
+    reserved = [
+        client.request(
+            method,
+            path,
+            headers=_bearer("bad"),
+            json=TOOLS_LIST,
+            follow_redirects=False,
+        )
+        for path in ("/mcp/service", "/mcp/service/")
+        for method in ("GET", "POST", "DELETE", "PUT", "PATCH", "OPTIONS", "HEAD")
+    ]
+
+    assert response.status_code == 401
+    assert {item.status_code for item in reserved} == {404}
+    assert entered == []
+
+
+def test_disabled_service_route_still_never_enters_connection_gateway(monkeypatch):
+    entered: list[str] = []
+
+    class ConnectionGateway:
+        resolver = _Resolver({})
+        _runtime = None
+
+        async def __call__(self, scope, receive, send):
+            entered.append("connection")
+
+    settings = main.get_settings()
+    monkeypatch.setattr(
+        main,
+        "get_settings",
+        lambda: type(
+            "Settings",
+            (),
+            {
+                "mcp_service_enabled": False,
+                "app_env": settings.app_env,
+                "wecom_use_mock": settings.wecom_use_mock,
+            },
+        )(),
+    )
+    app = main.create_app(gateway=ConnectionGateway())
+
+    response = TestClient(app).post(
+        "/mcp/service/service-a",
+        headers=_bearer("bad"),
+        json=TOOLS_LIST,
+        follow_redirects=False,
+    )
+
+    assert response.status_code == 404
+    assert entered == []
+
+
 def test_tool_policy_is_scoped_to_one_connection():
     client, _resolver = _client()
 

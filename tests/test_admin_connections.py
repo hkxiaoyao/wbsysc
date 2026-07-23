@@ -1,9 +1,12 @@
 from __future__ import annotations
 
+from copy import copy, deepcopy
 from dataclasses import replace
 from types import SimpleNamespace
 
+import pytest
 from fastapi import FastAPI
+from fastapi import HTTPException
 from fastapi.testclient import TestClient
 
 from app import admin, admin_connections
@@ -16,6 +19,15 @@ from app.connectors.contracts import (
 )
 from app.connectors.registry import ConnectorRegistry
 from app.connectors.runtime import PolicyGuard
+from app.connectors.declarative.models import (
+    DeclarativeOperation,
+    DeclarativeStep,
+    DeclarativeTool,
+    InputMapping,
+    OutputMapping,
+    ValueRef,
+)
+from app.connectors.declarative.validator import import_openapi_revision
 
 
 class _Connector:
@@ -63,6 +75,84 @@ def _record(**changes):
         config_version=1,
     )
     return replace(base, **changes)
+
+
+def _compiled_revision_stub(*, spec_id: str, revision: int, status: str):
+    return SimpleNamespace(
+        spec_id=spec_id,
+        revision=revision,
+        status=status,
+        operations=(_compiled_operation_stub(),),
+        tools=(),
+    )
+
+
+def _compiled_operation_stub(
+    *,
+    tool_key: str = "items.get",
+    mcp_name: str = "items_get",
+    input_schema=None,
+):
+    input_mappings = ()
+    if input_schema is not None:
+        input_mappings = (
+            InputMapping(
+                arg_name="item_id",
+                location="query",
+                target="item_id",
+                required=True,
+                schema=input_schema,
+            ),
+        )
+    return DeclarativeOperation(
+        tool_key=tool_key,
+        mcp_name=mcp_name,
+        description="Get item",
+        method="GET",
+        path="/items",
+        input_mappings=input_mappings,
+        output_mappings=(OutputMapping(name="id", pointer="/id"),),
+        operation_kind="read",
+        base_url="https://api.example.com",
+    )
+
+
+def _compiled_preview_with_bounds(
+    *, operation_schema, tool_property_schema
+):
+    operation = _compiled_operation_stub(input_schema=operation_schema)
+    step = DeclarativeStep(
+        step_id="operation",
+        operation_key=operation.tool_key,
+        input_mappings={
+            "item_id": ValueRef(source="input", field="item_id"),
+        },
+        output_mappings={"id": "id"},
+    )
+    tool = DeclarativeTool(
+        tool_key="items.get.safe",
+        mcp_name="items_get_safe",
+        description="Get item safely",
+        input_schema={
+            "type": "object",
+            "properties": {"item_id": tool_property_schema},
+            "required": ["item_id"],
+            "additionalProperties": False,
+        },
+        output_schema={
+            "type": "object",
+            "properties": {"id": {"type": "string"}},
+            "required": ["id"],
+            "additionalProperties": False,
+        },
+        steps=(step,),
+        result_map={
+            "id": ValueRef(source="steps", step_id="operation", field="id"),
+        },
+    )
+    return admin_connections._declarative_preview(
+        SimpleNamespace(operations=(operation,), tools=(tool,))
+    )
 
 
 def _client(monkeypatch, *, authed=True):
@@ -197,6 +287,7 @@ def test_create_returns_raw_token_once_and_redacts_credentials(monkeypatch):
         },
     )
     assert response.status_code == 201
+    assert response.headers["cache-control"] == "no-store"
     body = response.json()
     assert body["initial_token"] == "mcp_one_time_secret"
     assert "credential-secret" not in repr(body)
@@ -217,6 +308,56 @@ def test_list_and_detail_never_return_raw_tokens_or_secret_config(monkeypatch):
     assert "token_hmac" not in repr((listed, detail))
     assert "raw_value" not in repr((listed, detail))
     assert detail["tokens"] == [{"token_id": "t1", "prefix": "abc123", "label": "cli"}]
+
+
+def test_admin_connection_list_and_detail_project_authoritative_alias(monkeypatch):
+    client = _client(monkeypatch)
+    record = _record(connection_alias="renamed_admin_alias")
+    monkeypatch.setattr(admin_connections.store, "list_connections", lambda tenant_id: [record])
+    monkeypatch.setattr(admin_connections.store, "get_connection", lambda cid, tid=None: record)
+    monkeypatch.setattr(admin_connections.store, "list_connection_tokens", lambda cid: [])
+
+    listed = client.get("/admin/tenants/tenant-a/connections").json()["items"][0]
+    detail = client.get("/admin/connections/conn-a").json()["connection"]
+
+    expected_keys = {
+        "connection_id", "connection_alias", "tenant_id", "connector_key",
+        "display_name", "status", "data_mode", "public_config", "config_version",
+    }
+    assert set(listed) == expected_keys
+    assert set(detail) == expected_keys
+    assert listed["connection_alias"] == "renamed_admin_alias"
+    assert detail["connection_alias"] == "renamed_admin_alias"
+    assert "credentials" not in repr((listed, detail))
+    assert "raw_value" not in repr((listed, detail))
+
+
+def test_declarative_fallback_projection_keeps_alias_and_redacts_config(monkeypatch):
+    client = _client(monkeypatch)
+    record = _record(
+        connection_alias="declarative_alias",
+        connector_key="http_declarative",
+        status="draft",
+        public_config={"unavailable_secret": "must-not-project"},
+    )
+    monkeypatch.setattr(admin_connections.store, "list_connections", lambda tenant_id: [record])
+
+    response = client.get("/admin/tenants/tenant-a/connections")
+
+    assert response.status_code == 200
+    projected = response.json()["items"][0]
+    assert projected == {
+        "connection_id": "conn-a",
+        "connection_alias": "declarative_alias",
+        "tenant_id": "tenant-a",
+        "connector_key": "http_declarative",
+        "display_name": "Sample",
+        "status": "draft",
+        "data_mode": "direct",
+        "public_config": {},
+        "config_version": 1,
+    }
+    assert "must-not-project" not in repr(projected)
 
 
 def test_invalid_config_credentials_and_policy_fail_before_store(monkeypatch):
@@ -298,7 +439,9 @@ def test_declarative_revision_validate_publish_activate_lifecycle(monkeypatch):
     record = replace(
         record, public_config={"spec_id": "spec-a", "revision": 2}
     )
-    revision = SimpleNamespace(spec_id="spec-a", revision=2, status="draft")
+    revision = _compiled_revision_stub(
+        spec_id="spec-a", revision=2, status="draft"
+    )
     published = SimpleNamespace(spec_id="spec-a", revision=2, status="published")
     calls = []
     monkeypatch.setattr(admin_connections.store, "get_connection", lambda cid, tid=None: record)
@@ -347,6 +490,421 @@ def test_declarative_revision_validate_publish_activate_lifecycle(monkeypatch):
     assert published_response.json()["status"] == "published"
     assert activated.json()["connection"]["config_version"] == 2
     assert calls == ["publish", "activate"]
+
+
+def test_declarative_import_and_validate_return_compiled_safe_step_preview(monkeypatch):
+    client = _client(monkeypatch)
+    record = _record(connector_key="http_declarative", status="draft", public_config={})
+    document = {
+        "openapi": "3.0.3",
+        "servers": [{"url": "https://api.example.com/v1"}],
+        "paths": {
+            "/items/{item_id}": {"get": {
+                "operationId": "items.get",
+                "x-mcp-name": "items_get",
+                "summary": "Get item",
+                "parameters": [{
+                    "name": "item_id",
+                    "in": "path",
+                    "required": True,
+                    "schema": {
+                        "type": "string",
+                        "maxLength": 128,
+                    },
+                }],
+                "x-output-mappings": {"public_title": "/internal_title"},
+                "responses": {"200": {
+                    "description": "ok",
+                    "content": {"application/json": {"schema": {
+                        "type": "object",
+                        "properties": {"internal_title": {"type": "string"}},
+                    }}},
+                }},
+            }},
+            "/items": {"post": {
+            "operationId": "items.create",
+            "x-mcp-name": "items_create",
+            "summary": "Create item operation",
+            "x-write-enabled": True,
+            "parameters": [{"name": "name", "in": "query", "required": True, "schema": {"type": "string"}}],
+            "x-output-mappings": {"item_id": "/id"},
+            "responses": {"200": {"description": "ok", "content": {"application/json": {"schema": {"type": "object", "properties": {"id": {"type": "string"}}}}}}},
+        }}},
+        "x-mcp-tools": [{
+            "tool_key": "items.create.safe", "mcp_name": "items_create_safe", "description": "Create item",
+            "input_schema": {"type": "object", "$comment": "Bearer schema-secret", "properties": {
+                "name": {"type": "string", "description": "Authorization: schema-secret", "default": "secret-default", "x-sample": "secret-sample"},
+                "metadata": {"type": "object", "description": "token nested-secret", "$comment": "password nested-secret", "x-auth-header": "Bearer nested-secret", "properties": {"label": {"type": "string", "description": "cookie nested-secret"}}, "additionalProperties": False},
+                "authorization_header": {"type": "string"},
+            }, "required": ["name"], "additionalProperties": False},
+            "output_schema": {"type": "object", "properties": {"id": {"type": "string", "example": "secret-output"}}, "required": ["id"], "additionalProperties": False},
+            "steps": [{"step_id": "create", "operation_key": "items.create", "input_map": {"name": "$input.name"}, "output_mappings": {"id": "item_id"}}],
+            "result_map": {"id": "$steps.create.id"},
+        }],
+    }
+    compiled = import_openapi_revision(document, spec_id="spec-a", revision=2, tenant_id="tenant-a", connection_id="conn-a")
+    unsafe_document = deepcopy(document)
+    unsafe_document["x-mcp-tools"][0]["description"] = "Bearer preview-secret"
+    unsafe_compiled = import_openapi_revision(unsafe_document, spec_id="spec-a", revision=3, tenant_id="tenant-a", connection_id="conn-a")
+    stored = []
+    monkeypatch.setattr(admin_connections.store, "get_connection", lambda *args: record)
+    monkeypatch.setattr(admin_connections, "import_openapi_revision", lambda *args, **kwargs: compiled)
+    monkeypatch.setattr(admin_connections.store, "save_declarative_revision", lambda revision, **kwargs: stored.append(revision))
+    monkeypatch.setattr(admin_connections.store, "get_declarative_revision", lambda *args: compiled)
+    monkeypatch.setattr(admin_connections, "write_event", lambda event: True)
+
+    imported = client.post("/admin/connections/conn-a/specs/import", json={"document": document, "spec_id": "spec-a", "revision": 2})
+    validated = client.post("/admin/connections/conn-a/specs/spec-a/revisions/2/validate")
+
+    expected = {
+        "operations": [
+            {
+                "operation_key": "items.get",
+                "mcp_name": "items_get",
+                "description": "Get item",
+                "operation_kind": "read",
+                "input_schema": {
+                    "type": "object",
+                    "properties": {
+                        "item_id": {"type": "string", "maxLength": 128},
+                    },
+                    "required": ["item_id"],
+                    "additionalProperties": False,
+                },
+                "output_names": ["public_title"],
+            },
+            {
+                "operation_key": "items.create",
+                "mcp_name": "items_create",
+                "description": "Create item operation",
+                "operation_kind": "write",
+                "input_schema": {
+                    "type": "object",
+                    "properties": {"name": {"type": "string"}},
+                    "required": ["name"],
+                    "additionalProperties": False,
+                },
+                "output_names": ["item_id"],
+            },
+        ],
+        "tools": [{
+            "tool_key": "items.create.safe", "mcp_name": "items_create_safe", "description": "Create item", "operation_kind": "write",
+            "input_schema": {"type": "object", "properties": {
+                "name": {"type": "string"},
+                "metadata": {"type": "object", "properties": {"label": {"type": "string"}}, "additionalProperties": False},
+                "authorization_header": {"type": "string"},
+            }, "required": ["name"], "additionalProperties": False},
+            "output_schema": {"type": "object", "properties": {"id": {"type": "string"}}, "required": ["id"], "additionalProperties": False},
+            "steps": [{"step_id": "create", "operation_key": "items.create", "operation_kind": "write"}],
+        }]
+    }
+    assert imported.status_code == 201
+    assert validated.status_code == 200
+    assert imported.json()["preview"] == expected
+    assert validated.json()["preview"] == expected
+    assert stored == [compiled]
+    assert "secret-" not in repr((imported.json(), validated.json()))
+    assert [
+        set(operation) for operation in validated.json()["preview"]["operations"]
+    ] == [{
+        "operation_key",
+        "mcp_name",
+        "description",
+        "operation_kind",
+        "input_schema",
+        "output_names",
+    }] * 2
+    serialized = repr((imported.json(), validated.json()))
+    for forbidden in (
+        "https://api.example.com",
+        "/items/{item_id}",
+        "/internal_title",
+        "path",
+        "query",
+        "method",
+        "base_url",
+        "auth_scheme",
+        "timeout_ms",
+        "pagination",
+    ):
+        assert forbidden not in serialized
+    assert admin_connections._declarative_preview(unsafe_compiled)["tools"][0]["description"] == ""
+    assert "preview-secret" not in repr(admin_connections._declarative_preview(unsafe_compiled))
+
+
+def test_declarative_preview_rejects_duplicate_operation_keys_and_output_names():
+    document = {
+        "openapi": "3.0.3",
+        "servers": [{"url": "https://api.example.com"}],
+        "paths": {
+            "/items": {"get": {
+                "operationId": "items.get",
+                "responses": {"200": {
+                    "description": "ok",
+                    "content": {"application/json": {"schema": {
+                        "type": "object",
+                        "properties": {"id": {"type": "string"}},
+                    }}},
+                }},
+            }},
+        },
+    }
+    compiled = import_openapi_revision(document)
+    corrupt_revisions = []
+
+    duplicate_operation = copy(compiled)
+    object.__setattr__(
+        duplicate_operation,
+        "operations",
+        (duplicate_operation.operations[0], duplicate_operation.operations[0]),
+    )
+    corrupt_revisions.append(duplicate_operation)
+
+    duplicate_output = copy(compiled)
+    duplicate_output_operation = copy(compiled.operations[0])
+    object.__setattr__(
+        duplicate_output_operation,
+        "output_mappings",
+        (
+            OutputMapping(name="id", pointer="/id"),
+            OutputMapping(name="id", pointer="/id"),
+        ),
+    )
+    object.__setattr__(duplicate_output, "operations", (duplicate_output_operation,))
+    corrupt_revisions.append(duplicate_output)
+
+    for corrupt in corrupt_revisions:
+        try:
+            admin_connections._declarative_preview(corrupt)
+        except HTTPException as exc:
+            assert exc.status_code == 409
+            assert exc.detail == "declarative revision is unavailable"
+        else:
+            raise AssertionError("corrupt revision preview must fail closed")
+
+
+def test_declarative_preview_revalidates_compiled_operation_invariants():
+    invalid_pointer = _compiled_operation_stub()
+    object.__setattr__(
+        invalid_pointer.output_mappings[0],
+        "pointer",
+        "/",
+    )
+    invalid_method = _compiled_operation_stub()
+    object.__setattr__(invalid_method, "method", "TRACE")
+    invalid_schema = _compiled_operation_stub(
+        input_schema={"type": "object", "properties": {}}
+    )
+    object.__setattr__(
+        invalid_schema.input_mappings[0],
+        "schema",
+        {"type": "object", "properties": []},
+    )
+
+    for operation in (invalid_pointer, invalid_method, invalid_schema):
+        with pytest.raises(HTTPException) as caught:
+            admin_connections._declarative_preview(
+                SimpleNamespace(operations=(operation,), tools=())
+            )
+        assert caught.value.status_code == 409
+        assert caught.value.detail == "declarative revision is unavailable"
+
+
+def test_declarative_preview_rejects_duplicate_and_cross_colliding_identities():
+    duplicate_mcp_name = (
+        _compiled_operation_stub(tool_key="items.first", mcp_name="items_shared"),
+        _compiled_operation_stub(tool_key="items.second", mcp_name="items_shared"),
+    )
+    cross_collision = (
+        _compiled_operation_stub(tool_key="items.first", mcp_name="items_alias"),
+        _compiled_operation_stub(tool_key="items_alias", mcp_name="items_second"),
+    )
+
+    for operations in (duplicate_mcp_name, cross_collision):
+        with pytest.raises(HTTPException) as caught:
+            admin_connections._declarative_preview(
+                SimpleNamespace(operations=operations, tools=())
+            )
+        assert caught.value.status_code == 409
+        assert caught.value.detail == "declarative revision is unavailable"
+
+
+def test_safe_preview_schema_rejects_cycles_depth_and_url_valued_type():
+    cyclic = {"type": "object"}
+    cyclic["properties"] = {"self": cyclic}
+    deep = {"type": "string"}
+    for index in range(10):
+        deep = {
+            "type": "object",
+            "properties": {f"level_{index}": deep},
+        }
+
+    for schema in (
+        cyclic,
+        deep,
+        {"type": "https://private.example.invalid"},
+    ):
+        operation = _compiled_operation_stub(input_schema={"type": "string"})
+        object.__setattr__(operation.input_mappings[0], "schema", schema)
+        with pytest.raises(HTTPException) as caught:
+            admin_connections._declarative_preview(
+                SimpleNamespace(operations=(operation,), tools=())
+            )
+        assert caught.value.status_code == 409
+        assert caught.value.detail == "declarative revision is unavailable"
+
+
+@pytest.mark.parametrize(
+    "schema",
+    (
+        {"properties": []},
+        {"properties": {"item_id": "not-a-schema"}},
+        {"items": []},
+        {"required": "item_id"},
+        {"properties": {"item_id": {}}, "required": ["item_id", "item_id"]},
+        {"properties": {}, "required": ["missing"]},
+        {"additionalProperties": "yes"},
+        {"minLength": "1"},
+        {"uniqueItems": 1},
+        {"minimum": True},
+    ),
+)
+def test_safe_preview_schema_rejects_malformed_keyword_values(schema):
+    with pytest.raises(HTTPException) as caught:
+        admin_connections._safe_preview_schema(schema)
+    assert caught.value.status_code == 409
+    assert caught.value.detail == "declarative revision is unavailable"
+
+
+def test_preview_preserves_boolean_and_numeric_exclusive_bounds_on_both_paths():
+    boolean_bounds = {
+        "type": "integer",
+        "minimum": 0,
+        "maximum": 10,
+        "exclusiveMinimum": True,
+        "exclusiveMaximum": False,
+    }
+    numeric_bounds = {
+        "type": "number",
+        "minimum": 0,
+        "maximum": 10,
+        "exclusiveMinimum": 0.5,
+        "exclusiveMaximum": 9.5,
+    }
+    preview = _compiled_preview_with_bounds(
+        operation_schema=numeric_bounds,
+        tool_property_schema=boolean_bounds,
+    )
+    reversed_preview = _compiled_preview_with_bounds(
+        operation_schema=boolean_bounds,
+        tool_property_schema=numeric_bounds,
+    )
+
+    assert preview["operations"][0]["input_schema"]["properties"]["item_id"] == numeric_bounds
+    assert preview["tools"][0]["input_schema"]["properties"]["item_id"] == boolean_bounds
+    assert reversed_preview["operations"][0]["input_schema"]["properties"]["item_id"] == boolean_bounds
+    assert reversed_preview["tools"][0]["input_schema"]["properties"]["item_id"] == numeric_bounds
+
+
+@pytest.mark.parametrize(
+    ("keyword", "value"),
+    (
+        ("minimum", True),
+        ("maximum", False),
+        ("minimum", float("nan")),
+        ("maximum", float("inf")),
+        ("minimum", float("-inf")),
+        ("minimum", "0"),
+        ("exclusiveMinimum", float("nan")),
+        ("exclusiveMaximum", float("inf")),
+        ("exclusiveMinimum", float("-inf")),
+        ("exclusiveMaximum", "10"),
+    ),
+)
+@pytest.mark.parametrize("path", ("operation", "tool"))
+def test_preview_rejects_invalid_bound_values_on_both_paths(keyword, value, path):
+    valid_schema = {"type": "number", "minimum": 0, "maximum": 10}
+    operation = _compiled_operation_stub(input_schema=valid_schema)
+
+    invalid_schema = {"type": "number", keyword: value}
+    if path == "operation":
+        object.__setattr__(operation.input_mappings[0], "schema", invalid_schema)
+        revision = SimpleNamespace(operations=(operation,), tools=())
+    else:
+        valid_preview_operation = _compiled_operation_stub(input_schema=valid_schema)
+        operation_step = DeclarativeStep(
+            step_id="operation",
+            operation_key=valid_preview_operation.tool_key,
+            input_mappings={
+                "item_id": ValueRef(source="input", field="item_id"),
+            },
+            output_mappings={"id": "id"},
+        )
+        tool = DeclarativeTool(
+            tool_key="items.get.safe",
+            mcp_name="items_get_safe",
+            description="Get item safely",
+            input_schema={
+                "type": "object",
+                "properties": {"item_id": valid_schema},
+                "required": ["item_id"],
+                "additionalProperties": False,
+            },
+            output_schema={
+                "type": "object",
+                "properties": {"id": {"type": "string"}},
+                "required": ["id"],
+                "additionalProperties": False,
+            },
+            steps=(operation_step,),
+            result_map={
+                "id": ValueRef(
+                    source="steps", step_id="operation", field="id"
+                ),
+            },
+        )
+        object.__setattr__(
+            tool,
+            "input_schema",
+            {
+                "type": "object",
+                "properties": {"item_id": invalid_schema},
+                "required": ["item_id"],
+                "additionalProperties": False,
+            },
+        )
+        revision = SimpleNamespace(
+            operations=(valid_preview_operation,), tools=(tool,)
+        )
+
+    with pytest.raises(HTTPException) as caught:
+        admin_connections._declarative_preview(revision)
+    assert caught.value.status_code == 409
+    assert caught.value.detail == "declarative revision is unavailable"
+
+
+def test_preview_description_keeps_bounded_ordinary_prose():
+    for description in (
+        "Get basic account details",
+        "List active sessions for the account",
+        "Explain bearer authentication requirements",
+    ):
+        assert admin_connections._safe_preview_description(description) == description
+
+
+def test_preview_description_redacts_common_secret_shapes():
+    secrets = (
+        "Use Bearer abc12345-secret-value",
+        "JWT eyJhbGciOiJIUzI1NiJ9.eyJzdWIiOiIxMjM0NTY3ODkwIn0.signature123",
+        "Stripe sk_live_51ABCDEF1234567890",
+        "GitHub ghp_1234567890abcdefghijklmnopqrstuv",
+        "Slack " + "xox" + "b-123456789012-123456789012-abcdefghijklmnop",
+        "AWS AKIAIOSFODNN7EXAMPLE",
+        "client_secret=correct-horse-battery-staple",
+        "key 8fK2mP9qR4sT7vW1xY6zA3bC5dE0gH",
+    )
+    for description in secrets:
+        assert admin_connections._safe_preview_description(description) == ""
 
 
 def test_disabled_connection_cannot_run_manual_sync(monkeypatch):
@@ -429,6 +987,7 @@ def test_explicit_token_rotation_returns_new_raw_token_once(monkeypatch):
     )
 
     assert response.status_code == 201
+    assert response.headers["cache-control"] == "no-store"
     assert response.json()["token"] == "mcp_rotated_once"
 
 
@@ -652,7 +1211,9 @@ def test_declarative_import_passes_owned_version_to_atomic_save(monkeypatch):
     record = _record(
         connector_key="http_declarative", status="draft", config_version=7
     )
-    revision = SimpleNamespace(spec_id="spec-b", revision=2, status="draft")
+    revision = _compiled_revision_stub(
+        spec_id="spec-b", revision=2, status="draft"
+    )
     captured = []
     monkeypatch.setattr(admin_connections.store, "get_connection", lambda *args: record)
     monkeypatch.setattr(

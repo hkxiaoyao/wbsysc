@@ -2,7 +2,20 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from datetime import datetime
+import re
 from typing import Any, Literal
+
+
+_CONNECTOR_IDENTIFIER_PATTERN = re.compile(r"^[A-Za-z][A-Za-z0-9_.-]{0,127}$")
+
+def validate_connection_alias(value: str) -> str:
+    if (
+        not isinstance(value, str)
+        or len(value) > 64
+        or _CONNECTOR_IDENTIFIER_PATTERN.fullmatch(value) is None
+    ):
+        raise ValueError("invalid connection_alias")
+    return value
 
 
 @dataclass(frozen=True)
@@ -15,6 +28,11 @@ class ConnectionRecord:
     data_mode: Literal["direct", "stored", "hybrid"]
     public_config: dict[str, Any]
     config_version: int
+    connection_alias: str = ""
+
+    def __post_init__(self) -> None:
+        if self.connection_alias:
+            validate_connection_alias(self.connection_alias)
 
 
 @dataclass(frozen=True)
