@@ -1,0 +1,12 @@
+{
+  "id": "diagnose-production-feature-failures",
+  "title": "诊断生产后台功能整体不可用",
+  "status": "completed",
+  "complexity": "M",
+  "risk": "high",
+  "domain": "fullstack",
+  "currentPhase": "completed",
+  "nextAction": "等待用户授权修复生产代理信任与端口绑定配置",
+  "createdAt": "2026-07-24T00:00:00+08:00",
+  "branch": "main"
+}
