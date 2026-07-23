@@ -96,6 +96,91 @@ def test_wecom_public_config_preserves_verified_legacy_schema():
     }
 
 
+def test_wecom_domain_verification_is_connection_scoped(monkeypatch):
+    client = _client(monkeypatch)
+    record = _record(
+        connector_key="wecom",
+        public_config={
+            "corpid": "ww123",
+            "trusted_domain": "mcp.example.com",
+            "schema_name": "wbd_conn",
+        },
+    )
+    saved = {}
+    monkeypatch.setattr(
+        admin_connections.store,
+        "get_connection",
+        lambda connection_id, tenant_id=None: (
+            record
+            if connection_id == "conn-a"
+            and (tenant_id is None or tenant_id == "tenant-a")
+            else None
+        ),
+    )
+    monkeypatch.setattr(
+        admin_connections,
+        "get_verify_by_connection",
+        lambda connection_id, tenant_id, adopt_legacy=False: (
+            {
+                "filename": "WW_verify_a.txt",
+                "updated_at": "2026-07-23 15:00:00",
+            }
+            if not saved
+            else saved
+        ),
+    )
+
+    def save(**values):
+        saved.update(
+            filename=values["filename"],
+            updated_at="2026-07-23 15:01:00",
+        )
+        assert values["connection_id"] == "conn-a"
+        assert values["tenant_id"] == "tenant-a"
+        assert values["trusted_domain"] == "mcp.example.com"
+        return saved
+
+    monkeypatch.setattr(admin_connections, "save_verify_file_for_connection", save)
+    monkeypatch.setattr(
+        admin_connections,
+        "delete_verify_by_connection",
+        lambda connection_id, tenant_id: (
+            connection_id == "conn-a" and tenant_id == "tenant-a"
+        ),
+    )
+    monkeypatch.setattr(admin_connections, "write_event", lambda event: True)
+
+    current = client.get("/admin/connections/conn-a/domain-verify")
+    uploaded = client.post(
+        "/admin/connections/conn-a/domain-verify",
+        files={"file": ("WW_verify_b.txt", b"verify-value", "text/plain")},
+    )
+    deleted = client.delete("/admin/connections/conn-a/domain-verify")
+
+    assert current.status_code == 200
+    assert current.json()["verify_url"] == "https://mcp.example.com/WW_verify_a.txt"
+    assert uploaded.status_code == 200
+    assert uploaded.json()["connection_id"] == "conn-a"
+    assert uploaded.json()["verify_filename"] == "WW_verify_b.txt"
+    assert deleted.status_code == 200
+
+
+def test_domain_verification_rejects_non_wecom_connection(monkeypatch):
+    client = _client(monkeypatch)
+    monkeypatch.setattr(
+        admin_connections.store,
+        "get_connection",
+        lambda *args: _record(),
+    )
+
+    response = client.get("/admin/connections/conn-a/domain-verify")
+
+    assert response.status_code == 409
+    assert response.json()["detail"] == (
+        "domain verification requires a WeCom connection"
+    )
+
+
 class _Connector:
     def spec(self):
         return ConnectorSpec(

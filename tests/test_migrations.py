@@ -83,6 +83,7 @@ def test_runtime_migration_repairs_all_required_tenant_columns(monkeypatch):
 def test_startup_migrations_upgrade_center_before_tenant_schemas(monkeypatch):
     events = []
     from app import mcp_log_store
+    from app import domain_verify
     from app.connections import store as connection_store
     from app.mcp_services import store as service_store
     from app.tenant_auth import store as tenant_auth_store
@@ -122,6 +123,11 @@ def test_startup_migrations_upgrade_center_before_tenant_schemas(monkeypatch):
         raising=False,
     )
     monkeypatch.setattr(
+        domain_verify,
+        "ensure_domain_tables",
+        lambda: events.append("domain_verify"),
+    )
+    monkeypatch.setattr(
         db,
         "get_tenant_schema_names",
         lambda: events.append("enumerate") or ["wbd_a", "wbd_b"],
@@ -140,6 +146,7 @@ def test_startup_migrations_upgrade_center_before_tenant_schemas(monkeypatch):
         "service_tables",
         "tenant_auth_tables",
         "connection_backfill",
+        "domain_verify",
         "enumerate",
         "wbd_a",
         "wbd_b",
@@ -376,8 +383,28 @@ def test_tenant_identity_boundary_migration_is_mysql57_idempotent_and_non_destru
     assert "call `migrate_tenant_identity_boundary`()" in lower
 
 
+def test_connection_domain_verify_migration_is_connection_scoped_and_idempotent():
+    sql = (ROOT / "sql" / "010_connection_domain_verify.sql").read_text(
+        encoding="utf-8"
+    )
+    lower = " ".join(sql.lower().split())
+
+    assert "column_name = 'connection_id'" in lower
+    assert "add column `connection_id` varchar(64) null" in lower
+    assert "drop index `uk_tenant`" in lower
+    assert "add unique key `uk_domain_verify_connection` (`connection_id`)" in lower
+    assert "add key `idx_domain_verify_tenant` (`tenant_id`)" in lower
+    assert "json_valid(connection_row.`public_config_json`)" in lower
+    assert "'$.legacy_source'" in lower
+    assert "verify_file.`connection_id` is null" in lower
+    assert "delete from" not in lower
+    assert "add column if not exists" not in lower
+    assert "call `migrate_connection_domain_verify`()" in lower
+
+
 def test_startup_creates_mcp_service_tables_after_connection_tables(monkeypatch):
     events = []
+    from app import domain_verify
     from app import mcp_log_store
     from app.connections import store as connection_store
     from app.mcp_services import store as service_store
@@ -389,6 +416,7 @@ def test_startup_creates_mcp_service_tables_after_connection_tables(monkeypatch)
     monkeypatch.setattr(service_store, "ensure_mcp_service_tables", lambda: events.append("services"))
     monkeypatch.setattr(tenant_auth_store, "ensure_tenant_auth_tables", lambda: events.append("auth"))
     monkeypatch.setattr(connection_store, "migrate_legacy_wecom_connections", lambda: events.append("backfill"))
+    monkeypatch.setattr(domain_verify, "ensure_domain_tables", lambda: events.append("domain_verify"))
     monkeypatch.setattr(db, "get_tenant_schema_names", lambda: [])
     monkeypatch.setattr(mcp_log_store, "migrate_legacy_logs", lambda days=90: events.append("legacy_logs"))
 
@@ -396,3 +424,4 @@ def test_startup_creates_mcp_service_tables_after_connection_tables(monkeypatch)
 
     assert events.index("connections") < events.index("services")
     assert events.index("services") < events.index("backfill")
+    assert events.index("backfill") < events.index("domain_verify")

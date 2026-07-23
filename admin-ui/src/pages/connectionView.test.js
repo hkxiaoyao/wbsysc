@@ -83,6 +83,7 @@ test('tenant connection endpoints never use admin tenant routes', () => {
   assert.equal(connectionCollectionEndpoint('tenant', ''), '/tenant/connections')
   assert.equal(connectionCollectionEndpoint('tenant', 'tenant-b'), '/tenant/connections')
   assert.equal(connectionResourceEndpoint('tenant', 'conn/a', 'tools'), '/tenant/connections/conn%2Fa/tools')
+  assert.equal(connectionResourceEndpoint('tenant', 'conn/a', 'domain-verify'), '/tenant/connections/conn%2Fa/domain-verify')
 })
 
 test('admin connection endpoint serialization remains unchanged', () => {
@@ -91,6 +92,7 @@ test('admin connection endpoint serialization remains unchanged', () => {
     '/admin/tenants/tenant%20%2Fa/connections',
   )
   assert.equal(connectionResourceEndpoint('admin', 'conn/a'), '/admin/connections/conn%2Fa')
+  assert.equal(connectionResourceEndpoint('admin', 'conn/a', 'domain-verify'), '/admin/connections/conn%2Fa/domain-verify')
 })
 
 test('tenant API base URL does not duplicate the tenant path prefix', () => {

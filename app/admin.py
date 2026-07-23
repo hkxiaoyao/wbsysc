@@ -11,18 +11,13 @@ import secrets
 import time
 from typing import Literal, Optional
 
-from fastapi import APIRouter, File, Form, HTTPException, Request, Response, UploadFile
+from fastapi import APIRouter, HTTPException, Request, Response
 from pydantic import BaseModel, ConfigDict, SecretStr
 from sqlalchemy import text
 
 from .config import get_settings
 from .db import get_engine
-from .domain_verify import (
-    delete_verify_by_tenant,
-    ensure_domain_tables,
-    get_verify_by_tenant,
-    save_verify_file,
-)
+from .domain_verify import ensure_domain_tables  # noqa: F401 - legacy test/plugin seam
 from .tenant import reload_tenants
 from .tenant_auth import store as tenant_auth_store
 from .tenant_auth.dependencies import require_same_origin
@@ -492,99 +487,3 @@ def sync_diagnose(tenant_id: str, request: Request, lookback_days: int = 90):
     result["db_report_cursor"] = (curs[0] if curs else None)
     result["db_report_cursor_at"] = (str(curs[1]) if curs and curs[1] is not None else None)
     return result
-
-
-@router.get("/tenants/{tenant_id}/domain-verify")
-def get_domain_verify(tenant_id: str, request: Request):
-    """查询租户可信域名与校验文件"""
-    _require_auth(request)
-    ensure_domain_tables()
-    with get_engine().connect() as conn:
-        row = conn.execute(
-            text("SELECT IFNULL(trusted_domain,'') FROM tenant_config WHERE tenant_id=:t"),
-            {"t": tenant_id},
-        ).fetchone()
-    if not row:
-        raise HTTPException(404, "租户不存在")
-    vf = get_verify_by_tenant(tenant_id)
-    domain = row[0] or (vf or {}).get("trusted_domain") or ""
-    filename = (vf or {}).get("filename") or ""
-    verify_url = f"https://{domain}/{filename}" if domain and filename else (f"/{filename}" if filename else "")
-    return {
-        "tenant_id": tenant_id,
-        "trusted_domain": domain,
-        "verify_filename": filename,
-        "verify_url": verify_url,
-        "has_file": bool(filename),
-        "updated_at": (vf or {}).get("updated_at") or "",
-    }
-
-
-@router.post("/tenants/{tenant_id}/domain-verify")
-async def upload_domain_verify(
-    tenant_id: str,
-    request: Request,
-    file: UploadFile = File(...),
-    trusted_domain: str = Form(""),
-):
-    """上传/覆盖企微可信域名校验文件；新文件会替换该租户旧文件"""
-    _require_auth(request)
-    ensure_domain_tables()
-    with get_engine().connect() as conn:
-        exists = conn.execute(
-            text("SELECT 1 FROM tenant_config WHERE tenant_id=:t"),
-            {"t": tenant_id},
-        ).fetchone()
-    if not exists:
-        raise HTTPException(404, "租户不存在")
-
-    raw_name = (file.filename or "").split("\\")[-1].split("/")[-1].strip()
-    if not raw_name:
-        raise HTTPException(400, "缺少文件名")
-    body = await file.read()
-    try:
-        text_body = body.decode("utf-8")
-    except UnicodeDecodeError:
-        # 企微校验文件通常是 ASCII/UTF-8；非文本拒绝
-        raise HTTPException(400, "校验文件必须是 UTF-8 文本")
-
-    try:
-        saved = save_verify_file(
-            filename=raw_name,
-            content=text_body,
-            tenant_id=tenant_id,
-            trusted_domain=trusted_domain,
-            content_type=file.content_type or "text/plain; charset=utf-8",
-        )
-    except ValueError as e:
-        raise HTTPException(400, str(e))
-
-    domain = saved.get("trusted_domain") or ""
-    # 若表单没传域名但租户已有域名，回填
-    if not domain:
-        with get_engine().connect() as conn:
-            r = conn.execute(
-                text("SELECT IFNULL(trusted_domain,'') FROM tenant_config WHERE tenant_id=:t"),
-                {"t": tenant_id},
-            ).fetchone()
-            domain = (r[0] if r else "") or ""
-
-    filename = saved["filename"]
-    verify_url = f"https://{domain}/{filename}" if domain else f"/{filename}"
-    return {
-        "ok": True,
-        "tenant_id": tenant_id,
-        "trusted_domain": domain,
-        "verify_filename": filename,
-        "verify_url": verify_url,
-        "msg": "已上传；同租户旧校验文件已替换",
-    }
-
-
-@router.delete("/tenants/{tenant_id}/domain-verify")
-def remove_domain_verify(tenant_id: str, request: Request):
-    """删除该租户的校验文件（不删 trusted_domain）"""
-    _require_auth(request)
-    if not delete_verify_by_tenant(tenant_id):
-        raise HTTPException(404, "该租户没有校验文件")
-    return {"ok": True}

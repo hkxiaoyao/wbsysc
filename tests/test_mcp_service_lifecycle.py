@@ -82,12 +82,14 @@ class _LifecycleConnection:
         public_config: dict | None = None,
         revision_binding: bool = False,
         hidden_binding: bool = False,
+        connector_key: str = "http_declarative",
     ):
         self.service_rows = list(service_rows)
         self.revision_status = revision_status
         self.public_config = dict(public_config or {})
         self.revision_binding = revision_binding
         self.hidden_binding = hidden_binding
+        self.connector_key = connector_key
         self.statements: list[tuple[str, dict]] = []
 
     def __enter__(self):
@@ -109,7 +111,10 @@ class _LifecycleConnection:
         if "FROM connection_instance" in sql and "LIMIT 1" in sql:
             if values.get("tenant_id") != "tenant-a":
                 return _Result(row=None)
-            row = _connection(public_config=self.public_config)
+            row = _connection(
+                connector_key=self.connector_key,
+                public_config=self.public_config,
+            )
             return _Result(
                 row={
                     "connection_id": row.connection_id,
@@ -747,6 +752,26 @@ def test_unreferenced_connection_delete_removes_only_connection_row(monkeypatch)
     deletes = [sql for sql, _ in connection.statements if sql.startswith("DELETE FROM")]
     assert deletes == [
         "DELETE FROM connection_instance WHERE connection_id=:connection_id AND tenant_id=:tenant_id"
+    ]
+
+
+def test_wecom_connection_delete_removes_its_domain_file_in_same_transaction(
+    monkeypatch,
+):
+    connection = _LifecycleConnection(connector_key="wecom")
+    monkeypatch.setattr(db, "get_engine", lambda: _Engine(connection))
+    monkeypatch.setattr(
+        service_store,
+        "invalidate_services_for_connection",
+        lambda value: None,
+    )
+
+    assert connection_store.delete_connection("conn-a", "tenant-a") is True
+
+    deletes = [sql for sql, _ in connection.statements if sql.startswith("DELETE FROM")]
+    assert deletes == [
+        "DELETE FROM domain_verify_file WHERE connection_id=:connection_id AND tenant_id=:tenant_id",
+        "DELETE FROM connection_instance WHERE connection_id=:connection_id AND tenant_id=:tenant_id",
     ]
 
 

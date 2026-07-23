@@ -1,0 +1,12 @@
+{
+  "id": "restore-connection-domain-verification",
+  "title": "将企业微信可信域名校验文件功能迁移到连接实例",
+  "status": "completed",
+  "complexity": "L+",
+  "risk": "high",
+  "domain": "fullstack",
+  "currentPhase": "completed",
+  "nextAction": "归档、提交、推送并部署",
+  "createdAt": "2026-07-23T15:05:00Z",
+  "branch": "main"
+}

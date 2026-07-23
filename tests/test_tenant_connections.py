@@ -91,6 +91,28 @@ def _create_payload():
     }
 
 
+def test_tenant_domain_verification_cannot_cross_connection_owner(monkeypatch):
+    client = _client(monkeypatch)
+    monkeypatch.setattr(
+        admin_connections.store,
+        "get_connection",
+        lambda connection_id, tenant_id=None: None,
+    )
+
+    get_response = client.get("/tenant/connections/conn-other/domain-verify")
+    upload_response = client.post(
+        "/tenant/connections/conn-other/domain-verify",
+        files={"file": ("WW_verify.txt", b"value", "text/plain")},
+    )
+    delete_response = client.delete(
+        "/tenant/connections/conn-other/domain-verify"
+    )
+
+    assert get_response.status_code == 404
+    assert upload_response.status_code == 404
+    assert delete_response.status_code == 404
+
+
 _BODY_SURFACE = (
     ("post", "/tenant/connections", _create_payload()),
     (

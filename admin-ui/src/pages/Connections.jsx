@@ -1,10 +1,10 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
 import {
-  Alert, Button, Drawer, Empty, Form, Grid, Input, InputNumber, Modal, Select, Space, Switch, Table, Tabs, Tag, Typography, message,
+  Alert, Button, Drawer, Empty, Form, Grid, Input, InputNumber, Modal, Select, Space, Switch, Table, Tabs, Tag, Typography, Upload, message,
 } from 'antd'
 import {
   ApiOutlined, CopyOutlined, FileSearchOutlined, PlusOutlined, ReloadOutlined,
-  SafetyCertificateOutlined, SyncOutlined,
+  SafetyCertificateOutlined, SyncOutlined, UploadOutlined,
 } from '@ant-design/icons'
 import defaultApi from '../api.js'
 import DeclarativeSpecWizard from './DeclarativeSpecWizard.jsx'
@@ -18,7 +18,7 @@ import {
 import { CONNECTOR_CARDS, connectorCard } from './servicesView.js'
 import './Connections.css'
 
-const { Paragraph, Text, Title } = Typography
+const { Link, Paragraph, Text, Title } = Typography
 const STATUS_META = {
   active: { label: '运行中', color: 'success' },
   draft: { label: '草稿', color: 'gold' },
@@ -64,6 +64,8 @@ export default function Connections({ scope = 'admin', apiClient = defaultApi, t
   const [configText, setConfigText] = useState('{}')
   const [wecomConfig, setWecomConfig] = useState(() => wecomConfigFormValues())
   const [wecomCredentials, setWecomCredentials] = useState(emptyWecomCredentialFields)
+  const [domainVerify, setDomainVerify] = useState({ has_file: false, verify_filename: '', verify_url: '', updated_at: '' })
+  const [domainFileList, setDomainFileList] = useState([])
   const [tokenLabel, setTokenLabel] = useState('')
   const [activeTab, setActiveTab] = useState('config')
   const [tokenModal, setTokenModal] = useState(closeTokenModal)
@@ -173,6 +175,8 @@ export default function Connections({ scope = 'admin', apiClient = defaultApi, t
     setConfigText('{}')
     setWecomConfig(wecomConfigFormValues())
     setWecomCredentials(emptyWecomCredentialFields())
+    setDomainVerify({ has_file: false, verify_filename: '', verify_url: '', updated_at: '' })
+    setDomainFileList([])
     setTokenLabel('')
     setTokenModal(closeTokenModal())
   }, [tenantId])
@@ -217,9 +221,12 @@ export default function Connections({ scope = 'admin', apiClient = defaultApi, t
     setTokenLabel('')
     setDrawerBusy('detail')
     try {
-      const [detailResponse, toolResponse] = await Promise.all([
+      const [detailResponse, toolResponse, domainResponse] = await Promise.all([
         apiClient.get(apiClientEndpoint(apiClient, connectionResourceEndpoint(scope, row.connection_id)), { signal: controller.signal }),
         apiClient.get(apiClientEndpoint(apiClient, connectionResourceEndpoint(scope, row.connection_id, 'tools')), { signal: controller.signal }).catch(() => ({ data: { items: [] } })),
+        row.connector_key === 'wecom'
+          ? apiClient.get(apiClientEndpoint(apiClient, connectionResourceEndpoint(scope, row.connection_id, 'domain-verify')), { signal: controller.signal })
+          : Promise.resolve({ data: null }),
       ])
       if (!isDetailCurrent(requestId, row.connection_id, controller)) return
       const next = detailResponse.data?.connection || row
@@ -228,6 +235,7 @@ export default function Connections({ scope = 'admin', apiClient = defaultApi, t
       setTools(toolResponse.data?.items || [])
       setConfigText(JSON.stringify(next.public_config || {}, null, 2))
       setWecomConfig(wecomConfigFormValues(next.public_config))
+      setDomainVerify(domainResponse.data || { has_file: false, verify_filename: '', verify_url: '', updated_at: '' })
     } catch (error) {
       if (isDetailCurrent(requestId, row.connection_id, controller)) messageApi.error(safeServerError(error, '连接详情加载失败'))
     } finally {
@@ -247,6 +255,8 @@ export default function Connections({ scope = 'admin', apiClient = defaultApi, t
     setConfigText('{}')
     setWecomConfig(wecomConfigFormValues())
     setWecomCredentials(emptyWecomCredentialFields())
+    setDomainVerify({ has_file: false, verify_filename: '', verify_url: '', updated_at: '' })
+    setDomainFileList([])
     setTokenLabel('')
     setTokenModal(closeTokenModal())
     openedInitialConnection.current = ''
@@ -283,6 +293,8 @@ export default function Connections({ scope = 'admin', apiClient = defaultApi, t
     setConfigText('{}')
     setWecomConfig(wecomConfigFormValues())
     setWecomCredentials(emptyWecomCredentialFields())
+    setDomainVerify({ has_file: false, verify_filename: '', verify_url: '', updated_at: '' })
+    setDomainFileList([])
     setTokenLabel('')
     setTokenModal(closeTokenModal())
     setActiveTab('config')
@@ -417,6 +429,69 @@ export default function Connections({ scope = 'admin', apiClient = defaultApi, t
       if (isDrawerMutationCurrent(ticket, controller)) setDrawerBusy('')
     }
   }
+
+  const uploadDomainVerify = async () => {
+    if (!detail || detail.connector_key !== 'wecom') return
+    const selected = domainFileList[0]
+    const raw = selected?.originFileObj || selected
+    if (!raw) {
+      messageApi.warning('请选择企业微信提供的校验文件')
+      return
+    }
+    const connection = detail
+    const { ticket, controller } = beginDrawerMutation(connection.connection_id)
+    const formData = new FormData()
+    formData.append('file', raw, raw.name)
+    setDrawerBusy('domain-verify')
+    try {
+      const response = await apiClient.post(
+        apiClientEndpoint(apiClient, connectionResourceEndpoint(scope, connection.connection_id, 'domain-verify')),
+        formData,
+        { signal: controller.signal },
+      )
+      if (!isDrawerMutationCurrent(ticket, controller)) return
+      setDomainVerify(response.data)
+      setDomainFileList([])
+      messageApi.success('校验文件已上传，可通过根路径访问')
+    } catch (error) {
+      if (isDrawerMutationCurrent(ticket, controller)) {
+        messageApi.error(safeServerError(error, '校验文件上传失败'))
+      }
+    } finally {
+      if (isDrawerMutationCurrent(ticket, controller)) setDrawerBusy('')
+    }
+  }
+
+  const removeDomainVerify = () => modal.confirm({
+    title: '删除当前校验文件？',
+    content: '删除后企业微信将无法通过根路径访问该文件；可信域名配置会保留。',
+    okText: '删除校验文件',
+    okButtonProps: { danger: true },
+    cancelText: '取消',
+    onOk: async () => {
+      if (!detail || detail.connector_key !== 'wecom') return
+      const connection = detail
+      const { ticket, controller } = beginDrawerMutation(connection.connection_id)
+      setDrawerBusy('domain-verify')
+      try {
+        await apiClient.delete(
+          apiClientEndpoint(apiClient, connectionResourceEndpoint(scope, connection.connection_id, 'domain-verify')),
+          { signal: controller.signal },
+        )
+        if (!isDrawerMutationCurrent(ticket, controller)) return
+        setDomainVerify({ has_file: false, verify_filename: '', verify_url: '', updated_at: '' })
+        setDomainFileList([])
+        messageApi.success('校验文件已删除')
+      } catch (error) {
+        if (isDrawerMutationCurrent(ticket, controller)) {
+          messageApi.error(safeServerError(error, '删除校验文件失败'))
+          throw error
+        }
+      } finally {
+        if (isDrawerMutationCurrent(ticket, controller)) setDrawerBusy('')
+      }
+    },
+  })
 
   const issueToken = async (rotate = false) => {
     if (!detail) return
@@ -553,6 +628,43 @@ export default function Connections({ scope = 'admin', apiClient = defaultApi, t
               <label>同步间隔（分钟）<InputNumber aria-label="企业微信同步间隔" min={1} max={1440} precision={0} style={{ width: '100%' }} value={wecomConfig.sync_interval_min} onChange={(sync_interval_min) => setWecomConfig((current) => ({ ...current, sync_interval_min }))} /></label>
               <label>打卡用户 ID<Input.TextArea aria-label="企业微信打卡用户 ID" rows={4} value={wecomConfig.checkin_userids} placeholder="每行一个用户 ID，也支持逗号分隔" onChange={(event) => setWecomConfig((current) => ({ ...current, checkin_userids: event.target.value }))} /></label>
               <label>可信域名<Input aria-label="企业微信可信域名" maxLength={255} value={wecomConfig.trusted_domain} placeholder="例如 mcp.example.com" onChange={(event) => setWecomConfig((current) => ({ ...current, trusted_domain: event.target.value }))} /></label>
+              <div className="connection-editor">
+                <Alert
+                  type="info"
+                  showIcon
+                  message="可信域名校验文件"
+                  description="先保存可信域名，再上传企业微信提供的 .txt/.html 文件。文件将绑定当前连接，并从站点根路径公开访问。"
+                />
+                <Upload
+                  aria-label="企业微信可信域名校验文件"
+                  accept=".txt,.html,.htm,text/plain,text/html"
+                  maxCount={1}
+                  beforeUpload={() => false}
+                  fileList={domainFileList}
+                  onChange={({ fileList }) => setDomainFileList(fileList.slice(-1))}
+                >
+                  <Button icon={<UploadOutlined />}>选择校验文件</Button>
+                </Upload>
+                <Space wrap>
+                  <Button type="primary" icon={<UploadOutlined />} loading={drawerBusy === 'domain-verify'} onClick={uploadDomainVerify}>上传并覆盖</Button>
+                  {domainVerify.has_file && <Button danger loading={drawerBusy === 'domain-verify'} onClick={removeDomainVerify}>删除校验文件</Button>}
+                </Space>
+                {domainVerify.has_file && (
+                  <Alert
+                    type="success"
+                    showIcon
+                    message={<>当前文件：<Text code>{domainVerify.verify_filename}</Text></>}
+                    description={(
+                      <Space direction="vertical" size={4}>
+                        <Link href={domainVerify.verify_url?.startsWith('http') ? domainVerify.verify_url : `${window.location.origin}${domainVerify.verify_url || ''}`} target="_blank">
+                          {domainVerify.verify_url?.startsWith('http') ? domainVerify.verify_url : `${window.location.origin}${domainVerify.verify_url || ''}`}
+                        </Link>
+                        <Button size="small" icon={<CopyOutlined />} onClick={() => navigator.clipboard?.writeText(domainVerify.verify_url?.startsWith('http') ? domainVerify.verify_url : `${window.location.origin}${domainVerify.verify_url || ''}`)}>复制访问 URL</Button>
+                      </Space>
+                    )}
+                  />
+                )}
+              </div>
             </>
           ) : <label>公开配置（JSON）<Input.TextArea aria-label="连接公开配置 JSON" disabled={configReadOnly} rows={9} value={configText} onChange={(event) => setConfigText(event.target.value)} /></label>}
           <Button type="primary" disabled={configReadOnly} loading={drawerBusy === 'config'} onClick={saveConfig}>保存配置</Button>

@@ -630,7 +630,8 @@ def delete_connection(connection_id: str, tenant_id: str) -> bool:
         ).fetchone()
         if row is None:
             return False
-        retired_version = _connection_from_row(row).config_version
+        record = _connection_from_row(row)
+        retired_version = record.config_version
         from app.mcp_services import store as service_store
 
         service_store.assert_connection_deletable(
@@ -638,6 +639,14 @@ def delete_connection(connection_id: str, tenant_id: str) -> bool:
             tenant_id,
             _connection=conn,
         )
+        if record.connector_key == "wecom":
+            conn.execute(
+                text(
+                    "DELETE FROM domain_verify_file "
+                    "WHERE connection_id=:connection_id AND tenant_id=:tenant_id"
+                ),
+                {"connection_id": connection_id, "tenant_id": tenant_id},
+            )
         result = conn.execute(
             text("""
                 DELETE FROM connection_instance

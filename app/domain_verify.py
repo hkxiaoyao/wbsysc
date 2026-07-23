@@ -1,7 +1,8 @@
 """
 企微可信域名验证文件
 - 反代域名接入时，企微要求根路径可访问校验文件（如 /xxxx.txt）
-- 文件内容落库，容器重建后仍可访问；每租户仅保留一份，新上传覆盖旧文件
+- 文件内容落库，容器重建后仍可访问；每个连接仅保留一份
+- tenant_id 保留用于归属检查与历史租户级文件兼容
 """
 from __future__ import annotations
 
@@ -22,10 +23,12 @@ CREATE TABLE IF NOT EXISTS `domain_verify_file` (
   `content`        MEDIUMTEXT   NOT NULL,
   `content_type`   VARCHAR(64)  NOT NULL DEFAULT 'text/plain; charset=utf-8',
   `tenant_id`      VARCHAR(64)  NULL COMMENT '归属租户，可空',
+  `connection_id`  VARCHAR(64)  NULL COMMENT '归属连接实例；历史数据可空',
   `trusted_domain` VARCHAR(255) NULL COMMENT '绑定可信域名（展示用）',
   `updated_at`     DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
   PRIMARY KEY (`filename`),
-  UNIQUE KEY `uk_tenant` (`tenant_id`)
+  UNIQUE KEY `uk_domain_verify_connection` (`connection_id`),
+  KEY `idx_domain_verify_tenant` (`tenant_id`)
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COMMENT='可信域名校验文件(中心库)'
 """
 
@@ -46,11 +49,51 @@ def _column_exists(conn, table: str, column: str) -> bool:
     return bool(r)
 
 
+def _index_exists(conn, table: str, index: str) -> bool:
+    r = conn.execute(
+        text(
+            """
+            SELECT 1 FROM information_schema.STATISTICS
+            WHERE TABLE_SCHEMA = DATABASE()
+              AND TABLE_NAME = :t
+              AND INDEX_NAME = :i
+            LIMIT 1
+            """
+        ),
+        {"t": table, "i": index},
+    ).fetchone()
+    return bool(r)
+
+
 def ensure_domain_tables() -> None:
     """建表 + 兼容旧库补列（幂等，兼容 MySQL 5.7）"""
     eng = get_engine()
     with eng.begin() as conn:
         conn.execute(text(_DDL))
+        if not _column_exists(conn, "domain_verify_file", "connection_id"):
+            conn.execute(text(
+                "ALTER TABLE domain_verify_file "
+                "ADD COLUMN connection_id VARCHAR(64) NULL "
+                "COMMENT '归属连接实例；历史数据可空' AFTER tenant_id"
+            ))
+        if _index_exists(conn, "domain_verify_file", "uk_tenant"):
+            conn.execute(text(
+                "ALTER TABLE domain_verify_file DROP INDEX uk_tenant"
+            ))
+        if not _index_exists(
+            conn, "domain_verify_file", "idx_domain_verify_tenant"
+        ):
+            conn.execute(text(
+                "ALTER TABLE domain_verify_file "
+                "ADD KEY idx_domain_verify_tenant (tenant_id)"
+            ))
+        if not _index_exists(
+            conn, "domain_verify_file", "uk_domain_verify_connection"
+        ):
+            conn.execute(text(
+                "ALTER TABLE domain_verify_file "
+                "ADD UNIQUE KEY uk_domain_verify_connection (connection_id)"
+            ))
         if not _column_exists(conn, "tenant_config", "trusted_domain"):
             try:
                 conn.execute(text(
@@ -61,6 +104,26 @@ def ensure_domain_tables() -> None:
             except Exception:
                 # 并发下可能已被其他进程加上；后续 SELECT 再兜底
                 pass
+        try:
+            conn.execute(text(
+                """
+                UPDATE domain_verify_file verify_file
+                JOIN connection_instance connection_row
+                  ON connection_row.tenant_id=verify_file.tenant_id
+                 AND connection_row.connector_key='wecom'
+                 AND JSON_UNQUOTE(
+                       JSON_EXTRACT(
+                         connection_row.public_config_json,
+                         '$.legacy_source'
+                       )
+                     )='tenant_config'
+                SET verify_file.connection_id=connection_row.connection_id
+                WHERE verify_file.connection_id IS NULL
+                """
+            ))
+        except Exception:
+            # 006 之前的旧库没有 connection_instance；连接接口首次使用时再认领。
+            pass
 
 
 def is_safe_verify_filename(name: str) -> bool:
@@ -89,7 +152,8 @@ def get_verify_file(filename: str) -> Optional[dict]:
         return None
     ensure_domain_tables()
     sql = text(
-        "SELECT filename, content, content_type, tenant_id, trusted_domain, updated_at "
+        "SELECT filename, content, content_type, tenant_id, connection_id, "
+        "trusted_domain, updated_at "
         "FROM domain_verify_file WHERE filename=:f LIMIT 1"
     )
     with get_engine().connect() as conn:
@@ -101,15 +165,17 @@ def get_verify_file(filename: str) -> Optional[dict]:
         "content": r[1] or "",
         "content_type": r[2] or "text/plain; charset=utf-8",
         "tenant_id": r[3],
-        "trusted_domain": r[4] or "",
-        "updated_at": str(r[5]) if r[5] is not None else "",
+        "connection_id": r[4],
+        "trusted_domain": r[5] or "",
+        "updated_at": str(r[6]) if r[6] is not None else "",
     }
 
 
 def get_verify_by_tenant(tenant_id: str) -> Optional[dict]:
     ensure_domain_tables()
     sql = text(
-        "SELECT filename, content, content_type, tenant_id, trusted_domain, updated_at "
+        "SELECT filename, content, content_type, tenant_id, connection_id, "
+        "trusted_domain, updated_at "
         "FROM domain_verify_file WHERE tenant_id=:t LIMIT 1"
     )
     with get_engine().connect() as conn:
@@ -121,9 +187,147 @@ def get_verify_by_tenant(tenant_id: str) -> Optional[dict]:
         "content": r[1] or "",
         "content_type": r[2] or "text/plain; charset=utf-8",
         "tenant_id": r[3],
-        "trusted_domain": r[4] or "",
-        "updated_at": str(r[5]) if r[5] is not None else "",
+        "connection_id": r[4],
+        "trusted_domain": r[5] or "",
+        "updated_at": str(r[6]) if r[6] is not None else "",
     }
+
+
+def get_verify_by_connection(
+    connection_id: str,
+    tenant_id: str,
+    *,
+    adopt_legacy: bool = False,
+) -> Optional[dict]:
+    """按连接查询；只有确定的历史连接可以认领同租户旧文件。"""
+    ensure_domain_tables()
+    eng = get_engine()
+    with eng.begin() as conn:
+        row = conn.execute(
+            text(
+                "SELECT filename FROM domain_verify_file "
+                "WHERE connection_id=:c AND tenant_id=:t LIMIT 1"
+            ),
+            {"c": connection_id, "t": tenant_id},
+        ).fetchone()
+        if not row and adopt_legacy:
+            legacy = conn.execute(
+                text(
+                    "SELECT filename FROM domain_verify_file "
+                    "WHERE connection_id IS NULL AND tenant_id=:t LIMIT 1 "
+                    "FOR UPDATE"
+                ),
+                {"t": tenant_id},
+            ).fetchone()
+            if legacy:
+                conn.execute(
+                    text(
+                        "UPDATE domain_verify_file SET connection_id=:c "
+                        "WHERE filename=:f AND connection_id IS NULL"
+                    ),
+                    {"c": connection_id, "f": legacy[0]},
+                )
+                row = legacy
+    return get_verify_file(row[0]) if row else None
+
+
+def save_verify_file_for_connection(
+    *,
+    filename: str,
+    content: str,
+    tenant_id: str,
+    connection_id: str,
+    trusted_domain: str = "",
+    content_type: str = "text/plain; charset=utf-8",
+    adopt_legacy: bool = False,
+) -> dict:
+    """保存/覆盖连接实例的校验文件，不影响同租户其他连接。"""
+    if not connection_id:
+        raise ValueError("连接 ID 不能为空")
+    if not is_safe_verify_filename(filename):
+        raise ValueError("文件名不合法，仅允许字母数字._- 且后缀 .txt/.html")
+    raw = content if isinstance(content, str) else str(content)
+    if len(raw.encode("utf-8")) > _MAX_BYTES:
+        raise ValueError(f"文件过大，上限 {_MAX_BYTES} 字节")
+    domain = normalize_domain(trusted_domain) if trusted_domain else ""
+    get_verify_by_connection(
+        connection_id,
+        tenant_id,
+        adopt_legacy=adopt_legacy,
+    )
+
+    eng = get_engine()
+    with eng.begin() as conn:
+        old = conn.execute(
+            text(
+                "SELECT filename FROM domain_verify_file "
+                "WHERE connection_id=:c AND tenant_id=:t FOR UPDATE"
+            ),
+            {"c": connection_id, "t": tenant_id},
+        ).fetchone()
+        if old and old[0] != filename:
+            conn.execute(
+                text(
+                    "DELETE FROM domain_verify_file "
+                    "WHERE connection_id=:c AND tenant_id=:t"
+                ),
+                {"c": connection_id, "t": tenant_id},
+            )
+        owner = conn.execute(
+            text(
+                "SELECT tenant_id, connection_id FROM domain_verify_file "
+                "WHERE filename=:f FOR UPDATE"
+            ),
+            {"f": filename},
+        ).fetchone()
+        if owner and (owner[0] != tenant_id or owner[1] != connection_id):
+            raise ValueError("文件名已被其他连接占用")
+        conn.execute(
+            text(
+                """
+                INSERT INTO domain_verify_file
+                    (filename, content, content_type, tenant_id,
+                     connection_id, trusted_domain)
+                VALUES (:f, :c, :ct, :t, :connection_id, :d)
+                ON DUPLICATE KEY UPDATE
+                    content=VALUES(content),
+                    content_type=VALUES(content_type),
+                    tenant_id=VALUES(tenant_id),
+                    connection_id=VALUES(connection_id),
+                    trusted_domain=VALUES(trusted_domain)
+                """
+            ),
+            {
+                "f": filename,
+                "c": raw,
+                "ct": content_type,
+                "t": tenant_id,
+                "connection_id": connection_id,
+                "d": domain,
+            },
+        )
+    return get_verify_by_connection(connection_id, tenant_id) or {
+        "filename": filename,
+        "content": raw,
+        "content_type": content_type,
+        "tenant_id": tenant_id,
+        "connection_id": connection_id,
+        "trusted_domain": domain,
+        "updated_at": "",
+    }
+
+
+def delete_verify_by_connection(connection_id: str, tenant_id: str) -> bool:
+    ensure_domain_tables()
+    with get_engine().begin() as conn:
+        r = conn.execute(
+            text(
+                "DELETE FROM domain_verify_file "
+                "WHERE connection_id=:c AND tenant_id=:t"
+            ),
+            {"c": connection_id, "t": tenant_id},
+        )
+    return bool(r.rowcount)
 
 
 def save_verify_file(

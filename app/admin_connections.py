@@ -11,7 +11,7 @@ from collections.abc import Mapping
 from dataclasses import replace
 from typing import Any, Literal
 
-from fastapi import APIRouter, Depends, HTTPException, Request, Response
+from fastapi import APIRouter, Depends, File, HTTPException, Request, Response, UploadFile
 from pydantic import BaseModel, ConfigDict, Field
 
 from . import admin
@@ -28,6 +28,12 @@ from .connectors.declarative.models import (
 )
 from .connectors.declarative.validator import import_openapi_revision, validate_revision
 from .db import ensure_schema
+from .domain_verify import (
+    delete_verify_by_connection,
+    get_verify_by_connection,
+    normalize_domain,
+    save_verify_file_for_connection,
+)
 from .mcp_audit import write_event
 from .mcp_log_models import McpLogEvent
 from .mcp_services import store as service_store
@@ -934,6 +940,126 @@ def _global_owner(connection_id: str) -> ConnectionRecord:
     if record is None:
         raise HTTPException(404, "connection not found")
     return record
+
+
+def _domain_verify_record(tenant_id: str, connection_id: str) -> ConnectionRecord:
+    record = _owned(tenant_id, connection_id)
+    if record.connector_key != WECOM_CONNECTOR_KEY:
+        raise HTTPException(409, "domain verification requires a WeCom connection")
+    return record
+
+
+def _adopts_legacy_domain_file(record: ConnectionRecord) -> bool:
+    return (
+        record.connection_id == _legacy_wecom_connection_id(record.tenant_id)
+        and record.public_config.get("legacy_source") == "tenant_config"
+    )
+
+
+def _domain_verify_response(record: ConnectionRecord, item: Mapping[str, Any] | None):
+    raw_domain = record.public_config.get("trusted_domain") or ""
+    try:
+        domain = normalize_domain(raw_domain) if raw_domain else ""
+    except ValueError:
+        raise HTTPException(409, "connection trusted domain is invalid") from None
+    filename = str((item or {}).get("filename") or "")
+    verify_url = (
+        f"https://{domain}/{filename}"
+        if domain and filename
+        else (f"/{filename}" if filename else "")
+    )
+    return {
+        "connection_id": record.connection_id,
+        "tenant_id": record.tenant_id,
+        "trusted_domain": domain,
+        "verify_filename": filename,
+        "verify_url": verify_url,
+        "has_file": bool(filename),
+        "updated_at": str((item or {}).get("updated_at") or ""),
+    }
+
+
+def get_domain_verify_use_case(tenant_id: str, connection_id: str):
+    record = _domain_verify_record(tenant_id, connection_id)
+    item = get_verify_by_connection(
+        connection_id,
+        tenant_id,
+        adopt_legacy=_adopts_legacy_domain_file(record),
+    )
+    return _domain_verify_response(record, item)
+
+
+async def upload_domain_verify_use_case(
+    tenant_id: str,
+    connection_id: str,
+    file: UploadFile,
+):
+    record = _domain_verify_record(tenant_id, connection_id)
+    raw_name = (file.filename or "").split("\\")[-1].split("/")[-1].strip()
+    if not raw_name:
+        raise HTTPException(400, "missing verification filename")
+    body = await file.read()
+    try:
+        content = body.decode("utf-8")
+    except UnicodeDecodeError:
+        raise HTTPException(400, "verification file must be UTF-8 text") from None
+    raw_domain = record.public_config.get("trusted_domain") or ""
+    try:
+        saved = save_verify_file_for_connection(
+            filename=raw_name,
+            content=content,
+            tenant_id=tenant_id,
+            connection_id=connection_id,
+            trusted_domain=raw_domain,
+            content_type=file.content_type or "text/plain; charset=utf-8",
+            adopt_legacy=_adopts_legacy_domain_file(record),
+        )
+    except ValueError as exc:
+        raise HTTPException(400, str(exc)) from None
+    _audit(record, "connection_domain_verification_uploaded")
+    return {
+        "ok": True,
+        **_domain_verify_response(record, saved),
+        "msg": "verification file uploaded",
+    }
+
+
+def delete_domain_verify_use_case(tenant_id: str, connection_id: str):
+    record = _domain_verify_record(tenant_id, connection_id)
+    get_verify_by_connection(
+        connection_id,
+        tenant_id,
+        adopt_legacy=_adopts_legacy_domain_file(record),
+    )
+    if not delete_verify_by_connection(connection_id, tenant_id):
+        raise HTTPException(404, "connection has no verification file")
+    _audit(record, "connection_domain_verification_deleted")
+    return {"ok": True}
+
+
+@router.get("/connections/{connection_id}/domain-verify")
+def get_domain_verify_global(connection_id: str):
+    record = _global_owner(connection_id)
+    return get_domain_verify_use_case(record.tenant_id, connection_id)
+
+
+@router.post("/connections/{connection_id}/domain-verify")
+async def upload_domain_verify_global(
+    connection_id: str,
+    file: UploadFile = File(...),
+):
+    record = _global_owner(connection_id)
+    return await upload_domain_verify_use_case(
+        record.tenant_id,
+        connection_id,
+        file,
+    )
+
+
+@router.delete("/connections/{connection_id}/domain-verify")
+def delete_domain_verify_global(connection_id: str):
+    record = _global_owner(connection_id)
+    return delete_domain_verify_use_case(record.tenant_id, connection_id)
 
 
 def update_connection_use_case(

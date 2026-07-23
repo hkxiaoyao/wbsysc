@@ -3,7 +3,7 @@ from __future__ import annotations
 
 import logging
 
-from fastapi import APIRouter, Depends, HTTPException, Request, Response
+from fastapi import APIRouter, Depends, File, HTTPException, Request, Response, UploadFile
 from fastapi.exceptions import RequestValidationError
 from fastapi.routing import APIRoute
 
@@ -117,6 +117,46 @@ async def get_connection(
     await _require_empty_body(request)
     return connections.get_connection_use_case(
         principal.tenant_id, connection_id, request
+    )
+
+
+@router.get("/connections/{connection_id}/domain-verify")
+async def get_domain_verify(
+    connection_id: str,
+    request: Request,
+    principal: TenantPrincipal = Depends(_principal),
+):
+    await _require_empty_body(request)
+    return connections.get_domain_verify_use_case(
+        principal.tenant_id,
+        connection_id,
+    )
+
+
+@router.post("/connections/{connection_id}/domain-verify")
+async def upload_domain_verify(
+    connection_id: str,
+    request: Request,
+    file: UploadFile = File(...),
+    principal: TenantPrincipal = Depends(_mutation_principal),
+):
+    return await connections.upload_domain_verify_use_case(
+        principal.tenant_id,
+        connection_id,
+        file,
+    )
+
+
+@router.delete("/connections/{connection_id}/domain-verify")
+async def delete_domain_verify(
+    connection_id: str,
+    request: Request,
+    principal: TenantPrincipal = Depends(_mutation_principal),
+):
+    await _require_empty_body(request)
+    return connections.delete_domain_verify_use_case(
+        principal.tenant_id,
+        connection_id,
     )
 
 

@@ -226,6 +226,7 @@ def run_startup_migrations() -> None:
     ensure_central_columns()
     from .mcp_log_store import ensure_central_log_tables, migrate_legacy_logs
     from .connections import store as connection_store
+    from .domain_verify import ensure_domain_tables
     from .mcp_services import store as mcp_service_store
     from .tenant_auth import store as tenant_auth_store
 
@@ -234,6 +235,7 @@ def run_startup_migrations() -> None:
     mcp_service_store.ensure_mcp_service_tables()
     tenant_auth_store.ensure_tenant_auth_tables()
     connection_store.migrate_legacy_wecom_connections()
+    ensure_domain_tables()
     for schema_name in get_tenant_schema_names():
         ensure_schema(schema_name)
     migrate_legacy_logs(days=90)
