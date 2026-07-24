@@ -1,0 +1,12 @@
+{
+  "id": "merge-mcp-into-connections",
+  "title": "将 MCP 服务融合到连接实例",
+  "status": "completed",
+  "complexity": "L+",
+  "risk": "high",
+  "domain": "fullstack",
+  "currentPhase": "completed",
+  "nextAction": "待发布前运行存量服务只读清单并确认兼容开关",
+  "createdAt": "2026-07-24T10:30:11+08:00",
+  "branch": "main"
+}
