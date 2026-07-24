@@ -1,0 +1,12 @@
+{
+  "id": "assess-connection-mcp-merge",
+  "title": "评估将 MCP 服务融合到连接实例",
+  "status": "completed",
+  "complexity": "M",
+  "risk": "high",
+  "domain": "architecture",
+  "currentPhase": "completed",
+  "nextAction": "待产品确认不需要跨连接聚合后，另建实施任务",
+  "createdAt": "2026-07-24T01:00:00+08:00",
+  "branch": "main"
+}
