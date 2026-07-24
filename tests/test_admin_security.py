@@ -110,16 +110,82 @@ def _auth_test_client():
     return TestClient(app)
 
 
-def test_admin_service_routes_use_existing_admin_authentication():
+def _isolated_admin_service_app():
+    from app.mcp_services.router import admin_router
+
+    app = FastAPI()
+    app.include_router(admin_router)
+    return app
+
+
+def test_main_app_retains_authenticated_legacy_service_cleanup_only(monkeypatch):
     from app.main import create_app
+    from app.mcp_services import router as service_router
 
-    response = TestClient(create_app()).get("/admin/tenants/tenant-a/services")
+    client = TestClient(create_app())
+    unauthenticated = client.get("/admin/tenants/tenant-a/services")
+    monkeypatch.setattr(admin, "_require_auth", lambda request: None)
+    monkeypatch.setattr(service_router.manager, "list_services", lambda tenant_id: [])
+    cleanup_list = client.get("/admin/tenants/tenant-a/services")
+    create = client.post(
+        "/admin/tenants/tenant-a/services",
+        headers={"Origin": "http://testserver"},
+        json={"display_name": "Operations", "service_key": "operations"},
+    )
 
-    assert response.status_code == 401
+    assert unauthenticated.status_code == 401
+    assert cleanup_list.status_code == 200
+    assert cleanup_list.json() == {"items": []}
+    assert create.status_code == 405
+
+
+def test_main_app_legacy_cleanup_can_disable_but_not_reactivate(monkeypatch):
+    from app.main import create_app
+    from app.mcp_services import router as service_router
+
+    calls = []
+    monkeypatch.setattr(
+        service_router.manager,
+        "update_status",
+        lambda tenant_id, service_id, status, version: calls.append(
+            (tenant_id, service_id, status, version)
+        )
+        or SimpleNamespace(
+            service_id=service_id,
+            tenant_id=tenant_id,
+            display_name="Legacy",
+            service_key="legacy",
+            status=status,
+            config_version=version + 1,
+        ),
+    )
+    client = TestClient(create_app())
+    headers = {"Origin": "http://testserver"}
+
+    unauthenticated = client.patch(
+        "/admin/tenants/tenant-a/services/service-a",
+        headers=headers,
+        json={"status": "active", "expected_config_version": 1},
+    )
+    monkeypatch.setattr(admin, "_require_auth", lambda request: None)
+    rejected = client.patch(
+        "/admin/tenants/tenant-a/services/service-a",
+        headers=headers,
+        json={"status": "active", "expected_config_version": 1},
+    )
+    disabled = client.patch(
+        "/admin/tenants/tenant-a/services/service-a",
+        headers=headers,
+        json={"status": "disabled", "expected_config_version": 1},
+    )
+
+    assert unauthenticated.status_code == 401
+    assert rejected.status_code == 422
+    assert disabled.status_code == 200
+    assert calls == [("tenant-a", "service-a", "disabled", 1)]
 
 
 def test_admin_service_mutations_require_same_origin_after_auth(monkeypatch):
-    from app.main import create_app
     from app.mcp_services import router as service_router
 
     monkeypatch.setattr(admin, "_require_auth", lambda request: None)
@@ -135,7 +201,7 @@ def test_admin_service_mutations_require_same_origin_after_auth(monkeypatch):
             config_version=1,
         ),
     )
-    client = TestClient(create_app())
+    client = TestClient(_isolated_admin_service_app())
 
     missing = client.post(
         "/admin/tenants/tenant-a/services",
@@ -161,7 +227,6 @@ def test_admin_service_mutations_require_same_origin_after_auth(monkeypatch):
 def test_admin_reveal_auth_csrf_and_boundary_failures_are_no_store_and_audited(
     monkeypatch,
 ):
-    from app.main import create_app
     from app.mcp_services import router as service_router
     from app.mcp_services.store import TokenUnavailableError
 
@@ -179,7 +244,7 @@ def test_admin_reveal_auth_csrf_and_boundary_failures_are_no_store_and_audited(
         unavailable,
     )
     service_router.reset_reveal_limiter()
-    client = TestClient(create_app())
+    client = TestClient(_isolated_admin_service_app())
     path = "/admin/tenants/tenant-a/services/service-a/tokens/token-a/reveal"
 
     unauthenticated = client.post(path, headers={"Origin": "http://testserver"})
@@ -233,7 +298,6 @@ def test_admin_reveal_auth_csrf_and_boundary_failures_are_no_store_and_audited(
 
 @pytest.mark.parametrize("audit_behavior", ["false", "throw"])
 def test_admin_reveal_requires_accepted_success_audit(monkeypatch, audit_behavior):
-    from app.main import create_app
     from app.mcp_services import router as service_router
 
     events = []
@@ -253,7 +317,7 @@ def test_admin_reveal_requires_accepted_success_audit(monkeypatch, audit_behavio
     )
     service_router.reset_reveal_limiter()
 
-    response = TestClient(create_app()).post(
+    response = TestClient(_isolated_admin_service_app()).post(
         "/admin/tenants/tenant-a/services/service-a/tokens/token-a/reveal",
         headers={"Origin": "http://testserver"},
     )
@@ -266,7 +330,6 @@ def test_admin_reveal_requires_accepted_success_audit(monkeypatch, audit_behavio
 
 
 def test_admin_issue_threads_normalized_expiry(monkeypatch):
-    from app.main import create_app
     from app.mcp_services import router as service_router
 
     calls = []
@@ -280,7 +343,7 @@ def test_admin_issue_threads_normalized_expiry(monkeypatch):
         or SimpleNamespace(token_id="token-a", raw_value="mcp_svc_secret", prefix="abc"),
     )
 
-    response = TestClient(create_app()).post(
+    response = TestClient(_isolated_admin_service_app()).post(
         "/admin/tenants/tenant-a/services/service-a/tokens",
         headers={"Origin": "http://testserver"},
         json={"label": "client", "expires_at": "2026-07-23T10:20:30+08:00"},

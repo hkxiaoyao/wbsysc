@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import inspect
 from types import SimpleNamespace
 
 from fastapi.testclient import TestClient
@@ -27,27 +28,35 @@ def test_health_reports_effective_service_flag_as_boolean(monkeypatch):
 
     assert disabled.status_code == 200
     assert disabled.json()["mcp_service_enabled"] is False
+    assert disabled.json()["mcp_service_legacy_enabled"] is False
     assert enabled.status_code == 200
     assert enabled.json()["mcp_service_enabled"] is True
+    assert enabled.json()["mcp_service_legacy_enabled"] is True
 
 
-def test_disabled_flag_hides_tenant_services_but_keeps_admin_cleanup(monkeypatch):
+def test_only_admin_legacy_cleanup_routes_remain_when_runtime_is_disabled(
+    monkeypatch,
+):
     app = _app(monkeypatch, enabled=False)
     paths = {getattr(route, "path", "") for route in app.routes}
     client = TestClient(app)
 
     assert "/tenant/services" not in paths
-    assert "/admin/tenants/{tenant_id}/services" in paths
     assert client.get("/tenant/services").status_code == 404
     assert client.get("/admin/tenants/tenant-a/services").status_code == 401
+    assert client.post("/admin/tenants/tenant-a/services").status_code == 405
 
 
-def test_enabled_flag_mounts_tenant_service_management(monkeypatch):
+def test_enabled_flag_mounts_only_legacy_service_runtime_not_management(monkeypatch):
     app = _app(monkeypatch, enabled=True)
     paths = {getattr(route, "path", "") for route in app.routes}
 
-    assert "/tenant/services" in paths
-    assert "/admin/tenants/{tenant_id}/services" in paths
+    assert "/tenant/services" not in paths
+    assert "/mcp/service/{service_id}" in paths
+
+
+def test_startup_no_longer_backfills_default_services():
+    assert "migrate_default_services" not in inspect.getsource(main.lifespan)
 
 
 def test_connection_and_legacy_mounts_survive_flag_with_service_precedence(monkeypatch):

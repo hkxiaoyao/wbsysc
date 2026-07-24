@@ -706,8 +706,6 @@ export default function McpLogs({ scope = 'admin', apiClient = defaultApi, filte
             options={tenantOptions}
             onChange={(tenantId) => updateFilters({ tenantId: tenantId || '' })}
           />}
-          {tenantScope && <Input allowClear aria-label="按 MCP 服务筛选" placeholder="服务 ID" value={activeFilters.serviceId || ''} onChange={(event) => updateFilters({ serviceId: event.target.value })} />}
-          {tenantScope && <Input allowClear aria-label="按工具别名筛选" placeholder="工具别名" value={activeFilters.toolAlias || ''} onChange={(event) => updateFilters({ toolAlias: event.target.value })} />}
           <Select
             allowClear
             showSearch

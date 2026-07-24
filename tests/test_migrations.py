@@ -402,6 +402,20 @@ def test_connection_domain_verify_migration_is_connection_scoped_and_idempotent(
     assert "call `migrate_connection_domain_verify`()" in lower
 
 
+def test_legacy_mcp_service_inventory_is_read_only_and_finds_cross_connection_rows():
+    sql = (ROOT / "sql" / "audit_legacy_mcp_services.sql").read_text(
+        encoding="utf-8"
+    )
+    lower = " ".join(sql.lower().split())
+
+    assert "count(distinct binding.connection_id)" in lower
+    assert "active_token_count" in lower
+    assert "max(call_log.created_at)" in lower
+    assert "having count(distinct binding.connection_id) > 1" in lower
+    for mutation in ("insert into", "update ", "delete from", "alter table", "drop table"):
+        assert mutation not in lower
+
+
 def test_startup_creates_mcp_service_tables_after_connection_tables(monkeypatch):
     events = []
     from app import domain_verify

@@ -27,7 +27,7 @@ services:
         - CMD-SHELL
         - >-
           curl -fsS http://localhost:8001/health |
-          python -c 'import json,sys; payload=json.load(sys.stdin); sys.exit(0 if payload.get("status") == "ok" and isinstance(payload.get("mcp_service_enabled"), bool) else 1)'
+          python -c 'import json,sys; payload=json.load(sys.stdin); sys.exit(0 if payload.get("status") == "ok" and isinstance(payload.get("mcp_service_legacy_enabled"), bool) else 1)'
       interval: 30s
       timeout: 5s
       retries: 3

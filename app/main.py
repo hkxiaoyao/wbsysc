@@ -51,11 +51,10 @@ from .mcp_audit import (
 from .mcp_gateway import ConnectionMcpGateway
 from .mcp_service_gateway import ServiceMcpGateway
 from .mcp_services import store as mcp_service_store
+from .mcp_services.router import legacy_admin_router as legacy_mcp_admin_router
 from .admin import router as admin_router
 from .admin_connections import router as admin_connections_router
 from .mcp_logs_admin import router as mcp_logs_admin_router
-from .mcp_services.router import admin_router as mcp_services_admin_router
-from .mcp_services.router import tenant_router as mcp_services_tenant_router
 from .tenant_auth.router import router as tenant_auth_router
 from .tenant_console import router as tenant_console_router
 from .tenant_connections import router as tenant_connections_router
@@ -241,9 +240,7 @@ def create_app(
     app.include_router(tenant_auth_router)
     app.include_router(tenant_console_router)
     app.include_router(tenant_connections_router)
-    if app.state.mcp_service_enabled:
-        app.include_router(mcp_services_tenant_router)
-    app.include_router(mcp_services_admin_router)
+    app.include_router(legacy_mcp_admin_router)
 
     # 健康检查（鉴权白名单）
     @app.get("/health")
@@ -254,6 +251,7 @@ def create_app(
             "mock": settings.wecom_use_mock,
             "scheduler": _scheduler.running if _scheduler else False,
             "mcp_service_enabled": app.state.mcp_service_enabled,
+            "mcp_service_legacy_enabled": app.state.mcp_service_enabled,
         }
 
     @app.api_route(
@@ -385,7 +383,7 @@ def create_app(
     app.mount("/mcp", legacy_mcp_app)
 
     logger.info(
-        "MCP Gateway mounted service_enabled=%s at connection and legacy routes",
+        "MCP Gateway mounted legacy_service_enabled=%s at connection and compatibility routes",
         app.state.mcp_service_enabled,
     )
     return app
@@ -474,10 +472,6 @@ async def lifespan(app):
     )
     if app_state is not None:
         configure_trusted_connectors(registry=gateway_registry)
-    mcp_service_store.migrate_default_services(
-        gateway_registry,
-        enabled=service_enabled,
-    )
     acquire_audit_writer()
     audit_acquired = True
     audit_released = False

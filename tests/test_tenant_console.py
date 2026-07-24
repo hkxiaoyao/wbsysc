@@ -8,7 +8,6 @@ from app.connections import store as connection_store
 from app.main import create_app
 from app.mcp_log_models import LogFilters
 from app import mcp_log_store
-from app.mcp_services import store as service_store
 from app.tenant_auth import store as tenant_auth_store
 from app.tenant_auth.models import TenantPrincipal
 
@@ -34,16 +33,6 @@ def _spy_on_tenant_console_stores(monkeypatch) -> list[str]:
         connection_store,
         "list_connections",
         lambda *args: calls.append("connections") or [],
-    )
-    monkeypatch.setattr(
-        service_store,
-        "list_services",
-        lambda *args: calls.append("services") or [],
-    )
-    monkeypatch.setattr(
-        service_store,
-        "list_bindings",
-        lambda *args: calls.append("bindings") or [],
     )
     monkeypatch.setattr(
         mcp_log_store,
@@ -238,7 +227,8 @@ def test_tenant_read_routes_reject_every_nonempty_body_before_store(
         ("/tenant/mcp-logs", "tenant%3Aid=tenant-b"),
         ("/tenant/mcp-logs", "unknown=value"),
         ("/tenant/mcp-logs", "page=1&page=2"),
-        ("/tenant/mcp-logs", "service_id=a&service_id=b"),
+        ("/tenant/mcp-logs", "service_id=a"),
+        ("/tenant/mcp-logs", "tool_alias=a"),
     ),
 )
 def test_tenant_read_routes_reject_unknown_or_repeated_query_before_store(
@@ -253,7 +243,7 @@ def test_tenant_read_routes_reject_unknown_or_repeated_query_before_store(
     assert calls == []
 
 
-def test_tenant_logs_map_alias_and_source_key_without_reinterpretation(monkeypatch):
+def test_tenant_logs_use_connection_and_source_key_without_service_scope(monkeypatch):
     captured = {}
 
     def fake_list(filters, page, page_size):
@@ -265,8 +255,6 @@ def test_tenant_logs_map_alias_and_source_key_without_reinterpretation(monkeypat
     response = _tenant_client(monkeypatch).get(
         "/tenant/mcp-logs",
         params={
-            "service_id": "service-a",
-            "tool_alias": "public.users",
             "connection_id": "conn-a",
             "source_tool_key": "users.get",
             "status": "ok",
@@ -279,8 +267,6 @@ def test_tenant_logs_map_alias_and_source_key_without_reinterpretation(monkeypat
     assert captured == {
         "filters": LogFilters(
             tenant_id="tenant-a",
-            service_id="service-a",
-            tool_alias="public.users",
             connection_id="conn-a",
             tool_key="users.get",
             status="ok",
@@ -291,30 +277,14 @@ def test_tenant_logs_map_alias_and_source_key_without_reinterpretation(monkeypat
     assert response.json() == {"items": [], "total": 0, "page": 2, "page_size": 50}
 
 
-def test_tenant_overview_aggregates_only_session_tenant_resources(monkeypatch):
-    captured = {"connections": [], "services": [], "bindings": [], "logs": []}
+def test_tenant_overview_uses_connections_as_the_mcp_instance_boundary(monkeypatch):
+    captured = {"connections": [], "logs": []}
     monkeypatch.setattr(
         connection_store,
         "list_connections",
         lambda tenant_id: captured["connections"].append(tenant_id)
         or [SimpleNamespace(status="active"), SimpleNamespace(status="disabled")],
     )
-    services = [
-        SimpleNamespace(service_id="service-a", status="active"),
-        SimpleNamespace(service_id="service-b", status="draft"),
-    ]
-    monkeypatch.setattr(
-        service_store,
-        "list_services",
-        lambda tenant_id: captured["services"].append(tenant_id) or services,
-    )
-
-    def fake_bindings(service_id, tenant_id):
-        captured["bindings"].append((service_id, tenant_id))
-        return [SimpleNamespace(binding_status="active")]
-
-    monkeypatch.setattr(service_store, "list_bindings", fake_bindings)
-
     def fake_stats(filters):
         captured["logs"].append(filters)
         return {
@@ -335,15 +305,12 @@ def test_tenant_overview_aggregates_only_session_tenant_resources(monkeypatch):
     assert response.status_code == 200
     assert captured == {
         "connections": ["tenant-a"],
-        "services": ["tenant-a"],
-        "bindings": [("service-a", "tenant-a"), ("service-b", "tenant-a")],
         "logs": [LogFilters(tenant_id="tenant-a")],
     }
     assert response.json() == {
         "tenant_id": "tenant-a",
         "connections": {"total": 2, "active": 1},
-        "services": {"total": 2, "active": 1},
-        "tools": {"total": 2, "active": 2},
+        "mcp": {"total": 2, "active": 1},
         "logs": {
             "total": 7,
             "success_rate": 80.0,

@@ -1,4 +1,5 @@
 import assert from 'node:assert/strict'
+import { readFileSync } from 'node:fs'
 import test from 'node:test'
 
 import tenantApi, { loginTenant, logoutTenant } from '../tenantApi.js'
@@ -10,10 +11,11 @@ import {
   serializeTenantLocation,
 } from './tenantAppView.js'
 
-test('tenant views are allowlisted and admin-only views normalize to overview', () => {
-  for (const view of ['overview', 'connections', 'services', 'logs', 'account']) {
+test('tenant views are allowlisted and legacy service links normalize to connections', () => {
+  for (const view of ['overview', 'connections', 'logs', 'account']) {
     assert.equal(normalizeTenantView(view), view)
   }
+  assert.equal(normalizeTenantView('services'), 'connections')
   for (const view of ['', 'tenants', 'admin', 'unknown']) {
     assert.equal(normalizeTenantView(view), 'overview')
   }
@@ -93,12 +95,24 @@ test('late logout completion cannot corrupt a newer session', async () => {
 test('tenant location accepts only the view and drops tenant scope', () => {
   assert.deepEqual(
     parseTenantLocation('?view=services&tenant_id=tenant-b&connection_id=conn-a'),
-    { view: 'services' },
+    { view: 'connections' },
   )
   assert.deepEqual(parseTenantLocation('?view=tenants&tenant_id=tenant-b'), { view: 'overview' })
   assert.equal(serializeTenantLocation('logs'), '?view=logs')
   assert.equal(serializeTenantLocation('tenants'), '?view=overview')
-  assert.equal(serializeTenantLocation('services', { tenant_id: 'tenant-b' }), '?view=services')
+  assert.equal(serializeTenantLocation('services', { tenant_id: 'tenant-b' }), '?view=connections')
+})
+
+test('admin and tenant shells expose connection management without a service page', () => {
+  const tenantSource = readFileSync(new URL('../TenantApp.jsx', import.meta.url), 'utf8')
+  const adminSource = readFileSync(new URL('../App.jsx', import.meta.url), 'utf8')
+
+  for (const source of [tenantSource, adminSource]) {
+    assert.doesNotMatch(source, /import Services from/)
+    assert.doesNotMatch(source, /locationState\.view === 'services'/)
+  }
+  assert.doesNotMatch(tenantSource, /\['services',/)
+  assert.doesNotMatch(adminSource, /aria-label="MCP 服务"/)
 })
 
 test('tenant API is cookie-only and login sends only tenant credentials', async () => {

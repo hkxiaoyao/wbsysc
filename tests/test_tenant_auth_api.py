@@ -149,7 +149,15 @@ def test_password_change_reauthenticates_updates_hash_and_clears_cookie(monkeypa
 
 
 def test_main_application_registers_tenant_auth_routes():
-    paths = {getattr(route, "path", "") for route in create_app().routes}
+    app = create_app()
+    included_routes = []
+    for route in app.routes:
+        included_routes.extend(
+            getattr(getattr(route, "original_router", None), "routes", ())
+        )
+    paths = {
+        getattr(route, "path", "") for route in [*app.routes, *included_routes]
+    }
 
     assert "/tenant/login" in paths
     assert "/tenant/session" in paths

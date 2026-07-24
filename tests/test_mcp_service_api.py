@@ -4,6 +4,7 @@ import json
 from types import SimpleNamespace
 
 import pytest
+from fastapi import FastAPI
 from fastapi.testclient import TestClient
 
 from app.mcp_services.models import IssuedServiceToken, McpService, ServiceToolBinding
@@ -113,20 +114,9 @@ class FakeManager:
 
 
 def _client(monkeypatch, manager=None) -> tuple[TestClient, FakeManager]:
-    from app import main
     from app.mcp_services import router as service_router
 
     fake = manager or FakeManager()
-    current = main.get_settings()
-    monkeypatch.setattr(
-        main,
-        "get_settings",
-        lambda: SimpleNamespace(
-            mcp_service_enabled=True,
-            app_env=current.app_env,
-            wecom_use_mock=current.wecom_use_mock,
-        ),
-    )
     monkeypatch.setattr(service_router, "manager", fake)
     service_router.reset_reveal_limiter()
     monkeypatch.setattr(
@@ -138,7 +128,9 @@ def _client(monkeypatch, manager=None) -> tuple[TestClient, FakeManager]:
             else None
         ),
     )
-    client = TestClient(main.create_app())
+    app = FastAPI()
+    app.include_router(service_router.tenant_router)
+    client = TestClient(app)
     client.cookies.set("wbg_tenant_session", "tenant-session-a", path="/tenant")
     return client, fake
 

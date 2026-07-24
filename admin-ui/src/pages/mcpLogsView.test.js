@@ -25,8 +25,6 @@ test('tenant log endpoint and query never carry a tenant override', () => {
     toolAlias: 'public.users',
     sourceToolKey: 'users.get',
   }, 3, 50), {
-    service_id: 'service-a',
-    tool_alias: 'public.users',
     connection_id: 'conn-a',
     source_tool_key: 'users.get',
     status: 'partial',
@@ -36,8 +34,9 @@ test('tenant log endpoint and query never carry a tenant override', () => {
   assert.equal(serializeScopedLogFilters('tenant', {
     ...EXPLICIT_FILTERS,
     serviceId: 'service-a',
-  }).includes('tenant_id'), false)
+  }).includes('service_id'), false)
   assert.equal(parseScopedLogLocation('tenant', '?tenant_id=tenant-b').tenantId, '')
+  assert.equal(parseScopedLogLocation('tenant', '?service_id=service-a').serviceId, undefined)
 })
 
 test('admin log endpoint and existing query serialization remain unchanged', () => {

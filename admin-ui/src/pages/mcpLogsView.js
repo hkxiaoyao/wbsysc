@@ -122,14 +122,10 @@ function filterQuery(filters = DEFAULT_LOG_FILTERS) {
 
 function tenantFilterQuery(filters = DEFAULT_LOG_FILTERS) {
   const query = {}
-  const serviceId = normalizeText(filters?.serviceId)
-  const toolAlias = normalizeText(filters?.toolAlias)
   const connectionId = normalizeText(filters?.connectionId)
   const sourceToolKey = normalizeText(filters?.sourceToolKey)
   const status = normalizeEnum(filters?.status, STATUS_VALUES)
 
-  if (serviceId) query.service_id = serviceId
-  if (toolAlias) query.tool_alias = toolAlias
   if (connectionId) query.connection_id = connectionId
   if (sourceToolKey) query.source_tool_key = sourceToolKey
   if (status) query.status = status
@@ -245,8 +241,6 @@ export function parseScopedLogLocation(scope = 'admin', search = '') {
   return {
     ...filters,
     tenantId: '',
-    serviceId: normalizeText(params.get('service_id')),
-    toolAlias: normalizeText(params.get('tool_alias')),
     sourceToolKey: normalizeText(params.get('source_tool_key')),
   }
 }

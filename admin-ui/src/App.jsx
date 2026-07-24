@@ -4,10 +4,8 @@ import Login from './pages/Login.jsx'
 import McpLogs from './pages/McpLogs.jsx'
 import Tenants from './pages/Tenants.jsx'
 import Connections from './pages/Connections.jsx'
-import Services from './pages/Services.jsx'
 import { parseLogLocation, serializeLogFilters } from './pages/mcpLogsView.js'
 import { parseConnectionLocation, serializeConnectionLocation } from './pages/connectionView.js'
-import { parseServiceLocation, serializeServiceLocation } from './pages/servicesView.js'
 import api, { getToken, setToken, clearToken } from './api.js'
 
 const { Header, Content } = Layout
@@ -15,14 +13,15 @@ const { Header, Content } = Layout
 function readAdminLocation() {
   const params = new URLSearchParams(window.location.search)
   return {
-    view: ['logs', 'connections', 'services'].includes(params.get('view')) ? params.get('view') : 'tenants',
+    view: ['logs', 'connections'].includes(params.get('view'))
+      ? params.get('view')
+      : params.get('view') === 'services' ? 'connections' : 'tenants',
     logFilters: parseLogLocation(window.location.search),
     connectionFilters: parseConnectionLocation(window.location.search),
-    serviceFilters: parseServiceLocation(window.location.search),
   }
 }
 
-function adminUrl(view, logFilters, connectionFilters, serviceFilters) {
+function adminUrl(view, logFilters, connectionFilters) {
   const params = new URLSearchParams()
   params.set('view', view)
   if (view === 'logs') {
@@ -31,10 +30,6 @@ function adminUrl(view, logFilters, connectionFilters, serviceFilters) {
   }
   if (view === 'connections') {
     const filterParams = new URLSearchParams(serializeConnectionLocation(connectionFilters))
-    for (const [key, value] of filterParams) params.set(key, value)
-  }
-  if (view === 'services') {
-    const filterParams = new URLSearchParams(serializeServiceLocation(serviceFilters))
     for (const [key, value] of filterParams) params.set(key, value)
   }
   return `${window.location.pathname}?${params.toString()}${window.location.hash}`
@@ -69,16 +64,16 @@ export default function App() {
     setAuthed(false)
   }
 
-  const applyLocation = useCallback((view, logFilters, connectionFilters = locationState.connectionFilters, serviceFilters = locationState.serviceFilters) => {
-    const nextUrl = adminUrl(view, logFilters, connectionFilters, serviceFilters)
+  const applyLocation = useCallback((view, logFilters, connectionFilters = locationState.connectionFilters) => {
+    const nextUrl = adminUrl(view, logFilters, connectionFilters)
     const currentUrl = `${window.location.pathname}${window.location.search}${window.location.hash}`
     if (nextUrl !== currentUrl) window.history.pushState({}, '', nextUrl)
-    setLocationState({ view, logFilters, connectionFilters, serviceFilters })
-  }, [locationState.connectionFilters, locationState.serviceFilters])
+    setLocationState({ view, logFilters, connectionFilters })
+  }, [locationState.connectionFilters])
 
-  const navigate = useCallback((view, logFilters = locationState.logFilters, connectionFilters = locationState.connectionFilters, serviceFilters = locationState.serviceFilters) => {
+  const navigate = useCallback((view, logFilters = locationState.logFilters, connectionFilters = locationState.connectionFilters) => {
     if (view === locationState.view && logFilters === locationState.logFilters) return
-    applyLocation(view, logFilters, connectionFilters, serviceFilters)
+    applyLocation(view, logFilters, connectionFilters)
   }, [applyLocation, locationState])
 
   const onLogFiltersChange = useCallback((logFilters) => {
@@ -102,10 +97,6 @@ export default function App() {
     navigate('connections', locationState.logFilters, { tenantId, connectionId: '' })
   }, [navigate, locationState.logFilters])
 
-  const onServiceTenantChange = useCallback((tenantId) => {
-    applyLocation('services', locationState.logFilters, locationState.connectionFilters, { tenantId })
-  }, [applyLocation, locationState.connectionFilters, locationState.logFilters])
-
   if (!authed) {
     return (
       <>
@@ -122,16 +113,6 @@ export default function App() {
         <Header className="admin-header">
           <span className="admin-brand">企微数据中转 <span>· 管理后台</span></span>
           <nav className="admin-nav" aria-label="管理后台主导航">
-            <Button
-              type="text"
-              className={locationState.view === 'services' ? 'admin-nav__item admin-nav__item--active' : 'admin-nav__item'}
-              aria-current={locationState.view === 'services' ? 'page' : undefined}
-              aria-label="MCP 服务"
-              onClick={() => navigate('services')}
-            >
-              <span className="admin-nav__full" aria-hidden="true">MCP 服务</span>
-              <span className="admin-nav__short" aria-hidden="true">服务</span>
-            </Button>
             <Button
               type="text"
               className={locationState.view === 'connections' ? 'admin-nav__item admin-nav__item--active' : 'admin-nav__item'}
@@ -176,11 +157,6 @@ export default function App() {
               tenantId={locationState.connectionFilters.tenantId}
               initialConnectionId={locationState.connectionFilters.connectionId}
               onViewLogs={onViewConnectionLogs}
-            />
-          ) : locationState.view === 'services' ? (
-            <Services
-              tenantId={locationState.serviceFilters.tenantId}
-              onTenantChange={onServiceTenantChange}
             />
           ) : (
             <Tenants onViewLogs={onViewLogs} onViewConnections={onViewConnections} onViewConnectionLogs={onViewConnectionLogs} />

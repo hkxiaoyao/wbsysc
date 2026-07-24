@@ -1,12 +1,12 @@
 export const TENANT_VIEWS = Object.freeze([
   'overview',
   'connections',
-  'services',
   'logs',
   'account',
 ])
 
 export function normalizeTenantView(view) {
+  if (view === 'services') return 'connections'
   return TENANT_VIEWS.includes(view) ? view : 'overview'
 }
 

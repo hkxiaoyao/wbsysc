@@ -181,6 +181,9 @@ def test_env_reader_trims_again_after_unquoting_for_key_validation_parity():
 
 def test_compose_healthcheck_requires_health_shape_and_boolean_flag():
     compose = (ROOT / "docker-compose.yml").read_text(encoding="utf-8")
+    deploy = (ROOT / "deploy" / "server_deploy.sh").read_text(encoding="utf-8")
 
     assert 'payload.get("status") == "ok"' in compose
-    assert 'isinstance(payload.get("mcp_service_enabled"), bool)' in compose
+    assert 'isinstance(payload.get("mcp_service_legacy_enabled"), bool)' in compose
+    assert '\\"mcp_service_legacy_enabled\\"' in deploy
+    assert '\\"mcp_service_enabled\\"' not in deploy

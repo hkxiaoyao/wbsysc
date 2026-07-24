@@ -10,7 +10,6 @@ from .connections import store as connection_store
 from .mcp_log_models import LogFilters
 from . import mcp_log_store
 from .mcp_logs_admin import safe_log_list, safe_log_stats
-from .mcp_services import store as service_store
 from .tenant_auth.dependencies import require_tenant_principal
 
 
@@ -22,8 +21,6 @@ _OVERVIEW_QUERY_KEYS = frozenset()
 _CONNECTION_QUERY_KEYS = frozenset()
 _LOG_QUERY_KEYS = frozenset(
     {
-        "service_id",
-        "tool_alias",
         "connection_id",
         "source_tool_key",
         "status",
@@ -88,8 +85,6 @@ async def tenant_connections(request: Request):
 @router.get("/mcp-logs", dependencies=[])
 async def tenant_logs(
     request: Request,
-    service_id: Annotated[str | None, Query(max_length=64)] = None,
-    tool_alias: Annotated[str | None, Query(max_length=128)] = None,
     connection_id: Annotated[str | None, Query(max_length=64)] = None,
     source_tool_key: Annotated[str | None, Query(max_length=128)] = None,
     status: Annotated[TenantLogStatus | None, Query()] = None,
@@ -101,8 +96,6 @@ async def tenant_logs(
     try:
         filters = LogFilters(
             tenant_id=principal.tenant_id,
-            service_id=service_id,
-            tool_alias=tool_alias,
             connection_id=connection_id,
             tool_key=source_tool_key,
             status=status or "",
@@ -123,12 +116,6 @@ async def tenant_overview(request: Request):
     await _validate_read_request(request, _OVERVIEW_QUERY_KEYS)
     tenant_id = principal.tenant_id
     connections = _store_call(connection_store.list_connections, tenant_id)
-    services = _store_call(service_store.list_services, tenant_id)
-    bindings = []
-    for service in services:
-        bindings.extend(
-            _store_call(service_store.list_bindings, service.service_id, tenant_id)
-        )
     log_stats = _store_call(
         mcp_log_store.get_log_stats,
         LogFilters(tenant_id=tenant_id),
@@ -140,13 +127,9 @@ async def tenant_overview(request: Request):
                 "total": len(connections),
                 "active": sum(item.status == "active" for item in connections),
             },
-            "services": {
-                "total": len(services),
-                "active": sum(item.status == "active" for item in services),
-            },
-            "tools": {
-                "total": len(bindings),
-                "active": sum(item.binding_status == "active" for item in bindings),
+            "mcp": {
+                "total": len(connections),
+                "active": sum(item.status == "active" for item in connections),
             },
             "logs": safe_log_stats(log_stats),
         }

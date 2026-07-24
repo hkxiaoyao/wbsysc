@@ -450,11 +450,17 @@ def test_tenant_validation_returns_shared_safe_operation_catalog(monkeypatch):
 
 
 def test_tenant_connection_surface_is_registered_without_duplicate_collection_get():
+    app = create_app()
+    included_routes = []
+    for route in app.routes:
+        included_routes.extend(
+            getattr(getattr(route, "original_router", None), "routes", ())
+        )
     routes = [
         (route.path, method)
-        for route in create_app().routes
+        for route in [*app.routes, *included_routes]
         for method in getattr(route, "methods", ())
-        if route.path.startswith("/tenant/connections")
+        if getattr(route, "path", "").startswith("/tenant/connections")
     ]
 
     def template(path: str) -> str:

@@ -35,6 +35,10 @@ from . import store
 logger = logging.getLogger(__name__)
 tenant_router = APIRouter(prefix="/tenant", tags=["tenant-services"])
 admin_router = APIRouter(prefix="/admin/tenants/{tenant_id}", tags=["admin-services"])
+legacy_admin_router = APIRouter(
+    prefix="/admin/tenants/{tenant_id}",
+    tags=["legacy-service-cleanup"],
+)
 manager = ServiceManager()
 _IDENTIFIER_PATTERN = r"^[A-Za-z][A-Za-z0-9_.-]{0,127}$"
 _NO_STORE_HEADERS = {"Cache-Control": "no-store"}
@@ -549,6 +553,7 @@ def revoke_tenant_token(
 
 
 @admin_router.get("/services")
+@legacy_admin_router.get("/services", include_in_schema=False)
 def list_admin_services(tenant_id: str, request: Request):
     _admin_auth(request)
     return {"items": [_service(item) for item in manager.list_services(tenant_id)]}
@@ -563,6 +568,7 @@ def create_admin_service(tenant_id: str, body: ServiceCreate, request: Request):
 
 
 @admin_router.get("/services/{service_id}")
+@legacy_admin_router.get("/services/{service_id}", include_in_schema=False)
 def get_admin_service(tenant_id: str, service_id: str, request: Request):
     _admin_auth(request)
     return {"service": _service(_call(manager.get_service, tenant_id, service_id))}
@@ -584,7 +590,29 @@ def patch_admin_service(
     return {"service": _service(item)}
 
 
+@legacy_admin_router.patch("/services/{service_id}", include_in_schema=False)
+def disable_legacy_admin_service(
+    tenant_id: str, service_id: str, body: ServicePatch, request: Request
+):
+    _admin_auth(request)
+    _same_origin(request)
+    if body.status != "disabled":
+        raise HTTPException(422, "legacy service cleanup only permits disabling")
+    item = _call(
+        manager.update_status,
+        tenant_id,
+        service_id,
+        body.status,
+        body.expected_config_version,
+    )
+    return {"service": _service(item)}
+
+
 @admin_router.get("/services/{service_id}/tools")
+@legacy_admin_router.get(
+    "/services/{service_id}/tools",
+    include_in_schema=False,
+)
 def list_admin_bindings(tenant_id: str, service_id: str, request: Request):
     _admin_auth(request)
     return {
@@ -615,6 +643,10 @@ def replace_admin_bindings(
 
 
 @admin_router.get("/services/{service_id}/tokens")
+@legacy_admin_router.get(
+    "/services/{service_id}/tokens",
+    include_in_schema=False,
+)
 def list_admin_tokens(tenant_id: str, service_id: str, request: Request):
     _admin_auth(request)
     return {
@@ -643,6 +675,10 @@ def issue_admin_token(
 
 
 @admin_router.post("/services/{service_id}/tokens/{token_id}/reveal")
+@legacy_admin_router.post(
+    "/services/{service_id}/tokens/{token_id}/reveal",
+    include_in_schema=False,
+)
 def reveal_admin_token(
     tenant_id: str,
     service_id: str,
@@ -664,6 +700,10 @@ def reveal_admin_token(
 
 
 @admin_router.delete("/services/{service_id}/tokens/{token_id}")
+@legacy_admin_router.delete(
+    "/services/{service_id}/tokens/{token_id}",
+    include_in_schema=False,
+)
 def revoke_admin_token(
     tenant_id: str, service_id: str, token_id: str, request: Request
 ):

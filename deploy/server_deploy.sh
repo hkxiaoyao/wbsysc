@@ -296,7 +296,7 @@ wait_for_health_state() {
   for ((attempt = 1; attempt <= HEALTH_MAX_ATTEMPTS; attempt++)); do
     if health_body="$(curl -fsS http://127.0.0.1:8001/health 2>/dev/null)" &&
       printf '%s' "$health_body" | grep -Eq '"status"[[:space:]]*:[[:space:]]*"ok"' &&
-      printf '%s' "$health_body" | grep -Eq "\"mcp_service_enabled\"[[:space:]]*:[[:space:]]*$expected[[:space:]]*[,}]"; then
+      printf '%s' "$health_body" | grep -Eq "\"mcp_service_legacy_enabled\"[[:space:]]*:[[:space:]]*$expected[[:space:]]*[,}]"; then
       return 0
     fi
     if [ "$attempt" -lt "$HEALTH_MAX_ATTEMPTS" ]; then
@@ -307,7 +307,7 @@ wait_for_health_state() {
 }
 
 rollback_service_flag() {
-  echo "⚠️  发布未完成，正在恢复并验证 MCP 服务禁用状态"
+  echo "⚠️  发布未完成，正在恢复并验证存量 MCP 服务兼容层禁用状态"
   if ! set_env_value MCP_SERVICE_ENABLED false; then
     echo "❌ 严重：无法原子写入禁用状态"
     return 1
@@ -322,7 +322,7 @@ rollback_service_flag() {
     echo "❌ 严重：禁用状态健康恢复失败；配置已保持 false"
     return 1
   fi
-  echo "✓ 已恢复 MCP 服务禁用状态；数据库和 008 数据均保留"
+  echo "✓ 已恢复存量 MCP 服务兼容层禁用状态；数据库和 008 数据均保留"
 }
 
 rollout_exit() {
@@ -450,16 +450,16 @@ echo "✓ 禁用阶段健康检查通过"
 
 if [ "$REQUESTED_MCP_SERVICE_ENABLED" = "true" ]; then
   echo ""
-  echo "===== 8. 启用 MCP 服务并验证 ====="
+  echo "===== 8. 启用存量 MCP 服务兼容层并验证 ====="
   set_env_value MCP_SERVICE_ENABLED true
   docker compose up -d --force-recreate
   if ! wait_for_health_state true; then
-    echo "❌ MCP 服务启用阶段健康检查未通过"
+    echo "❌ 存量 MCP 服务兼容层启用阶段健康检查未通过"
     exit 1
   fi
-  echo "✓ MCP 服务启用阶段健康检查通过"
+  echo "✓ 存量 MCP 服务兼容层启用阶段健康检查通过"
 else
-  echo "✓ MCP 服务按请求保持禁用"
+  echo "✓ 存量 MCP 服务兼容层按请求保持禁用"
 fi
 
 docker compose ps

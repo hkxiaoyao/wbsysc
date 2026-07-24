@@ -3,7 +3,6 @@ import { Alert, Button, Card, Col, Layout, Row, Spin, Statistic, Typography } fr
 
 import Connections from './pages/Connections.jsx'
 import McpLogs from './pages/McpLogs.jsx'
-import Services from './pages/Services.jsx'
 import TenantLogin from './pages/TenantLogin.jsx'
 import tenantApi, { logoutTenant } from './tenantApi.js'
 import { parseScopedLogLocation } from './pages/mcpLogsView.js'
@@ -21,15 +20,13 @@ const { Paragraph, Title } = Typography
 const NAV_ITEMS = [
   ['overview', '概览'],
   ['connections', '连接'],
-  ['services', '服务'],
   ['logs', '日志'],
   ['account', '账户设置'],
 ]
 
 const VIEW_COPY = {
-  overview: ['租户概览', '查看当前租户的连接、服务和运行状态。'],
-  connections: ['连接', '管理当前租户可用的数据连接。'],
-  services: ['MCP 服务', '管理当前租户的 MCP 服务与工具。'],
+  overview: ['租户概览', '查看当前租户的连接实例、MCP 端点和运行状态。'],
+  connections: ['连接实例', '管理连接配置、MCP Token、工具和同步策略。'],
   logs: ['调用日志', '查看当前租户的 MCP 调用记录。'],
   account: ['账户设置', '管理当前租户账户的安全设置。'],
 }
@@ -63,10 +60,9 @@ function TenantOverview({ apiClient }) {
       <Title level={2}>租户概览</Title>
       <Paragraph type="secondary">所有数据均由当前登录会话确定租户范围。</Paragraph>
       <Row gutter={[16, 16]}>
-        <Col xs={12} lg={6}><Statistic title="连接" value={data.connections?.total || 0} suffix={`/ ${data.connections?.active || 0} 运行中`} /></Col>
-        <Col xs={12} lg={6}><Statistic title="服务" value={data.services?.total || 0} suffix={`/ ${data.services?.active || 0} 运行中`} /></Col>
-        <Col xs={12} lg={6}><Statistic title="工具" value={data.tools?.total || 0} suffix={`/ ${data.tools?.active || 0} 可用`} /></Col>
-        <Col xs={12} lg={6}><Statistic title="调用日志" value={data.logs?.total || 0} /></Col>
+        <Col xs={24} md={8}><Statistic title="连接实例" value={data.connections?.total || 0} suffix={`/ ${data.connections?.active || 0} 运行中`} /></Col>
+        <Col xs={24} md={8}><Statistic title="MCP 实例" value={data.mcp?.total || 0} suffix={`/ ${data.mcp?.active || 0} 可调用`} /></Col>
+        <Col xs={24} md={8}><Statistic title="调用日志" value={data.logs?.total || 0} /></Col>
       </Row>
     </Card>
   )
@@ -196,8 +192,6 @@ export default function TenantApp() {
         }}
       />
     )
-  } else if (locationState.view === 'services') {
-    viewContent = <Services scope="tenant" apiClient={tenantApi} />
   } else if (locationState.view === 'logs') {
     viewContent = (
       <McpLogs

@@ -31,7 +31,7 @@ TL;DR：先备份 MySQL，再部署连接平台表和应用。保留旧模型上
 | `CREDENTIAL_KEY` | 凭证加密密钥，生产至少 32 个 UTF-8 字节 |
 | `MCP_TOKEN_HMAC_KEY` | Token 基于哈希的消息认证码（HMAC）密钥，生产至少 32 个 UTF-8 字节，必须使用非示例值 |
 | `MCP_TOKEN_PLAINTEXT_KEY` | 可揭示服务 Token 的密文密钥，生产至少 32 个 UTF-8 字节，必须使用非示例值 |
-| `MCP_SERVICE_ENABLED` | 服务路由和租户服务自助开关；首次发布保持 `false` |
+| `MCP_SERVICE_ENABLED` | 存量服务级 MCP 端点兼容开关；不会开放租户管理入口或默认服务回填 |
 | `CONNECTOR_ALLOWLIST` | 已审核连接器入口名的逗号分隔精确列表 |
 | `MCP_BASE_URL` | 对外 HTTPS 基础地址，也参与 Host 许可判断 |
 | `MCP_ALLOWED_HOSTS` | 反向代理 Host 的逗号分隔精确列表 |
@@ -74,10 +74,10 @@ CONNECTOR_ALLOWLIST=reviewed-connector-name
 3. 验证备份可列出 `tenant_config`、业务表和 `audit_log`
 4. 将备份时间与二进制日志位置登记为恢复点
 5. 使用独立迁移账户和 MySQL 5.7 客户端严格执行 `004` → `005` → `006` → `007` → `008`
-6. 保持 `MCP_SERVICE_ENABLED=false`，重建应用并等待 `/health` 明确返回 `mcp_service_enabled:false`
+6. 保持 `MCP_SERVICE_ENABLED=false`，重建应用并等待 `/health` 明确返回 `mcp_service_legacy_enabled:false`
 7. 核对每个旧租户只有一个确定性默认 `wecom` 连接，旧 `/mcp` 与 `/mcp/{connection_id}` 正常
-8. 如本次批准启用服务，改为 `true` 后**重建**应用，并等待健康响应明确返回 `mcp_service_enabled:true`
-9. 核对默认服务回填、服务路由和租户控制台，再逐批切换客户端
+8. 如存量客户端确需兼容，改为 `true` 后**重建**应用，并等待健康响应明确返回 `mcp_service_legacy_enabled:true`
+9. 核对连接级 MCP 路由和租户连接实例控制台；仅有存量依赖时再验证服务兼容路由
 
 顺序不可跳跃：`008_mcp_service.sql` 依赖 `005` 的 `mcp_call_log` 和 `006` 的连接表，`007` 提供租户登录。结构迁移只前进，不因功能回滚删除。推荐使用 `deploy/server_deploy.sh`，它会在拉取/启动前执行精确顺序，并先以关闭状态启动、健康检查，再按原请求值启用。
 
@@ -120,11 +120,13 @@ CONNECTOR_ALLOWLIST=reviewed-connector-name
 - `PUT /admin/tenants/{tenant_id}/login-status` 只接受明确的启用/禁用状态；禁用会撤销全部租户会话。普通租户资料编辑不得意外重新启用已禁用登录。
 - 租户自行修改密码同样撤销全部会话并清除当前 Cookie。工单、日志和浏览器状态中都不得保存密码或密码派生提示。
 
-## 默认服务回填与功能回滚
+## 存量服务兼容与功能回滚
 
-默认服务回填仅在 `MCP_SERVICE_ENABLED=true` 的应用重启中、可信连接器注册完成后运行。它使用水位、可重复执行，为已有连接创建确定性默认服务及当前启用工具的绑定，**不会复制连接 Token 行**。
+应用不再为连接回填默认服务，也不再挂载 tenant 服务管理 API。`MCP_SERVICE_ENABLED=true` 只让已有 `/mcp/service/{service_id}` 客户端继续使用存量绑定和 Token。平台保留不进入 OpenAPI 的 admin 清理 API：可只读盘点、停用服务、揭示或撤销旧 Token，但不能新建服务、修改绑定、签发 Token 或重新激活。
 
-服务功能异常时，把 `.env` 中 `MCP_SERVICE_ENABLED=false`，执行容器重建（仅 restart 不保证重新读取环境），并验证 `/health` 返回 `mcp_service_enabled:false`。此回滚保留 `008` 表和数据，关闭 `/mcp/service/{service_id}`、租户服务管理 UI/API 和服务运行时；旧 `/mcp`、`/mcp/{connection_id}` 及连接 Token 继续工作；经过认证的平台管理员服务管理 API 继续可用，以便精确撤销 Token、禁用服务和清理。若启用阶段健康检查失败，发布脚本会自动恢复 `false`、重建并验证关闭态，然后以非零状态退出。
+发布前使用迁移账户执行只读清单 [`sql/audit_legacy_mcp_services.sql`](../sql/audit_legacy_mcp_services.sql)。第二个查询返回的跨连接服务必须逐项决定拆分或继续兼容，不能自动转换为某一个连接端点。
+
+兼容运行时异常时，把 `.env` 中 `MCP_SERVICE_ENABLED=false`，执行容器重建（仅 restart 不保证重新读取环境），并验证 `/health` 返回 `mcp_service_legacy_enabled:false`。此回滚保留 `008` 表和数据，关闭旧 `/mcp/service/{service_id}`；`/mcp`、`/mcp/{connection_id}` 及连接 Token 继续工作。若启用阶段健康检查失败，发布脚本会自动恢复 `false`、重建并验证关闭态，然后以非零状态退出。
 
 ## 发布连接器包
 
