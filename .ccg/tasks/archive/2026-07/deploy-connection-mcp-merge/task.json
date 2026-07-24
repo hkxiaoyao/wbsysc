@@ -1,0 +1,13 @@
+{
+  "id": "deploy-connection-mcp-merge",
+  "title": "推送并部署连接实例 MCP 融合改造",
+  "status": "completed",
+  "complexity": "M",
+  "risk": "high",
+  "domain": "devops",
+  "currentPhase": "completed",
+  "nextAction": "归档发布记录",
+  "createdAt": "2026-07-24T11:24:51+08:00",
+  "completedAt": "2026-07-24T11:53:01+08:00",
+  "branch": "main"
+}
