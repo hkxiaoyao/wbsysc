@@ -1,0 +1,13 @@
+{
+  "id": "restore-mcp-one-click-copy",
+  "title": "恢复连接实例 MCP 配置一键复制入口",
+  "status": "completed",
+  "complexity": "M",
+  "risk": "high",
+  "domain": "frontend",
+  "currentPhase": "completed",
+  "nextAction": "none",
+  "createdAt": "2026-07-28T22:50:00+08:00",
+  "updatedAt": "2026-07-28T23:25:00+08:00",
+  "branch": "main"
+}

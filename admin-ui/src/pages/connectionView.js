@@ -89,6 +89,21 @@ export function buildConnectionMcpConfig(connection, origin) {
   }, null, 2)
 }
 
+export async function tryCopyText(value, writeText) {
+  if (typeof writeText !== 'function') return false
+  try {
+    await writeText(String(value ?? ''))
+    return true
+  } catch {
+    return false
+  }
+}
+
+export async function copyConnectionMcpConfig(connection, origin, writeText) {
+  const config = buildConnectionMcpConfig(connection, origin)
+  return { config, copied: await tryCopyText(config, writeText) }
+}
+
 export function closeTokenModal() {
   return { open: false, rawToken: '', connectionId: '' }
 }

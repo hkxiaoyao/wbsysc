@@ -1,5 +1,6 @@
 import test from 'node:test'
 import assert from 'node:assert/strict'
+import { readFileSync } from 'node:fs'
 import {
   buildConnectionMcpConfig,
   buildWecomCredentials,
@@ -7,6 +8,7 @@ import {
   apiClientEndpoint,
   canEnableWriteTool,
   closeTokenModal,
+  copyConnectionMcpConfig,
   connectionCollectionEndpoint,
   connectionResourceEndpoint,
   createConnectionMutationSequence,
@@ -23,6 +25,7 @@ import {
   safeServerError,
   serializeConnectionLocation,
   setExplicitToolPolicy,
+  tryCopyText,
   wecomConfigFormValues,
   wizardRevisionIdentity,
 } from './connectionView.js'
@@ -108,6 +111,38 @@ test('buildConnectionMcpConfig uses the encoded instance-specific endpoint', () 
 
   assert.equal(config.mcpServers['conn/a ?#'].url, 'https://gw.example.com/mcp/conn%2Fa%20%3F%23')
   assert.equal(config.mcpServers['conn/a ?#'].headers.Authorization, 'Bearer mcp_once')
+})
+
+test('tryCopyText reports clipboard success without changing the payload', async () => {
+  let copied = ''
+  const result = await tryCopyText('mcp-config', async (value) => { copied = value })
+
+  assert.equal(result, true)
+  assert.equal(copied, 'mcp-config')
+})
+
+test('tryCopyText fails closed when clipboard is unavailable or rejects', async () => {
+  assert.equal(await tryCopyText('mcp-config'), false)
+  assert.equal(await tryCopyText('mcp-config', async () => { throw new Error('denied') }), false)
+})
+
+test('copyConnectionMcpConfig copies the exact config returned for fallback display', async () => {
+  let clipboardValue = ''
+  const result = await copyConnectionMcpConfig(
+    { connection_id: 'conn-a', initial_token: 'mcp_once' },
+    'https://gw.example.com',
+    async (value) => { clipboardValue = value },
+  )
+
+  assert.equal(result.copied, true)
+  assert.equal(result.config, clipboardValue)
+  assert.equal(JSON.parse(result.config).mcpServers['conn-a'].headers.Authorization, 'Bearer mcp_once')
+})
+
+test('connection token tab keeps a fixed non-rotating one-click MCP config action', () => {
+  const source = readFileSync(new URL('./Connections.jsx', import.meta.url), 'utf8')
+  assert.match(source, /一键生成并复制 MCP 配置/)
+  assert.match(source, /issueToken\(false, true\)/)
 })
 
 test('token display state is cleared after the one-time modal closes', () => {
