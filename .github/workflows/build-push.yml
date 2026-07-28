@@ -50,7 +50,7 @@ jobs:
         run: pip install -r requirements.txt
 
       - name: Run backend tests
-        run: pytest -q
+        run: python -m pytest -q
 
       - name: Set up Node.js
         uses: actions/setup-node@v4
