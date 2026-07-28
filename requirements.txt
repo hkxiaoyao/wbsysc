@@ -2,7 +2,7 @@
 # Python 3.11+
 
 # MCP 官方 Python SDK（提供 FastMCP 与 Streamable HTTP transport）
-mcp>=1.2.0
+mcp==1.28.1
 
 # Web 框架
 fastapi>=0.115.0
