@@ -1,0 +1,13 @@
+{
+  "id": "deploy-declarative-connector",
+  "title": "推送并部署声明式连接器增强",
+  "status": "completed",
+  "complexity": "S",
+  "risk": "high",
+  "domain": "devops",
+  "currentPhase": "completed",
+  "nextAction": "none",
+  "createdAt": "2026-07-28T16:45:00+08:00",
+  "updatedAt": "2026-07-28T22:40:00+08:00",
+  "branch": "main"
+}
