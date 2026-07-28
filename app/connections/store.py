@@ -6,12 +6,13 @@ import logging
 import secrets
 import threading
 import uuid
-from collections.abc import Callable
+from collections.abc import Callable, Iterable
 from dataclasses import replace
 from typing import Any, Mapping
 
 from sqlalchemy import text
 
+from .cache import contains_sensitive_value
 from .crypto import encrypt_credential, token_hmac
 from .models import (
     ConnectionRecord,
@@ -26,6 +27,7 @@ logger = logging.getLogger(__name__)
 _LEGACY_WATERMARK_KEY = "legacy_wecom_backfill_v1"
 _LEGACY_WATERMARK_STATUS = "completed"
 _RESERVED_CONNECTION_IDS = frozenset({"service"})
+_MAX_DECLARATIVE_SYNC_CURSOR = 512
 
 # The gateway owns the callback registration.  The store only emits the safe,
 # exact cache key after a transaction has committed; it never receives raw
@@ -155,6 +157,19 @@ _CONNECTION_DDLS = (
       UNIQUE KEY `uk_declarative_spec_operation`
         (`tenant_id`, `spec_id`, `revision`, `operation_key`),
       KEY `idx_declarative_operation_connection` (`connection_id`)
+    ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4
+    """,
+    """
+    CREATE TABLE IF NOT EXISTS `declarative_record` (
+      `connection_id` VARCHAR(64) NOT NULL,
+      `resource_key` VARCHAR(128) NOT NULL,
+      `record_key` VARCHAR(255) NOT NULL,
+      `payload_json` TEXT NOT NULL,
+      `synced_at` DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP
+        ON UPDATE CURRENT_TIMESTAMP,
+      PRIMARY KEY (`connection_id`, `resource_key`, `record_key`),
+      KEY `idx_declarative_record_resource`
+        (`connection_id`, `resource_key`, `synced_at`)
     ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4
     """,
 )
@@ -879,6 +894,185 @@ def get_declarative_revision(
             {"spec_id": spec_id, "revision": revision, "tenant_id": tenant_id, "connection_id": connection_id},
         ).fetchone()
     return None if row is None else _declarative_revision_from_row(row)
+
+
+_MAX_DECLARATIVE_RECORD_KEY = 255
+_MAX_DECLARATIVE_PAYLOAD_BYTES = 64 * 1024
+_MAX_DECLARATIVE_READ_LIMIT = 1_000
+
+
+def upsert_declarative_records(
+    connection_id: str,
+    resource_key: str,
+    records: Iterable[Mapping[str, Any]],
+) -> int:
+    """Idempotently persist already-projected records for one connection.
+
+    ``records`` carries only the connector's declared field projection.  This
+    function never receives, and must never be given, a raw upstream body.
+    """
+    rows = []
+    for record in records:
+        record_key = record.get("record_key")
+        payload = record.get("payload")
+        if (
+            not isinstance(record_key, str)
+            or not record_key
+            or len(record_key) > _MAX_DECLARATIVE_RECORD_KEY
+            or not isinstance(payload, Mapping)
+            or contains_sensitive_value(payload)
+        ):
+            continue
+        try:
+            payload_json = json.dumps(
+                dict(payload), ensure_ascii=False, allow_nan=False
+            )
+        except (TypeError, ValueError, OverflowError, RecursionError):
+            continue
+        if len(payload_json.encode("utf-8")) > _MAX_DECLARATIVE_PAYLOAD_BYTES:
+            continue
+        rows.append(
+            {
+                "connection_id": connection_id,
+                "resource_key": resource_key,
+                "record_key": record_key,
+                "payload_json": payload_json,
+            }
+        )
+    if not rows:
+        return 0
+    with _engine().begin() as conn:
+        conn.execute(
+            text("""
+                INSERT INTO declarative_record
+                    (connection_id, resource_key, record_key, payload_json)
+                VALUES (:connection_id, :resource_key, :record_key, :payload_json)
+                ON DUPLICATE KEY UPDATE payload_json=VALUES(payload_json)
+            """),
+            rows,
+        )
+    return len(rows)
+
+
+def _declarative_sync_state_key(resource_key: str) -> str:
+    """Return a fixed-size state key without trusting a resource as SQL state."""
+    if not isinstance(resource_key, str) or not resource_key or len(resource_key) > 128:
+        raise ValueError("invalid declarative resource key")
+    digest = hashlib.sha256(resource_key.encode("utf-8")).hexdigest()
+    return f"decl_sync_{digest[:54]}"
+
+
+def get_declarative_sync_cursor(
+    connection_id: str,
+    resource_key: str,
+) -> str | None:
+    """Load a bounded page checkpoint scoped to one connection and resource."""
+    _validate_connection_id(connection_id)
+    state_key = _declarative_sync_state_key(resource_key)
+    with _engine().connect() as conn:
+        raw_state = conn.execute(
+            text("""
+                SELECT state_json FROM connection_sync_state
+                WHERE connection_id=:connection_id AND state_key=:state_key
+                LIMIT 1
+            """),
+            {"connection_id": connection_id, "state_key": state_key},
+        ).scalar()
+    try:
+        state = json.loads(raw_state) if isinstance(raw_state, str) else None
+    except (TypeError, ValueError):
+        return None
+    if not isinstance(state, dict) or state.get("resource_key") != resource_key:
+        return None
+    cursor = state.get("cursor")
+    if (
+        not isinstance(cursor, str)
+        or not cursor
+        or len(cursor) > _MAX_DECLARATIVE_SYNC_CURSOR
+    ):
+        return None
+    return cursor
+
+
+def save_declarative_sync_cursor(
+    connection_id: str,
+    resource_key: str,
+    cursor: str | None,
+) -> None:
+    """Advance a page checkpoint after persistence, or clear it on completion."""
+    _validate_connection_id(connection_id)
+    state_key = _declarative_sync_state_key(resource_key)
+    with _engine().begin() as conn:
+        if cursor is None:
+            conn.execute(
+                text("""
+                    DELETE FROM connection_sync_state
+                    WHERE connection_id=:connection_id AND state_key=:state_key
+                """),
+                {"connection_id": connection_id, "state_key": state_key},
+            )
+            return
+        if (
+            not isinstance(cursor, str)
+            or not cursor
+            or len(cursor) > _MAX_DECLARATIVE_SYNC_CURSOR
+        ):
+            raise ValueError("invalid declarative sync cursor")
+        state_json = json.dumps(
+            {"resource_key": resource_key, "cursor": cursor},
+            ensure_ascii=False,
+            separators=(",", ":"),
+        )
+        conn.execute(
+            text("""
+                INSERT INTO connection_sync_state
+                    (connection_id, state_key, state_json, last_success_at, last_error)
+                VALUES (:connection_id, :state_key, :state_json, UTC_TIMESTAMP(), '')
+                ON DUPLICATE KEY UPDATE
+                    state_json=VALUES(state_json),
+                    last_success_at=VALUES(last_success_at),
+                    last_error=''
+            """),
+            {
+                "connection_id": connection_id,
+                "state_key": state_key,
+                "state_json": state_json,
+            },
+        )
+
+
+def list_declarative_records(
+    connection_id: str,
+    resource_key: str,
+    limit: int = _MAX_DECLARATIVE_READ_LIMIT,
+) -> tuple[dict[str, Any], ...]:
+    """Read one connection's stored projection; scoping is always server-side."""
+    if not isinstance(limit, int) or isinstance(limit, bool) or limit < 1:
+        limit = _MAX_DECLARATIVE_READ_LIMIT
+    limit = min(limit, _MAX_DECLARATIVE_READ_LIMIT)
+    with _engine().connect() as conn:
+        rows = conn.execute(
+            text("""
+                SELECT payload_json FROM declarative_record
+                WHERE connection_id=:connection_id AND resource_key=:resource_key
+                ORDER BY record_key
+                LIMIT :limit
+            """),
+            {
+                "connection_id": connection_id,
+                "resource_key": resource_key,
+                "limit": limit,
+            },
+        ).fetchall()
+    payloads: list[dict[str, Any]] = []
+    for row in rows:
+        try:
+            payload = json.loads(row[0])
+        except (TypeError, ValueError):
+            continue
+        if isinstance(payload, dict):
+            payloads.append(payload)
+    return tuple(payloads)
 
 
 def _revision_is_selected(

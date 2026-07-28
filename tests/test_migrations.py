@@ -156,6 +156,7 @@ def test_startup_migrations_upgrade_center_before_tenant_schemas(monkeypatch):
 
 def test_startup_orders_connection_tables_before_legacy_wecom_backfill(monkeypatch):
     events = []
+    from app import domain_verify
     from app.connections import store as connection_store
     from app import mcp_log_store
     from app.mcp_services import store as service_store
@@ -181,6 +182,11 @@ def test_startup_orders_connection_tables_before_legacy_wecom_backfill(monkeypat
         lambda: events.append("tenant_auth_tables"),
     )
     monkeypatch.setattr(
+        domain_verify,
+        "ensure_domain_tables",
+        lambda: events.append("domain_tables"),
+    )
+    monkeypatch.setattr(
         connection_store,
         "migrate_legacy_wecom_connections",
         lambda: events.append("connection_backfill"),
@@ -200,6 +206,7 @@ def test_startup_orders_connection_tables_before_legacy_wecom_backfill(monkeypat
 
 
 def test_startup_migration_failure_propagates(monkeypatch):
+    from app import domain_verify
     from app import mcp_log_store
     from app.connections import store as connection_store
     from app.mcp_services import store as service_store
@@ -211,6 +218,7 @@ def test_startup_migration_failure_propagates(monkeypatch):
     monkeypatch.setattr(connection_store, "ensure_connection_tables", lambda: None)
     monkeypatch.setattr(service_store, "ensure_mcp_service_tables", lambda: None)
     monkeypatch.setattr(tenant_auth_store, "ensure_tenant_auth_tables", lambda: None)
+    monkeypatch.setattr(domain_verify, "ensure_domain_tables", lambda: None)
     monkeypatch.setattr(
         connection_store,
         "migrate_legacy_wecom_connections",
@@ -400,6 +408,23 @@ def test_connection_domain_verify_migration_is_connection_scoped_and_idempotent(
     assert "delete from" not in lower
     assert "add column if not exists" not in lower
     assert "call `migrate_connection_domain_verify`()" in lower
+
+
+def test_declarative_record_migration_is_connection_scoped_and_idempotent():
+    sql = (ROOT / "sql" / "011_declarative_record.sql").read_text(encoding="utf-8")
+    lower = " ".join(sql.lower().split())
+
+    assert "create table if not exists `declarative_record`" in lower
+    # Isolation is structural: the primary key leads with the connection.
+    assert (
+        "primary key (`connection_id`, `resource_key`, `record_key`)" in lower
+    )
+    assert "engine=innodb default charset=utf8mb4" in lower
+    # A stored projection must never be a destructive or schema-rewriting step.
+    assert "drop table" not in lower
+    assert "delete from" not in lower
+    assert "drop column" not in lower
+    assert "alter table" not in lower
 
 
 def test_legacy_mcp_service_inventory_is_read_only_and_finds_cross_connection_rows():

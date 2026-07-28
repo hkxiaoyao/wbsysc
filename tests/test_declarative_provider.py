@@ -63,11 +63,14 @@ def _revision(*, status="published", tenant_id="tenant-a", connection_id="conn-a
 
 def _sync_revision():
     document = _document()
+    document["paths"]["/health"]["get"]["responses"]["200"]["content"][
+        "application/json"
+    ]["schema"]["properties"]["node"] = {"type": "string"}
     document["x-sync-spec"] = {
         "resource_key": "health",
         "operation_key": "health.get",
-        "primary_key_pointer": "/ok",
-        "field_mappings": {"ok": "/ok"},
+        "primary_key_pointer": "/node",
+        "field_mappings": {"ok": "/ok", "node": "/node"},
     }
     return import_openapi_revision(
         document,
@@ -456,15 +459,38 @@ def test_admin_lifecycle_then_gateway_lists_and_executes_dynamic_revision(monkey
 @pytest.mark.asyncio
 async def test_sync_orchestrator_uses_same_connection_scoped_provider():
     loaded = _sync_revision()
+
+    class _MemoryStore:
+        def __init__(self) -> None:
+            self.rows: dict[tuple[str, str, str], dict] = {}
+
+        def upsert_declarative_records(self, connection_id, resource_key, records):
+            for record in records:
+                self.rows[(connection_id, resource_key, record["record_key"])] = dict(
+                    record["payload"]
+                )
+            return len(records)
+
+        def list_declarative_records(self, connection_id, resource_key, limit=1000):
+            return tuple(
+                dict(payload)
+                for (conn, res, _), payload in self.rows.items()
+                if conn == connection_id and res == resource_key
+            )[:limit]
+
+    store = _MemoryStore()
     provider = DeclarativeConnectorProvider._for_test(
         revision_loader=lambda *args: loaded,
         client_factory=lambda revision: SafeHttpClient._for_test(
             revision.allowed_hosts,
             resolver=lambda host, port: ["93.184.216.34"],
             transport=httpx.MockTransport(
-                lambda request: httpx.Response(200, json={"ok": True}, request=request)
+                lambda request: httpx.Response(
+                    200, json={"ok": True, "node": "n1"}, request=request
+                )
             ),
         ),
+        record_store=store,
     )
     registry = ConnectorRegistry()
     resolver = ConnectionConnectorResolver(registry, declarative_provider=provider)
@@ -492,3 +518,5 @@ async def test_sync_orchestrator_uses_same_connection_scoped_provider():
 
     assert result.status == "ok"
     assert result.connection_id == "conn-a"
+    # The projection reached storage through the same connection-scoped provider.
+    assert store.rows == {("conn-a", "health", "n1"): {"ok": True, "node": "n1"}}

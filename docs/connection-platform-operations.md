@@ -149,8 +149,10 @@ CONNECTOR_ALLOWLIST=reviewed-connector-name
 - **目标主机**：只写精确 HTTPS 主机名，不允许通配内网、IP 字面量、用户信息或非标准混淆形式
 - **域名系统**：解析域名系统（DNS）结果，拒绝环回、链路本地、私网、保留地址和元数据地址
 - **重定向**：逐跳重新校验协议、主机、DNS 与 IP，超出跳数立即失败
-- **开放授权（OAuth）**：只允许 OAuth 2.0 client credentials；Token URL 必须是许可的精确 HTTPS 地址；Token 交换禁止重定向；平台不支持 authorization code 或 `state` 流程；凭证只写加密存储
-- **响应限制**：设定超时、最大响应字节数和字段提取白名单；当前版本不支持声明式分页，导入含分页声明的规范必须失败关闭
+- **开放授权（OAuth）**：只允许 OAuth 2.0 client credentials；Token URL 必须是许可的精确 HTTPS 地址；Token 交换禁止重定向；平台不支持 authorization code 或 `state` 流程；凭证只写加密存储。Token 按连接缓存并复用，尊重 `expires_in` 且提前 60 秒过期；缓存键使用凭证的进程内加盐指纹，凭证轮换即自动失效；上游 401 只允许刷新后重试一次
+- **响应限制**：设定超时、最大响应字节数和字段提取白名单
+- **分页**：`x-pagination` 只接受闭合键集，且仅限 GET 只读操作。`items_pointer` 必须指向响应 schema 已声明的数组并被 output 映射投影；`next_pointer` 必须被响应 schema 声明；`next_query_param` 不得与已声明 query 入参同名。评审需确认翻页只替换该单个 query 参数、host 与 path 不变、绝不跟随上游 next 链接，且页数（≤10）、条目数（≤1000）与输出字节三重上限均已设定
+- **同步落库**：`x-sync-spec` 的 `field_mappings` 决定唯一允许落库的字段集合。评审必须确认投影中不含凭证、令牌或整包响应体；`primary_key_pointer` 必须产出稳定标量（布尔值会被拒绝，否则所有记录会折叠到同一行）。数据写入中心库 `declarative_record`，按 `(connection_id, resource_key, record_key)` 幂等 UPSERT
 - **操作范围**：只发布已声明 operation，默认只读，写操作同时要求 ToolSpec 与连接策略允许
 
 安全测试至少包含许可 HTTPS 主机、未许可主机、HTTP 降级、内网解析、DNS 重绑定和跳转到内网。任何不安全 URL 必须在发出业务请求前拒绝。

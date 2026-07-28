@@ -579,7 +579,7 @@ def test_import_rejects_an_oauth_token_host_outside_the_allowlist() -> None:
         import_openapi_revision(document)
 
 
-def test_import_rejects_unimplemented_pagination_declarations() -> None:
+def test_import_rejects_pagination_pointers_absent_from_the_response_schema() -> None:
     document = _document()
     operation = document["paths"]["/users/{user_id}"]["get"]
     operation["parameters"].append(
@@ -593,7 +593,7 @@ def test_import_rejects_unimplemented_pagination_declarations() -> None:
         "next_query_param": "cursor",
     }
 
-    with pytest.raises(SpecValidationError, match="pagination is not supported"):
+    with pytest.raises(SpecValidationError, match="pagination items"):
         import_openapi_revision(document)
 
 

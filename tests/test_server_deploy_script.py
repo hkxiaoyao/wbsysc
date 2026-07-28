@@ -21,6 +21,7 @@ def test_deployer_runs_all_migrations_in_order_before_starting_new_image():
             "008_mcp_service.sql",
             "009_tenant_identity_boundary.sql",
             "010_connection_domain_verify.sql",
+            "011_declarative_record.sql",
         )
     ]
 
@@ -29,8 +30,19 @@ def test_deployer_runs_all_migrations_in_order_before_starting_new_image():
     assert migration_positions[-1] < script.index(
         "\ndocker compose up -d --force-recreate\n"
     )
+    assert "004 → 005 → 006 → 007 → 008 → 009 → 010 → 011" in script
+    assert "004、005、006、007、008、009、010、011 数据库迁移完成" in script
     assert 'MYSQL_PWD="$DB_MIGRATION_PASSWORD" mysql' in script
     assert '--user="$DB_MIGRATION_USER"' in script
+
+
+def test_image_pull_has_a_timeout_and_noninteractive_local_build_fallback():
+    script = _script()
+
+    assert 'IMAGE_PULL_TIMEOUT_SECONDS "${IMAGE_PULL_TIMEOUT_SECONDS:-300}" 1800' in script
+    assert 'timeout "$IMAGE_PULL_TIMEOUT_SECONDS" docker pull' in script
+    assert "docker compose build wbsysc" in script
+    assert 'read -p "是否本机构建?' not in script
 
 
 def test_deployer_documents_schema_scoped_least_privilege_grants():

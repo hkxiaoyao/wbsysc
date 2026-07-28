@@ -45,10 +45,12 @@ class DeclarativeConnectorProvider:
         *,
         revision_loader: RevisionLoader | None = None,
         client_factory: ClientFactory | None = None,
+        record_store: Any | None = None,
         _allow_test_transport: bool = False,
     ) -> None:
         self._revision_loader = revision_loader or _load_revision
         self._client_factory = client_factory or _production_client
+        self._record_store = record_store
         self._allow_test_transport = _allow_test_transport
 
     @classmethod
@@ -57,10 +59,12 @@ class DeclarativeConnectorProvider:
         *,
         revision_loader: RevisionLoader,
         client_factory: ClientFactory,
+        record_store: Any | None = None,
     ) -> "DeclarativeConnectorProvider":
         return cls(
             revision_loader=revision_loader,
             client_factory=client_factory,
+            record_store=record_store,
             _allow_test_transport=True,
         )
 
@@ -112,9 +116,17 @@ class DeclarativeConnectorProvider:
             if not isinstance(client, SafeHttpClient):
                 raise TypeError("invalid declarative HTTP client")
             connector = (
-                DeclarativeConnector._for_test(revision=revision, client=client)
+                DeclarativeConnector._for_test(
+                    revision=revision,
+                    client=client,
+                    record_store=self._record_store,
+                )
                 if self._allow_test_transport
-                else DeclarativeConnector(revision=revision, client=client)
+                else DeclarativeConnector(
+                    revision=revision,
+                    client=client,
+                    record_store=self._record_store,
+                )
             )
             yield connector
         except DeclarativeProviderUnavailableError:

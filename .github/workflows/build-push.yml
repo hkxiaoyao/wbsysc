@@ -15,6 +15,10 @@ on:
       - 'Dockerfile'
       - 'docker-compose.yml'
       - 'requirements.txt'
+      - 'tests/**'
+      - 'sql/**'
+      - 'deploy/**'
+      - '.github/workflows/build-push.yml'
   workflow_dispatch:   # 支持手动触发
 
 env:
@@ -22,7 +26,48 @@ env:
   IMAGE_NAME: ${{ github.repository }}   # hkxiaoyao/wbsysc
 
 jobs:
+  test:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    env:
+      APP_ENV: dev
+      WECOM_USE_MOCK: 'true'
+      CREDENTIAL_KEY: ''
+      ADMIN_PASSWORD: ''
+      DB_PASSWORD: ''
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+          cache: pip
+
+      - name: Install backend dependencies
+        run: pip install -r requirements.txt
+
+      - name: Run backend tests
+        run: pytest -q
+
+      - name: Set up Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+
+      - name: Install and verify admin UI
+        working-directory: admin-ui
+        run: |
+          corepack enable
+          corepack prepare pnpm@10.34.5 --activate
+          pnpm install --frozen-lockfile
+          node --test src/pages/*.test.js
+          pnpm run build
+
   build-push:
+    needs: test
     runs-on: ubuntu-latest
     permissions:
       contents: read

@@ -7,9 +7,9 @@
 services:
   wbsysc:
     # 拉镜像模式：用 GHCR 推送的镜像
-    # 本机构建模式：注释下面 image 取消注释 build
     image: ghcr.io/hkxiaoyao/wbsysc:latest
-    # build: .
+    # 保留 build context，使部署脚本在 GHCR 超时或不可用时能构建同一标签。
+    build: .
     container_name: wbsysc-gateway
     restart: unless-stopped
     env_file:

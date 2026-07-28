@@ -126,6 +126,11 @@ def _contains_sensitive_value(value: Any, *, depth: int = 0) -> bool:
     return True
 
 
+def contains_sensitive_value(value: Any) -> bool:
+    """Public defense-in-depth check shared by caches and projected storage."""
+    return _contains_sensitive_value(value)
+
+
 def _canonical_arguments(value: Any, *, depth: int = 0) -> Any:
     """Return a JSON-safe args projection, or raise for sensitive/unbounded input."""
     if depth > 8:
@@ -345,7 +350,11 @@ class ConnectionCache:
         except Exception:
             if not existing.done():
                 existing.set_result((_INFLIGHT_FAILED, None))
-            raise CacheLoadError() from None
+            # The caller that owns the load must observe the connector's
+            # original exception.  Only concurrent waiters receive the fixed
+            # cache error above, so cache coalescing cannot change the public
+            # runtime exception contract or leak exception details to peers.
+            raise
         finally:
             async with self._lock:
                 if self._inflight.get(key) is existing:

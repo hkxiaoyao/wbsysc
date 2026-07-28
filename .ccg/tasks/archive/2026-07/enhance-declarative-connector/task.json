@@ -1,0 +1,13 @@
+{
+  "id": "enhance-declarative-connector",
+  "title": "补齐声明式连接器分页、缓存、OAuth 与 stored 模式",
+  "status": "completed",
+  "complexity": "L+",
+  "risk": "high",
+  "domain": "backend",
+  "currentPhase": "completed",
+  "nextAction": "无，任务已归档",
+  "createdAt": "2026-07-26T17:54:00+08:00",
+  "updatedAt": "2026-07-28T16:30:00+08:00",
+  "branch": "main"
+}

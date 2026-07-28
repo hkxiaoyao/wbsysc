@@ -56,6 +56,55 @@
 
 直连模式查询大时间窗口时，会从最新时间分段开始遍历企微列表分页，并为返回的单号逐条请求详情，API 调用成本较高。生产调用建议缩小时间窗口并设置较小的 `limit`。
 
+### 响应缓存
+
+`ToolSpec.cache_ttl_seconds` 现在真正生效：**只读**工具在 TTL 内复用上一次成功结果，
+按 `(connection_id, tool_key, 参数哈希)` 隔离，连接配置提交变更后立即失效。
+写工具、`error` / `partial` 结果、以及含疑似凭证字段的结果一律不缓存。
+
+`direct` 模式是**刻意的缓存旁路**——该模式的语义就是每次都取实时数据，
+因此缓存只作用于 `stored` 和 `hybrid`。
+
+## 🧩 声明式连接器（OpenAPI）
+
+除内置企业微信连接器外，租户可导入 OpenAPI 3 文档生成 `http_declarative` 连接器。
+除既有的多步编排、SSRF 边界和修订版生命周期外，现支持：
+
+**分页**（`x-pagination`，仅 GET 只读操作）：
+
+```yaml
+x-pagination:
+  max_pages: 3            # ≤ 10
+  max_items: 500          # ≤ 1000
+  items_pointer: /items       # 必须是已声明的数组，且被 output 映射投影
+  next_pointer: /next_cursor  # 必须被响应 schema 声明；游标只作控制数据
+  next_query_param: cursor    # 不得与已声明的 query 入参同名
+```
+
+翻页**只替换这一个 query 参数**，host 与 path 固定不变，绝不跟随上游返回的
+任意 next 链接；游标按非法即停止处理。遍历同时受页数、条目数和输出字节数三重上限约束。
+
+**OAuth2 token 缓存**：`client_credentials` token 按连接缓存并复用，
+尊重 `expires_in` 且提前 60 秒过期（未返回则默认 300 秒）。多步工具只换一次 token。
+缓存键含凭证的加盐指纹，轮换密钥即自动失效；上游返回 401 会刷新 token 并**只重试一次**。
+
+**stored 落库**（`x-sync-spec`）：
+
+```yaml
+x-sync-spec:
+  resource_key: people
+  operation_key: people.list
+  items_pointer: /items         # 可选：设了就按数组逐项落库；不设为单记录
+  primary_key_pointer: /id      # items_pointer 存在时相对每一项解析
+  field_mappings: { id: /id, name: /name }
+```
+
+同步结果写入中心库 `declarative_record` 表（`sql/011`），按
+`(connection_id, resource_key, record_key)` 幂等 UPSERT。**只写 `field_mappings`
+投影后的字段**，绝不写入上游原始响应体；主键缺失或非标量的记录会被跳过并计入
+`partial`。`stored` 模式下该同步资源对应的工具从本地表读取，其余工具仍走直连。
+
+
 ## 🚀 快速开始
 
 ### 方式一：Docker（生产推荐，用 CI 构建的镜像）
@@ -74,7 +123,7 @@ curl http://localhost:8001/health        # 同时核对 mcp_service_legacy_enabl
 
 ### 生产升级（先迁移再切换）
 
-推荐执行 `bash deploy/server_deploy.sh`：脚本先校验三个生产密钥，再用独立迁移账户和宿主 `mysql` CLI 严格执行 `004` → `005` → `006` → `007` → `008` → `009` → `010`；任一迁移失败都会在拉取/启动前终止。随后脚本强制以 `MCP_SERVICE_ENABLED=false` 重建并验证健康，仅在原请求值为 `true` 时二次重建启用。启用检查失败会恢复 `false`、重建并验证关闭态后非零退出，且保留迁移数据。
+推荐执行 `bash deploy/server_deploy.sh`：脚本先校验三个生产密钥，再用独立迁移账户和宿主 `mysql` CLI 严格执行 `004` → `005` → `006` → `007` → `008` → `009` → `010` → `011`；任一迁移失败都会在拉取/启动前终止。随后脚本强制以 `MCP_SERVICE_ENABLED=false` 重建并验证健康，仅在原请求值为 `true` 时二次重建启用。启用检查失败会恢复 `false`、重建并验证关闭态后非零退出，且保留迁移数据。
 
 ```bash
 git pull
@@ -83,7 +132,7 @@ read -rsp "DB_MIGRATION_PASSWORD: " DB_MIGRATION_PASSWORD && export DB_MIGRATION
 bash deploy/server_deploy.sh
 ```
 
-需要手动升级时，顺序必须是“备份数据库 → `004` → `005` → `006` → `007` → `008` → `009` → `010` → 关闭态重建/健康检查 → 经批准启用并再次重建”。`008` 依赖 `005` 与 `006`；`009` 让租户身份记录不再要求旧企业微信字段；`010` 将可信域名校验文件迁移到连接实例，同时保留历史文件。密码通过 `MYSQL_PWD` 环境变量传递：
+需要手动升级时，顺序必须是“备份数据库 → `004` → `005` → `006` → `007` → `008` → `009` → `010` → `011` → 关闭态重建/健康检查 → 经批准启用并再次重建”。`008` 依赖 `005` 与 `006`；`009` 让租户身份记录不再要求旧企业微信字段；`010` 将可信域名校验文件迁移到连接实例，同时保留历史文件；`011` 新增 `declarative_record` 中心表，供声明式连接器 `stored` 模式落库（仅存 `field_mappings` 投影字段）。密码通过 `MYSQL_PWD` 环境变量传递：
 
 ```bash
 DB_MIGRATION_HOST=127.0.0.1
@@ -105,6 +154,8 @@ mysql --protocol=TCP --host="$DB_MIGRATION_HOST" --port="$DB_PORT" \
   --user="$DB_MIGRATION_USER" "$DB_NAME" < sql/009_tenant_identity_boundary.sql
 mysql --protocol=TCP --host="$DB_MIGRATION_HOST" --port="$DB_PORT" \
   --user="$DB_MIGRATION_USER" "$DB_NAME" < sql/010_connection_domain_verify.sql
+mysql --protocol=TCP --host="$DB_MIGRATION_HOST" --port="$DB_PORT" \
+  --user="$DB_MIGRATION_USER" "$DB_NAME" < sql/011_declarative_record.sql
 unset MYSQL_PWD
 docker pull ghcr.io/hkxiaoyao/wbsysc:latest
 # 先写 MCP_SERVICE_ENABLED=false，再 docker compose up -d --force-recreate 并核对 health

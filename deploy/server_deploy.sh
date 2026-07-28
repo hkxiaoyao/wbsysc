@@ -288,6 +288,7 @@ echo "✓ .env 生产配置校验通过"
 
 validate_positive_decimal HEALTH_MAX_ATTEMPTS "${HEALTH_MAX_ATTEMPTS:-30}" 60
 validate_positive_decimal HEALTH_RETRY_SECONDS "${HEALTH_RETRY_SECONDS:-2}" 10
+validate_positive_decimal IMAGE_PULL_TIMEOUT_SECONDS "${IMAGE_PULL_TIMEOUT_SECONDS:-300}" 1800
 
 wait_for_health_state() {
   local expected="$1"
@@ -390,6 +391,7 @@ MIGRATIONS=(
   "sql/008_mcp_service.sql"
   "sql/009_tenant_identity_boundary.sql"
   "sql/010_connection_domain_verify.sql"
+  "sql/011_declarative_record.sql"
 )
 for migration in "${MIGRATIONS[@]}"; do
   if [ ! -f "$APP_DIR/$migration" ]; then
@@ -398,7 +400,7 @@ for migration in "${MIGRATIONS[@]}"; do
   fi
 done
 
-echo "使用宿主 mysql CLI 按 004 → 005 → 006 → 007 → 008 → 009 → 010 执行迁移（迁移主机默认 127.0.0.1，可用 DB_MIGRATION_HOST 覆盖）"
+echo "使用宿主 mysql CLI 按 004 → 005 → 006 → 007 → 008 → 009 → 010 → 011 执行迁移（迁移主机默认 127.0.0.1，可用 DB_MIGRATION_HOST 覆盖）"
 for migration in "${MIGRATIONS[@]}"; do
   echo "执行 $migration"
   if ! MYSQL_PWD="$DB_MIGRATION_PASSWORD" mysql --protocol=TCP \
@@ -409,29 +411,22 @@ for migration in "${MIGRATIONS[@]}"; do
   fi
 done
 unset DB_PASSWORD DB_MIGRATION_USER DB_MIGRATION_PASSWORD
-echo "✓ 004、005、006、007、008、009、010 数据库迁移完成"
+echo "✓ 004、005、006、007、008、009、010、011 数据库迁移完成"
 
 echo ""
 echo "===== 5. 拉取镜像（GitHub Actions 已构建推送到 GHCR） ====="
 # 先试拉（GHCR 公开 package 可匿名拉；私有需 docker login）
-if docker pull ghcr.io/hkxiaoyao/wbsysc:latest 2>&1 | tee /tmp/pull.log | tail -3; then
+if timeout "$IMAGE_PULL_TIMEOUT_SECONDS" docker pull ghcr.io/hkxiaoyao/wbsysc:latest 2>&1 | tee /tmp/pull.log | tail -3; then
   echo "✓ 镜像拉取成功"
 else
   if grep -qE "unauthorized|forbidden|denied|not found" /tmp/pull.log; then
-    echo "⚠️  GHCR 镜像不可匿名访问。两种解决："
+    echo "⚠️  GHCR 镜像不可匿名访问，改用当前提交本机构建"
     echo "  方式A(登录私有package): echo \$GHCR_TOKEN | docker login ghcr.io -u hkxiaoyao --password-stdin"
     echo "    普通 package 改公开免登录: GitHub package 页→Package settings→Change visibility→Public"
-    echo "  方式B(本机构建): docker compose build"
-    echo "镜像可能还没构建过(需先 push 触发 GitHub Actions)。"
-    read -p "是否本机构建? [y/N] " yn
-    if [ "$yn" = "y" ] || [ "$yn" = "Y" ]; then
-      docker compose build
-    else
-      exit 1
-    fi
   else
-    docker compose build   # 其他错误兜底本机构建
+    echo "⚠️  GHCR 拉取失败或超过 ${IMAGE_PULL_TIMEOUT_SECONDS}s，改用当前提交本机构建"
   fi
+  docker compose build wbsysc
 fi
 docker images | grep wbsysc | head -2 || true
 

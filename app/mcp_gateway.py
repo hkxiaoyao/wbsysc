@@ -34,6 +34,7 @@ from .connectors import (
     ConnectorRuntime,
 )
 from .connectors.declarative.provider import DeclarativeConnectorProvider
+from .connectors.declarative.token_cache import get_default_token_cache
 from .connectors.runtime import (
     ConnectionConnectorResolver,
     ConnectorAuditEvent,
@@ -305,6 +306,7 @@ class ConnectionMcpGateway:
         self._run_count = 0
         self._invalidation_loop: asyncio.AbstractEventLoop | None = None
         self._store_invalidator: Callable[[str, int], None] | None = None
+        self._token_cache_invalidator: Callable[[str, int], None] | None = None
 
     def _default_runtime(self) -> ConnectorRuntime:
         registry = ConnectorRegistry(
@@ -330,12 +332,24 @@ class ConnectionMcpGateway:
             connection_store.register_connection_cache_invalidator(
                 self._store_invalidator
             )
+            # The OAuth token cache retires synchronously, so it needs no loop
+            # scheduling and stays correct when a commit lands on a worker thread.
+            self._token_cache_invalidator = self._invalidate_cached_oauth_tokens
+            connection_store.register_connection_cache_invalidator(
+                self._token_cache_invalidator
+            )
         self._run_count += 1
         try:
             yield
         finally:
             self._run_count -= 1
             if self._run_count == 0:
+                token_invalidator = self._token_cache_invalidator
+                if token_invalidator is not None:
+                    connection_store.unregister_connection_cache_invalidator(
+                        token_invalidator
+                    )
+                self._token_cache_invalidator = None
                 invalidator = self._store_invalidator
                 if invalidator is not None:
                     connection_store.unregister_connection_cache_invalidator(invalidator)
@@ -346,6 +360,20 @@ class ConnectionMcpGateway:
                 self._manager_lock = None
                 self._invalidation_loop = None
                 self._store_invalidator = None
+
+    @staticmethod
+    def _invalidate_cached_oauth_tokens(
+        connection_id: str,
+        _config_version: int,
+    ) -> None:
+        """Drop declarative OAuth tokens after any committed connection change."""
+        try:
+            get_default_token_cache().invalidate_connection(connection_id)
+        except Exception as exc:
+            logger.warning(
+                "OAuth token cache invalidation failed type=%s",
+                type(exc).__name__,
+            )
 
     def _invalidate_after_connection_mutation(
         self,
@@ -401,6 +429,18 @@ class ConnectionMcpGateway:
         lock = self._manager_lock
         if lock is None:
             return False
+        # Cached reads outlive the session entry, so retire them too: a
+        # credential, policy, or revision change must not keep serving data
+        # produced under the previous configuration.
+        invalidate = getattr(self._runtime, "invalidate_cached_data", None)
+        if callable(invalidate):
+            try:
+                await invalidate(connection_id)
+            except Exception as exc:
+                logger.warning(
+                    "Connection data cache invalidation failed type=%s",
+                    type(exc).__name__,
+                )
         async with lock:
             entry = self._entries.pop(key, None)
             return entry is not None

@@ -731,12 +731,18 @@ class AuthScheme:
 
 @dataclass(frozen=True)
 class SyncSpec:
-    """The minimum declaration necessary to permit persistent stored mode."""
+    """The minimum declaration necessary to permit persistent stored mode.
+
+    When ``items_pointer`` is set the response carries a list and every other
+    pointer is read relative to one element of it.  Without it the operation
+    yields a single record, which is the original single-document contract.
+    """
 
     resource_key: str
     primary_key_pointer: str
     field_mappings: Mapping[str, str]
     operation_key: str = ""
+    items_pointer: str = ""
 
     def __post_init__(self) -> None:
         _identifier("resource key", self.resource_key)
@@ -748,6 +754,8 @@ class SyncSpec:
             _identifier("sync field", field_name)
             _pointer_tokens(pointer)
         _identifier("sync operation key", self.operation_key)
+        if self.items_pointer:
+            _pointer_tokens(self.items_pointer)
         object.__setattr__(self, "field_mappings", mappings)
 
 
@@ -930,7 +938,27 @@ class DeclarativeOperation:
         ):
             raise SpecValidationError("invalid cache TTL")
         if self.pagination is not None:
-            raise SpecValidationError("pagination is not supported")
+            if not isinstance(self.pagination, PaginationPolicy):
+                raise SpecValidationError("invalid pagination declaration")
+            # Traversing a write would repeat a side effect once per page.
+            if self.operation_kind != "read" or self.method != "GET":
+                raise SpecValidationError("pagination requires a read GET operation")
+            if self.pagination.max_pages > 1:
+                if all(
+                    mapping.pointer != self.pagination.items_pointer
+                    for mapping in outputs
+                ):
+                    raise SpecValidationError(
+                        "pagination items pointer requires an output mapping"
+                    )
+                if any(
+                    mapping.location == "query"
+                    and mapping.target == self.pagination.next_query_param
+                    for mapping in inputs
+                ):
+                    raise SpecValidationError(
+                        "pagination cursor parameter conflicts with a declared input"
+                    )
         if any(not isinstance(mapping, InputMapping) for mapping in inputs) or any(
             not isinstance(mapping, OutputMapping) for mapping in outputs
         ):
@@ -961,6 +989,17 @@ class DeclarativeOperation:
             "properties": {mapping.name: {} for mapping in self.output_mappings},
             "additionalProperties": False,
         }
+
+    @property
+    def pagination_items_field(self) -> str:
+        """Name of the projected output field the cursor traversal accumulates."""
+        pagination = self.pagination
+        if pagination is None:
+            return ""
+        for mapping in self.output_mappings:
+            if mapping.pointer == pagination.items_pointer:
+                return mapping.name
+        return ""
 
     def build_request(self, args: Mapping[str, Any]) -> dict[str, Any]:
         if not isinstance(args, Mapping):
@@ -1149,13 +1188,20 @@ class DeclarativeRevision:
             declared_pointers = {
                 mapping.pointer for mapping in sync_operation.output_mappings
             }
-            if self.sync_spec.primary_key_pointer not in declared_pointers:
-                raise SpecValidationError("sync primary key is not declared")
-            if any(
-                pointer not in declared_pointers
-                for pointer in self.sync_spec.field_mappings.values()
-            ):
-                raise SpecValidationError("sync field mapping is not declared")
+            if self.sync_spec.items_pointer:
+                # List sync: the array itself must be projected, and the record
+                # pointers address one element, so they cannot be matched
+                # against the operation's document-level output mappings.
+                if self.sync_spec.items_pointer not in declared_pointers:
+                    raise SpecValidationError("sync items pointer is not declared")
+            else:
+                if self.sync_spec.primary_key_pointer not in declared_pointers:
+                    raise SpecValidationError("sync primary key is not declared")
+                if any(
+                    pointer not in declared_pointers
+                    for pointer in self.sync_spec.field_mappings.values()
+                ):
+                    raise SpecValidationError("sync field mapping is not declared")
         object.__setattr__(self, "allowed_hosts", hosts)
         object.__setattr__(self, "operations", operations)
         object.__setattr__(self, "tools", tools)
@@ -1358,6 +1404,7 @@ class DeclarativeRevision:
                 "primary_key_pointer": self.sync_spec.primary_key_pointer,
                 "field_mappings": _plain_json_value(self.sync_spec.field_mappings),
                 "operation_key": self.sync_spec.operation_key,
+                "items_pointer": self.sync_spec.items_pointer,
             }
         )
         document = {
@@ -1470,6 +1517,7 @@ class DeclarativeRevision:
                         "primary_key_pointer",
                         "field_mappings",
                         "operation_key",
+                        "items_pointer",
                     }
                 ),
             )
@@ -1481,6 +1529,7 @@ class DeclarativeRevision:
                 primary_key_pointer=sync["primary_key_pointer"],
                 field_mappings=sync["field_mappings"],
                 operation_key=sync["operation_key"],
+                items_pointer=sync["items_pointer"],
             )
 
         operations: list[DeclarativeOperation] = []

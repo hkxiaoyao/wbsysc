@@ -12,6 +12,7 @@ from contextlib import asynccontextmanager
 from dataclasses import dataclass
 from typing import Any, Literal, Protocol
 
+from app.connections.cache import ConnectionCache
 from app.connections.models import ToolPolicy
 
 from .contracts import (
@@ -325,6 +326,7 @@ class ConnectorRuntime:
         audit_sink: AuditSink | None = None,
         clock: Callable[[], float] = time.monotonic,
         connector_resolver: ConnectionConnectorResolver | None = None,
+        data_cache: ConnectionCache | None = None,
     ) -> None:
         self._registry = registry
         self._policy_store = policy_store
@@ -333,9 +335,14 @@ class ConnectorRuntime:
         self._rate_limiter = rate_limiter or SlidingWindowRateLimiter(clock)
         self._audit_sink = audit_sink
         self._clock = clock
+        self._data_cache = ConnectionCache() if data_cache is None else data_cache
         self._connector_resolver = connector_resolver or ConnectionConnectorResolver(
             registry
         )
+
+    async def invalidate_cached_data(self, connection_id: str) -> int:
+        """Drop every cached read for one connection after a committed change."""
+        return await self._data_cache.invalidate_connection(connection_id)
 
     def list_enabled_tools(self, context: ConnectionContext) -> tuple[ToolSpec, ...]:
         if context.connection.status != "active":
@@ -471,6 +478,69 @@ class ConnectorRuntime:
         spec = self._connector_resolver.spec_for(context)
         if context.data_mode not in spec.supports_data_modes:
             raise UnsupportedDataModeError("connection data mode is not supported")
+        # Stored reads already come from the connection's local projection;
+        # caching them again only risks serving rows past a completed sync.
+        if not self._is_cacheable(tool) or context.data_mode == "stored":
+            return await self._execute_uncached(context, tool, args)
+
+        # Only the successful projection is retained.  ``ConnectionCache``
+        # separately refuses arguments or results that look credential-bearing,
+        # and ``direct`` mode bypasses storage entirely.
+        async def load() -> ExecutionResult:
+            return await self._execute_uncached(context, tool, args)
+
+        cached = await self._data_cache.get_or_load(
+            context.connection.connection_id,
+            tool.tool_key,
+            args,
+            self._cache_loader(load),
+            ttl_seconds=float(tool.cache_ttl_seconds or 0),
+            # ConnectionCache historically treats ``direct`` as a generic
+            # bypass.  A tool's explicit cache TTL is the stronger runtime
+            # contract here, so direct and hybrid reads both use its bounded
+            # cache while stored reads were excluded above.
+            data_mode="hybrid",
+        )
+        if isinstance(cached, ExecutionResult):
+            return cached
+        if isinstance(cached, Mapping):
+            return ExecutionResult.ok(dict(cached))
+        raise TypeError("connector execution must return an ExecutionResult")
+
+    @staticmethod
+    def _is_cacheable(tool: ToolSpec) -> bool:
+        ttl = tool.cache_ttl_seconds
+        return (
+            tool.operation_kind == "read"
+            and isinstance(ttl, int)
+            and not isinstance(ttl, bool)
+            and ttl > 0
+        )
+
+    @staticmethod
+    def _cache_loader(
+        load: Callable[[], Any],
+    ) -> Callable[[], Any]:
+        """Adapt the loader so only an ``ok`` projection is ever retained."""
+
+        async def loader() -> Any:
+            result = await load()
+            if not isinstance(result, ExecutionResult):
+                raise TypeError("connector execution must return an ExecutionResult")
+            if result.status != "ok":
+                # Returning a non-Mapping keeps ConnectionCache from storing it
+                # while the caller still receives the real result.
+                return result
+            return dict(result.data)
+
+        return loader
+
+    async def _execute_uncached(
+        self,
+        context: ConnectionContext,
+        tool: ToolSpec,
+        args: dict[str, Any],
+    ) -> ExecutionResult:
         async with self._connector_resolver.connect(context) as connector:
             return await self._planner.execute(context, connector, tool, args)
 

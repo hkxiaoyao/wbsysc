@@ -22,6 +22,7 @@ from .models import (
     MAX_DOCUMENT_BYTES,
     MAX_MAPPING_DEPTH,
     MAX_OPERATION_COUNT,
+    MAX_PAGE_LIMIT,
     MAX_TOOL_STEPS,
     AuthScheme,
     DeclarativeOperation,
@@ -30,6 +31,7 @@ from .models import (
     DeclarativeTool,
     InputMapping,
     OutputMapping,
+    PaginationPolicy,
     SpecValidationError,
     SyncSpec,
     ValueRef,
@@ -363,9 +365,13 @@ def _simple_schema(
         if key in value:
             result[key] = value[key]
     if schema_type == "array":
+        # A scalar parameter never reaches this branch: an array-typed
+        # parameter is already rejected above with allow_object=False.  Only
+        # response and request-body schemas recurse here, where a list of
+        # objects is ordinary and stays bounded by MAX_MAPPING_DEPTH.
         result["items"] = _simple_schema(
             value.get("items"),
-            allow_object=False,
+            allow_object=allow_object,
             require_closed_object=require_closed_object,
             depth=depth + 1,
         )
@@ -594,14 +600,74 @@ def _output_mappings(operation: Mapping[str, Any]) -> tuple[OutputMapping, ...]:
     return tuple(mappings)
 
 
+_PAGINATION_KEYS = frozenset(
+    {"max_pages", "max_items", "items_pointer", "next_pointer", "next_query_param"}
+)
+
+
+def _schema_node_at_pointer(
+    schema: Mapping[str, Any], pointer: str
+) -> Mapping[str, Any] | None:
+    """Resolve a JSON pointer to its declared schema node, or ``None``."""
+    if not isinstance(pointer, str) or not pointer.startswith("/"):
+        return None
+    current: Mapping[str, Any] = schema
+    for token in pointer[1:].split("/"):
+        token = token.replace("~1", "/").replace("~0", "~")
+        if not isinstance(current, Mapping):
+            return None
+        if current.get("type") == "object":
+            properties = current.get("properties")
+            if not isinstance(properties, Mapping) or token not in properties:
+                return None
+            child = properties[token]
+        elif current.get("type") == "array" and token.isdigit():
+            child = current.get("items")
+        else:
+            return None
+        if not isinstance(child, Mapping):
+            return None
+        current = child
+    return current
+
+
 def _pagination(
     operation: Mapping[str, Any],
     _input_mappings: tuple[InputMapping, ...],
-) -> None:
+) -> PaginationPolicy | None:
+    """Compile the declared cursor protocol; unpaginated when absent.
+
+    Only a closed set of keys is accepted.  The cursor is followed by
+    substituting one predeclared query parameter, never by trusting an
+    upstream link, so the host and path stay fixed across pages.
+    """
     raw = operation.get("x-pagination")
     if raw is None:
         return None
-    raise SpecValidationError("pagination is not supported")
+    if not isinstance(raw, Mapping):
+        raise SpecValidationError("invalid pagination declaration")
+    unknown = set(raw) - _PAGINATION_KEYS
+    if unknown:
+        raise SpecValidationError("unsupported pagination declaration")
+    policy = PaginationPolicy(
+        max_pages=raw.get("max_pages", 1),
+        max_items=raw.get("max_items", MAX_PAGE_LIMIT),
+        items_pointer=raw.get("items_pointer", ""),
+        next_pointer=raw.get("next_pointer", ""),
+        next_query_param=raw.get("next_query_param", ""),
+    )
+    if policy.max_pages > 1:
+        schema = _response_schema(operation)
+        items_node = _schema_node_at_pointer(schema, policy.items_pointer)
+        if items_node is None or items_node.get("type") != "array":
+            raise SpecValidationError(
+                "pagination items pointer must address a declared array"
+            )
+        if _schema_node_at_pointer(schema, policy.next_pointer) is None:
+            raise SpecValidationError(
+                "pagination cursor pointer is not declared by the response schema"
+            )
+    return policy
 
 
 def _operation_auth(document: Mapping[str, Any], operation: Mapping[str, Any]) -> AuthScheme | None:
@@ -663,6 +729,7 @@ def _sync_spec(value: Any) -> SyncSpec | None:
         primary_key_pointer=value.get("primary_key_pointer", value.get("primary_key")),
         field_mappings=value.get("field_mappings", value.get("fields")),
         operation_key=value.get("operation_key", ""),
+        items_pointer=value.get("items_pointer", ""),
     )
 
 
