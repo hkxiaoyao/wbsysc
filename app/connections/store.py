@@ -13,7 +13,7 @@ from typing import Any, Mapping
 from sqlalchemy import text
 
 from .cache import contains_sensitive_value
-from .crypto import encrypt_credential, token_hmac
+from .crypto import decrypt_token, encrypt_credential, encrypt_token, token_hmac
 from .models import (
     ConnectionRecord,
     IssuedToken,
@@ -46,6 +46,10 @@ class ConnectionAliasConflictError(RuntimeError):
 
 class DeclarativeRevisionInUseError(RuntimeError):
     """A published declarative revision is still used by runtime state."""
+
+
+class TokenUnavailableError(LookupError):
+    """A connection token cannot be revealed through the requested path."""
 
 
 def _validate_connection_id(connection_id: str) -> None:
@@ -94,6 +98,7 @@ _CONNECTION_DDLS = (
       `token_id` VARCHAR(64) NOT NULL,
       `connection_id` VARCHAR(64) NOT NULL,
       `token_hmac` CHAR(64) NOT NULL,
+      `encrypted_token` VARBINARY(4096) NULL,
       `token_prefix` VARCHAR(32) NOT NULL,
       `token_label` VARCHAR(128) NOT NULL DEFAULT '',
       `expires_at` DATETIME NULL,
@@ -307,6 +312,7 @@ def ensure_connection_tables() -> None:
         for ddl in _CONNECTION_DDLS:
             conn.execute(text(ddl))
         _migrate_connection_alias(conn)
+        _migrate_connection_token_reveal(conn)
         _migrate_declarative_tenant_identity(conn)
 
 
@@ -380,6 +386,23 @@ def _migrate_connection_alias(conn: Any) -> None:
             ALTER TABLE connection_instance
             ADD UNIQUE KEY `uk_connection_instance_tenant_alias`
               (`tenant_id`, `connection_alias`)
+        """))
+
+
+def _migrate_connection_token_reveal(conn: Any) -> None:
+    """Idempotently add reversible-token storage on MySQL 5.7."""
+    token_column = conn.execute(
+        text("""
+            SELECT COUNT(*) FROM information_schema.COLUMNS
+            WHERE TABLE_SCHEMA=DATABASE()
+              AND TABLE_NAME='connection_token'
+              AND COLUMN_NAME='encrypted_token'
+        """)
+    ).scalar()
+    if not token_column:
+        conn.execute(text("""
+            ALTER TABLE connection_token
+            ADD COLUMN `encrypted_token` VARBINARY(4096) NULL AFTER `token_hmac`
         """))
 
 
@@ -1488,6 +1511,7 @@ def issue_token(
     else:
         token_value = raw_value
     digest = token_hmac(token_value)
+    ciphertext = encrypt_token(token_value)
     issued = IssuedToken(
         token_id=str(uuid.uuid4()),
         raw_value=token_value,
@@ -1521,15 +1545,19 @@ def issue_token(
         conn.execute(
             text("""
                 INSERT INTO connection_token
-                    (token_id, connection_id, token_hmac, token_prefix, token_label)
-                VALUES (:token_id, :connection_id, :token_hmac, :token_prefix, :token_label)
+                    (token_id, connection_id, token_hmac, encrypted_token,
+                     token_prefix, token_label)
+                VALUES (:token_id, :connection_id, :token_hmac, :encrypted_token,
+                        :token_prefix, :token_label)
                 ON DUPLICATE KEY UPDATE
+                    encrypted_token=VALUES(encrypted_token),
                     token_prefix=VALUES(token_prefix), token_label=VALUES(token_label)
             """),
             {
                 "token_id": issued.token_id,
                 "connection_id": connection_id,
                 "token_hmac": digest,
+                "encrypted_token": ciphertext,
                 "token_prefix": issued.prefix,
                 "token_label": label,
             },
@@ -1549,6 +1577,7 @@ def create_connection_with_token(
     record = _materialize_connection_alias(record)
     raw_value = f"mcp_{secrets.token_urlsafe(32)}"
     digest = token_hmac(raw_value)
+    ciphertext = encrypt_token(raw_value)
     issued = IssuedToken(str(uuid.uuid4()), raw_value, digest[:12])
     with _engine().begin() as conn:
         _lock_live_tenant(conn, record.tenant_id)
@@ -1592,13 +1621,15 @@ def create_connection_with_token(
         conn.execute(
             text("""
                 INSERT INTO connection_token
-                    (token_id, connection_id, token_hmac, token_prefix)
-                VALUES (:token_id, :connection_id, :token_hmac, :token_prefix)
+                    (token_id, connection_id, token_hmac, encrypted_token, token_prefix)
+                VALUES (:token_id, :connection_id, :token_hmac, :encrypted_token,
+                        :token_prefix)
             """),
             {
                 "token_id": issued.token_id,
                 "connection_id": record.connection_id,
                 "token_hmac": digest,
+                "encrypted_token": ciphertext,
                 "token_prefix": issued.prefix,
             },
         )
@@ -1793,11 +1824,15 @@ def replace_credentials(
 
 
 def list_connection_tokens(connection_id: str) -> list[dict[str, Any]]:
-    """Return non-sensitive token metadata; the digest is intentionally not selected."""
+    """Return metadata only; token digests, ciphertext, and plaintext stay private."""
     with _engine().connect() as conn:
         rows = conn.execute(
             text("""
-                SELECT token_id, token_prefix, token_label, expires_at, revoked_at, created_at
+                SELECT token_id, token_prefix, token_label, expires_at, revoked_at, created_at,
+                       CASE WHEN encrypted_token IS NOT NULL
+                                  AND revoked_at IS NULL
+                                  AND (expires_at IS NULL OR expires_at > UTC_TIMESTAMP())
+                            THEN 1 ELSE 0 END AS revealable
                 FROM connection_token WHERE connection_id=:connection_id
                 ORDER BY created_at DESC, token_id
             """),
@@ -1813,8 +1848,44 @@ def list_connection_tokens(connection_id: str) -> list[dict[str, Any]]:
             "expires_at": str(values["expires_at"]) if values.get("expires_at") else None,
             "revoked": values.get("revoked_at") is not None,
             "created_at": str(values["created_at"]) if values.get("created_at") else None,
+            "revealable": bool(values.get("revealable")),
         })
     return result
+
+
+def reveal_connection_token(connection_id: str, tenant_id: str, token_id: str) -> str:
+    """Reveal one current token only to the tenant that owns its connection."""
+    if not connection_id or not tenant_id or not token_id:
+        raise ValueError("connection_id, tenant_id, and token_id are required")
+    with _engine().connect() as conn:
+        row = conn.execute(
+            text("""
+                SELECT t.encrypted_token
+                FROM connection_token t
+                JOIN connection_instance c ON c.connection_id=t.connection_id
+                WHERE t.token_id=:token_id AND t.connection_id=:connection_id
+                  AND c.tenant_id=:tenant_id
+                  AND t.revoked_at IS NULL
+                  AND (t.expires_at IS NULL OR t.expires_at > UTC_TIMESTAMP())
+                  AND t.encrypted_token IS NOT NULL
+                LIMIT 1
+            """),
+            {
+                "token_id": token_id,
+                "connection_id": connection_id,
+                "tenant_id": tenant_id,
+            },
+        ).fetchone()
+    if row is None:
+        raise TokenUnavailableError("connection token is unavailable")
+    values = _row_values(row)
+    ciphertext = values.get("encrypted_token")
+    if not isinstance(ciphertext, bytes) or not ciphertext:
+        raise TokenUnavailableError("connection token is unavailable")
+    try:
+        return decrypt_token(ciphertext)
+    except Exception as exc:
+        raise TokenUnavailableError("connection token is unavailable") from exc
 
 
 def revoke_token(connection_id: str, tenant_id: str, token_id: str) -> bool:
@@ -1827,7 +1898,7 @@ def revoke_token(connection_id: str, tenant_id: str, token_id: str) -> bool:
             text("""
                 UPDATE connection_token t JOIN connection_instance c
                   ON c.connection_id=t.connection_id
-                SET t.revoked_at=UTC_TIMESTAMP()
+                SET t.revoked_at=UTC_TIMESTAMP(), t.encrypted_token=NULL
                 WHERE t.connection_id=:connection_id AND t.token_id=:token_id
                   AND c.tenant_id=:tenant_id AND t.revoked_at IS NULL
             """),
@@ -1845,6 +1916,7 @@ def rotate_token(
     """Atomically revoke current tokens and issue one replacement."""
     raw_value = f"mcp_{secrets.token_urlsafe(32)}"
     digest = token_hmac(raw_value)
+    ciphertext = encrypt_token(raw_value)
     issued = IssuedToken(str(uuid.uuid4()), raw_value, digest[:12])
     retired_version: int | None = None
     with _engine().begin() as conn:
@@ -1859,16 +1931,24 @@ def rotate_token(
         if owner != tenant_id:
             return None
         conn.execute(
-            text("UPDATE connection_token SET revoked_at=UTC_TIMESTAMP() WHERE connection_id=:connection_id AND revoked_at IS NULL"),
+            text("""
+                UPDATE connection_token
+                SET revoked_at=UTC_TIMESTAMP(), encrypted_token=NULL
+                WHERE connection_id=:connection_id AND revoked_at IS NULL
+            """),
             {"connection_id": connection_id},
         )
         conn.execute(
             text("""
                 INSERT INTO connection_token
-                    (token_id, connection_id, token_hmac, token_prefix, token_label)
-                VALUES (:token_id, :connection_id, :token_hmac, :token_prefix, :token_label)
+                    (token_id, connection_id, token_hmac, encrypted_token,
+                     token_prefix, token_label)
+                VALUES (:token_id, :connection_id, :token_hmac, :encrypted_token,
+                        :token_prefix, :token_label)
             """),
-            {"token_id": issued.token_id, "connection_id": connection_id, "token_hmac": digest, "token_prefix": issued.prefix, "token_label": label},
+            {"token_id": issued.token_id, "connection_id": connection_id,
+             "token_hmac": digest, "encrypted_token": ciphertext,
+             "token_prefix": issued.prefix, "token_label": label},
         )
     _notify_connection_cache_invalidator(connection_id, retired_version)
     return issued
@@ -2084,6 +2164,7 @@ def _backfill_legacy_tenant(values: Mapping[str, Any]) -> bool:
             raw_token = values.get("mcp_token")
             if raw_token:
                 digest = token_hmac(raw_token)
+                ciphertext = encrypt_token(raw_token)
                 existing_connection_id = _token_owner_connection_id(conn, digest)
                 if (
                     existing_connection_id is not None
@@ -2095,10 +2176,12 @@ def _backfill_legacy_tenant(values: Mapping[str, Any]) -> bool:
                 conn.execute(
                     text("""
                         INSERT INTO connection_token
-                            (token_id, connection_id, token_hmac, token_prefix, token_label)
-                        VALUES (:token_id, :connection_id, :token_hmac, :token_prefix,
-                                :token_label)
+                            (token_id, connection_id, token_hmac, encrypted_token,
+                             token_prefix, token_label)
+                        VALUES (:token_id, :connection_id, :token_hmac,
+                                :encrypted_token, :token_prefix, :token_label)
                         ON DUPLICATE KEY UPDATE
+                            encrypted_token=VALUES(encrypted_token),
                             token_prefix=VALUES(token_prefix),
                             token_label=VALUES(token_label)
                     """),
@@ -2111,6 +2194,7 @@ def _backfill_legacy_tenant(values: Mapping[str, Any]) -> bool:
                         ),
                         "connection_id": connection_id,
                         "token_hmac": digest,
+                        "encrypted_token": ciphertext,
                         "token_prefix": digest[:12],
                         "token_label": "legacy tenant_config token",
                     },

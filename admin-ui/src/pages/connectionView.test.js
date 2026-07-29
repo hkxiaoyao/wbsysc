@@ -25,6 +25,7 @@ import {
   safeServerError,
   serializeConnectionLocation,
   setExplicitToolPolicy,
+  tokenCopyStatus,
   tryCopyText,
   wecomConfigFormValues,
   wizardRevisionIdentity,
@@ -139,10 +140,26 @@ test('copyConnectionMcpConfig copies the exact config returned for fallback disp
   assert.equal(JSON.parse(result.config).mcpServers['conn-a'].headers.Authorization, 'Bearer mcp_once')
 })
 
-test('connection token tab keeps a fixed non-rotating one-click MCP config action', () => {
+test('connection token tab reveals a persisted token before copying its MCP config', () => {
   const source = readFileSync(new URL('./Connections.jsx', import.meta.url), 'utf8')
-  assert.match(source, /一键生成并复制 MCP 配置/)
-  assert.match(source, /issueToken\(false, true\)/)
+  assert.match(source, /tokens\/\$\{encodeURIComponent\(token\.token_id\)\}\/reveal/)
+  assert.match(source, /copyConnectionMcpConfig/)
+  assert.match(source, /复制 MCP 配置/)
+  assert.match(source, /历史 Token 不可复制，请重新签发/)
+})
+
+test('token copy status distinguishes revealable, historical, and revoked tokens', () => {
+  assert.equal(tokenCopyStatus({ revealable: true, revoked_at: null }), 'revealable')
+  assert.equal(tokenCopyStatus({ revealable: false, revoked_at: null }), 'historical')
+  assert.equal(tokenCopyStatus({ revealable: true, revoked_at: '2026-07-01T00:00:00Z' }), 'revoked')
+  assert.equal(tokenCopyStatus({ revealable: true, status: 'revoked' }), 'revoked')
+})
+
+test('token modal copy explains persisted MCP config access while retaining the raw token', () => {
+  const source = readFileSync(new URL('./Connections.jsx', import.meta.url), 'utf8')
+  assert.match(source, /新 Token 可随时复制 MCP 配置/)
+  assert.doesNotMatch(source, /关闭后无法再次查看此 Token/)
+  assert.match(source, /tokenModal\.rawToken/)
 })
 
 test('token display state is cleared after the one-time modal closes', () => {

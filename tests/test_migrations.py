@@ -427,6 +427,19 @@ def test_declarative_record_migration_is_connection_scoped_and_idempotent():
     assert "alter table" not in lower
 
 
+def test_connection_token_reveal_migration_is_mysql57_idempotent():
+    sql = (ROOT / "sql" / "012_connection_token_reveal.sql").read_text(
+        encoding="utf-8"
+    )
+    lower = " ".join(sql.lower().split())
+
+    assert "information_schema.columns" in lower
+    assert "column_name = 'encrypted_token'" in lower
+    assert "add column `encrypted_token` varbinary(4096) null" in lower
+    assert "call `migrate_connection_token_reveal`()" in lower
+    assert "add column if not exists" not in lower
+
+
 def test_legacy_mcp_service_inventory_is_read_only_and_finds_cross_connection_rows():
     sql = (ROOT / "sql" / "audit_legacy_mcp_services.sql").read_text(
         encoding="utf-8"

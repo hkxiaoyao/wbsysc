@@ -461,6 +461,119 @@ def test_list_and_detail_never_return_raw_tokens_or_secret_config(monkeypatch):
     assert detail["tokens"] == [{"token_id": "t1", "prefix": "abc123", "label": "cli"}]
 
 
+def test_admin_connection_token_reveal_is_no_store_and_audited(monkeypatch):
+    client = _client(monkeypatch)
+    events = []
+    calls = []
+    monkeypatch.setattr(
+        admin_connections.store,
+        "get_connection",
+        lambda connection_id, tenant_id=None: _record()
+        if connection_id == "conn-a"
+        and (tenant_id is None or tenant_id == "tenant-a")
+        else None,
+    )
+    monkeypatch.setattr(
+        admin_connections.store,
+        "reveal_connection_token",
+        lambda connection_id, tenant_id, token_id: calls.append(
+            (connection_id, tenant_id, token_id)
+        )
+        or "mcp_revealed_once",
+    )
+    monkeypatch.setattr(admin_connections, "write_event", lambda event: events.append(event) or True)
+    admin_connections.reset_reveal_limiter()
+
+    scoped = client.post(
+        "/admin/tenants/tenant-a/connections/conn-a/tokens/token-a/reveal",
+        headers={"Origin": "http://testserver"},
+    )
+    global_response = client.post(
+        "/admin/connections/conn-a/tokens/token-a/reveal",
+        headers={"Origin": "http://testserver"},
+    )
+
+    assert scoped.status_code == global_response.status_code == 200
+    assert scoped.json() == global_response.json() == {"token": "mcp_revealed_once"}
+    assert scoped.headers["cache-control"] == "no-store"
+    assert global_response.headers["cache-control"] == "no-store"
+    assert calls == [("conn-a", "tenant-a", "token-a")] * 2
+    assert [event.event_name for event in events] == ["connection_token_reveal"] * 2
+    assert all("mcp_revealed_once" not in repr(event) for event in events)
+
+
+def test_admin_connection_token_reveal_rate_limit_is_no_store_and_audited(
+    monkeypatch,
+):
+    client = _client(monkeypatch)
+    events = []
+    monkeypatch.setattr(
+        admin_connections.store,
+        "get_connection",
+        lambda connection_id, tenant_id=None: _record(),
+    )
+    monkeypatch.setattr(
+        admin_connections.store,
+        "reveal_connection_token",
+        lambda *_args: "mcp_rate_limited",
+    )
+    monkeypatch.setattr(
+        admin_connections,
+        "write_event",
+        lambda event: events.append(event) or True,
+    )
+    monkeypatch.setattr(
+        admin_connections,
+        "_reveal_limiter",
+        admin_connections.RevealLimiter(limit=2, window_seconds=60),
+    )
+
+    responses = [
+        client.post(
+            "/admin/connections/conn-a/tokens/token-a/reveal",
+            headers={"Origin": "http://testserver"},
+        )
+        for _ in range(3)
+    ]
+
+    assert [response.status_code for response in responses] == [200, 200, 429]
+    assert responses[-1].headers["cache-control"] == "no-store"
+    assert responses[-1].json() == {"detail": "request rate limit exceeded"}
+    assert [event.result_status for event in events] == ["ok", "ok", "denied"]
+    assert "mcp_rate_limited" not in repr(events)
+
+
+@pytest.mark.parametrize("audit_behavior", ["false", "throw"])
+def test_admin_connection_token_reveal_requires_accepted_success_audit(
+    monkeypatch, audit_behavior
+):
+    client = _client(monkeypatch)
+    monkeypatch.setattr(admin_connections.store, "get_connection", lambda *args: _record())
+    monkeypatch.setattr(
+        admin_connections.store,
+        "reveal_connection_token",
+        lambda *_args: "mcp_must_not_escape",
+    )
+
+    def audit(_event):
+        if audit_behavior == "throw":
+            raise RuntimeError("audit unavailable with mcp_must_not_escape")
+        return False
+
+    monkeypatch.setattr(admin_connections, "write_event", audit)
+    admin_connections.reset_reveal_limiter()
+
+    response = client.post(
+        "/admin/connections/conn-a/tokens/token-a/reveal",
+        headers={"Origin": "http://testserver"},
+    )
+
+    assert response.status_code == 500
+    assert response.headers["cache-control"] == "no-store"
+    assert response.json() == {"detail": "connection operation failed"}
+    assert "mcp_must_not_escape" not in response.text
+
+
 def test_admin_connection_list_and_detail_project_authoritative_alias(monkeypatch):
     client = _client(monkeypatch)
     record = _record(connection_alias="renamed_admin_alias")

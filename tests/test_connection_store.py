@@ -1,19 +1,22 @@
 from dataclasses import FrozenInstanceError
 import json
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 
 from app import db
+from app.connections import crypto
 from app.connections import store
 from app.connectors.declarative.validator import import_openapi_revision
 
 
 class Result:
-    def __init__(self, row=None, rows=(), scalar_value=None):
+    def __init__(self, row=None, rows=(), scalar_value=None, rowcount=1):
         self.row = row
         self.rows = list(rows)
         self.scalar_value = scalar_value
+        self.rowcount = rowcount
 
     def fetchone(self):
         return self.row
@@ -82,6 +85,12 @@ class FakeEngine:
 
     def connect(self):
         return self.connection
+
+
+@pytest.fixture(autouse=True)
+def stub_connection_token_encryption(monkeypatch):
+    """Keep store tests independent of deployment-only plaintext-key settings."""
+    monkeypatch.setattr(store, "encrypt_token", lambda _value: b"ciphertext")
 
 
 class LockedMutationConnection(FakeConnection):
@@ -732,6 +741,158 @@ def test_token_row_never_contains_raw_value(monkeypatch):
     assert params["token_hmac"] != "token-a"
 
 
+def test_connection_token_cipher_uses_the_management_plaintext_key(monkeypatch):
+    monkeypatch.setattr(
+        crypto,
+        "get_settings",
+        lambda: SimpleNamespace(mcp_token_plaintext_key="test-plaintext-key"),
+    )
+    crypto._fernet.cache_clear()
+    try:
+        ciphertext = crypto.encrypt_token("token-a")
+        assert ciphertext != b"token-a"
+        assert crypto.decrypt_token(ciphertext) == "token-a"
+    finally:
+        crypto._fernet.cache_clear()
+
+
+def test_connection_token_writes_store_only_ciphertext_for_reveal(monkeypatch):
+    fake_connection = FakeConnection()
+    monkeypatch.setattr(db, "get_engine", lambda: FakeEngine(fake_connection))
+    monkeypatch.setattr(store, "token_hmac", lambda _value: "a" * 64)
+    monkeypatch.setattr(store, "encrypt_token", lambda _value: b"ciphertext")
+
+    store.issue_token("conn-a", "token-a")
+    store.rotate_token("conn-a", "tenant-a")
+
+    inserts = [
+        (sql, params)
+        for sql, params in fake_connection.statements
+        if "INSERT INTO connection_token" in sql
+    ]
+    assert len(inserts) == 2
+    assert all("encrypted_token" in sql for sql, _ in inserts)
+    assert all(params["encrypted_token"] == b"ciphertext" for _, params in inserts)
+    assert all("token-a" not in repr(params) for _, params in inserts)
+
+
+def test_revoke_and_rotation_discard_connection_token_ciphertext(monkeypatch):
+    fake_connection = FakeConnection()
+    monkeypatch.setattr(db, "get_engine", lambda: FakeEngine(fake_connection))
+    monkeypatch.setattr(store, "token_hmac", lambda _value: "a" * 64)
+    monkeypatch.setattr(store, "encrypt_token", lambda _value: b"ciphertext")
+
+    store.revoke_token("conn-a", "tenant-a", "token-a")
+    store.rotate_token("conn-a", "tenant-a")
+
+    updates = [
+        sql
+        for sql, _ in fake_connection.statements
+        if sql.lstrip().startswith("UPDATE connection_token")
+    ]
+    assert all("encrypted_token=NULL" in sql for sql in updates)
+
+
+def test_reveal_connection_token_requires_tenant_live_token_and_ciphertext(monkeypatch):
+    class RevealConnection(FakeConnection):
+        def __init__(self, ciphertext):
+            super().__init__()
+            self.ciphertext = ciphertext
+
+        def execute(self, statement, params=None):
+            sql = str(statement)
+            params = params or {}
+            self.statements.append((sql, params))
+            if "SELECT t.encrypted_token" in sql:
+                return Result(
+                    {"encrypted_token": self.ciphertext}
+                    if params["tenant_id"] == "tenant-a" and self.ciphertext
+                    else None
+                )
+            return super().execute(statement, params)
+
+    fake_connection = RevealConnection(b"ciphertext")
+    monkeypatch.setattr(db, "get_engine", lambda: FakeEngine(fake_connection))
+    monkeypatch.setattr(store, "decrypt_token", lambda value: "token-a")
+
+    assert store.reveal_connection_token("conn-a", "tenant-a", "token-a") == "token-a"
+    with pytest.raises(store.TokenUnavailableError):
+        store.reveal_connection_token("conn-a", "tenant-b", "token-a")
+
+    reveal_sql = next(
+        sql for sql, _ in fake_connection.statements if "SELECT t.encrypted_token" in sql
+    )
+    assert "c.tenant_id=:tenant_id" in reveal_sql
+    assert "t.revoked_at IS NULL" in reveal_sql
+    assert "t.expires_at > UTC_TIMESTAMP()" in reveal_sql
+    assert "t.encrypted_token IS NOT NULL" in reveal_sql
+
+
+def test_list_connection_tokens_exposes_only_revealable_metadata(monkeypatch):
+    class TokenListConnection(FakeConnection):
+        def execute(self, statement, params=None):
+            sql = str(statement)
+            params = params or {}
+            self.statements.append((sql, params))
+            if "SELECT token_id, token_prefix" in sql:
+                return Result(rows=[
+                    {
+                        "token_id": "token-a",
+                        "token_prefix": "abc123",
+                        "token_label": "client-a",
+                        "expires_at": None,
+                        "revoked_at": None,
+                        "created_at": None,
+                        "revealable": 1,
+                    },
+                    {
+                        "token_id": "token-historical",
+                        "token_prefix": "history",
+                        "token_label": "legacy",
+                        "expires_at": None,
+                        "revoked_at": None,
+                        "created_at": None,
+                        "revealable": 0,
+                    },
+                    {
+                        "token_id": "token-revoked",
+                        "token_prefix": "revoked",
+                        "token_label": "old",
+                        "expires_at": None,
+                        "revoked_at": "2026-07-29 00:00:00",
+                        "created_at": None,
+                        "revealable": 0,
+                    },
+                ])
+            return super().execute(statement, params)
+
+    fake_connection = TokenListConnection()
+    monkeypatch.setattr(db, "get_engine", lambda: FakeEngine(fake_connection))
+
+    tokens = store.list_connection_tokens("conn-a")
+
+    assert tokens == [
+        {
+            "token_id": "token-a", "prefix": "abc123", "label": "client-a",
+            "expires_at": None, "revoked": False, "created_at": None,
+            "revealable": True,
+        },
+        {
+            "token_id": "token-historical", "prefix": "history",
+            "label": "legacy", "expires_at": None, "revoked": False,
+            "created_at": None, "revealable": False,
+        },
+        {
+            "token_id": "token-revoked", "prefix": "revoked", "label": "old",
+            "expires_at": None, "revoked": True, "created_at": None,
+            "revealable": False,
+        },
+    ]
+    query = fake_connection.statements[0][0]
+    assert "encrypted_token" in query
+    assert "token_hmac" not in query
+
+
 def test_issue_token_is_idempotent_without_reassigning_an_existing_digest(
     monkeypatch,
 ):
@@ -902,12 +1063,20 @@ def test_legacy_wecom_backfill_is_idempotent_and_never_repersists_raw_token(
     fake_connection = LegacyBackfillConnection()
     monkeypatch.setattr(db, "get_engine", lambda: FakeEngine(fake_connection))
     monkeypatch.setattr(store, "token_hmac", lambda raw_token: "b" * 64)
+    monkeypatch.setattr(store, "encrypt_token", lambda raw_token: b"legacy-ciphertext")
 
     assert store.migrate_legacy_wecom_connections() == 1
     assert store.migrate_legacy_wecom_connections() == 0
 
     statements = fake_connection.statements
     assert all("legacy-token" not in repr(params) for _, params in statements)
+    token_sql, token_params = next(
+        (sql, params)
+        for sql, params in statements
+        if "INSERT INTO connection_token" in sql
+    )
+    assert "encrypted_token" in token_sql
+    assert token_params["encrypted_token"] == b"legacy-ciphertext"
     copy_index = next(
         index
         for index, (sql, _) in enumerate(statements)

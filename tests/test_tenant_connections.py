@@ -154,6 +154,7 @@ _BODYLESS_SURFACE = (
     ("post", "/tenant/connections/conn-a/disable"),
     ("delete", "/tenant/connections/conn-a"),
     ("delete", "/tenant/connections/conn-a/tokens/token-a"),
+    ("post", "/tenant/connections/conn-a/tokens/token-a/reveal"),
     ("get", "/tenant/connections/conn-a/tools"),
     ("post", "/tenant/connections/conn-a/test"),
     ("post", "/tenant/connections/conn-a/sync"),
@@ -264,6 +265,7 @@ def test_hostile_origin_rejects_every_mutation_before_domain_or_side_effect(
         "issue_connection_token_use_case",
         "rotate_connection_token_use_case",
         "revoke_connection_token_use_case",
+        "reveal_connection_token_use_case",
         "update_connection_tools_use_case",
         "test_connection_use_case",
         "sync_connection_use_case",
@@ -291,6 +293,7 @@ def test_hostile_origin_rejects_every_mutation_before_domain_or_side_effect(
         "issue_token",
         "rotate_token",
         "revoke_token",
+        "reveal_connection_token",
         "replace_tool_policies",
         "save_declarative_revision",
         "delete_declarative_revision",
@@ -331,7 +334,12 @@ def test_hostile_origin_rejects_every_mutation_before_domain_or_side_effect(
     )
 
     assert response.status_code == 403
-    assert calls == []
+    if path.endswith("/reveal"):
+        assert len(calls) == 1
+        assert calls[0][0] == "audit"
+        assert calls[0][1].result_status == "denied"
+    else:
+        assert calls == []
     if path in {
         "/tenant/connections",
         "/tenant/connections/conn-a/tokens",
@@ -496,6 +504,7 @@ def test_foreign_connection_is_404_before_any_secondary_read_or_side_effect(monk
         "issue_token",
         "rotate_token",
         "revoke_token",
+        "reveal_connection_token",
         "list_tool_policies",
         "replace_tool_policies",
         "get_declarative_revision",
@@ -519,7 +528,13 @@ def test_foreign_connection_is_404_before_any_secondary_read_or_side_effect(monk
         calls.clear()
         response = client.request(method.upper(), path)
         assert response.status_code == 404
-        assert calls == [("owned", "conn-a", "tenant-a")]
+        expected = [("owned", "conn-a", "tenant-a")]
+        if path.endswith("/reveal"):
+            assert calls[:-1] == expected
+            assert calls[-1][0] == "audit"
+            assert calls[-1][1].result_status == "denied"
+        else:
+            assert calls == expected
 
     for method, path, payload in _BODY_SURFACE[1:]:
         calls.clear()
@@ -656,6 +671,70 @@ def test_tenant_create_and_token_issue_rotate_are_no_store_one_time_responses(
     assert responses[0].json()["initial_token"] == "mcp_initial_once"
     assert responses[1].json()["token"] == "mcp_issued_once"
     assert responses[2].json()["token"] == "mcp_rotated_once"
+
+
+def test_tenant_connection_token_reveal_uses_session_scope_and_is_no_store(monkeypatch):
+    events = []
+    calls = []
+    monkeypatch.setattr(admin_connections.store, "get_connection", lambda *args: _record())
+    monkeypatch.setattr(
+        admin_connections.store,
+        "reveal_connection_token",
+        lambda connection_id, tenant_id, token_id: calls.append(
+            (connection_id, tenant_id, token_id)
+        )
+        or "mcp_tenant_reveal",
+    )
+    monkeypatch.setattr(admin_connections, "write_event", lambda event: events.append(event) or True)
+    admin_connections.reset_reveal_limiter()
+
+    response = _client(monkeypatch).post(
+        "/tenant/connections/conn-a/tokens/token-a/reveal"
+    )
+
+    assert response.status_code == 200
+    assert response.headers["cache-control"] == "no-store"
+    assert response.json() == {"token": "mcp_tenant_reveal"}
+    assert calls == [("conn-a", "tenant-a", "token-a")]
+    assert len(events) == 1
+    assert events[0].tenant_id == "tenant-a"
+    assert "mcp_tenant_reveal" not in repr(events[0])
+
+
+def test_tenant_connection_reveal_auth_failure_is_no_store_and_audited(monkeypatch):
+    events = []
+    monkeypatch.setattr(
+        admin_connections,
+        "write_event",
+        lambda event: events.append(event) or True,
+    )
+
+    response = _client(monkeypatch, authenticated=False).post(
+        "/tenant/connections/conn-a/tokens/token-a/reveal"
+    )
+
+    assert response.status_code == 401
+    assert response.headers["cache-control"] == "no-store"
+    assert len(events) == 1
+    assert events[0].result_status == "denied"
+    assert events[0].params_summary == '{"principal_type":"tenant"}'
+
+
+def test_tenant_connection_reveal_unexpected_error_is_safe_no_store(monkeypatch, caplog):
+    def fail(*_args, **_kwargs):
+        raise RuntimeError("mcp_private_failure")
+
+    monkeypatch.setattr(admin_connections, "reveal_connection_token_use_case", fail)
+
+    response = _client(monkeypatch, raise_server_exceptions=False).post(
+        "/tenant/connections/conn-a/tokens/token-a/reveal"
+    )
+
+    assert response.status_code == 500
+    assert response.headers["cache-control"] == "no-store"
+    assert response.json() == {"detail": "tenant connection operation failed"}
+    assert "mcp_private_failure" not in response.text
+    assert "mcp_private_failure" not in caplog.text
 
 
 def test_tenant_detail_lists_only_safe_token_summaries(monkeypatch):

@@ -149,9 +149,11 @@ def retire_tenant(
                 JOIN connection_instance AS connection_row
                   ON connection_row.connection_id=token_row.connection_id
                 SET token_row.revoked_at=COALESCE(
-                      token_row.revoked_at, UTC_TIMESTAMP())
+                      token_row.revoked_at, UTC_TIMESTAMP()),
+                    token_row.encrypted_token=NULL
                 WHERE connection_row.tenant_id=:tenant_id
-                  AND token_row.revoked_at IS NULL
+                  AND (token_row.revoked_at IS NULL
+                       OR token_row.encrypted_token IS NOT NULL)
             """),
             {"tenant_id": tenant_id},
         )

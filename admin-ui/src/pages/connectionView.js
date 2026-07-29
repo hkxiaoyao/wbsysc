@@ -209,6 +209,12 @@ export function selectActiveTokenHint(tokens = []) {
   return cleanText(active?.prefix ?? active?.token_prefix)
 }
 
+export function tokenCopyStatus(token = {}) {
+  const revoked = Boolean(token.revoked_at || token.revoked === true || token.status === 'revoked')
+  if (revoked) return 'revoked'
+  return token.revealable === true ? 'revealable' : 'historical'
+}
+
 export function wizardRevisionIdentity(state = {}) {
   return { specId: cleanText(state.specId), revision: Number(state.revision) }
 }

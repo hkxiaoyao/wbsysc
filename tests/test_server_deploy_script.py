@@ -22,6 +22,7 @@ def test_deployer_runs_all_migrations_in_order_before_starting_new_image():
             "009_tenant_identity_boundary.sql",
             "010_connection_domain_verify.sql",
             "011_declarative_record.sql",
+            "012_connection_token_reveal.sql",
         )
     ]
 
@@ -30,8 +31,8 @@ def test_deployer_runs_all_migrations_in_order_before_starting_new_image():
     assert migration_positions[-1] < script.index(
         "\ndocker compose up -d --force-recreate\n"
     )
-    assert "004 → 005 → 006 → 007 → 008 → 009 → 010 → 011" in script
-    assert "004、005、006、007、008、009、010、011 数据库迁移完成" in script
+    assert "004 → 005 → 006 → 007 → 008 → 009 → 010 → 011 → 012" in script
+    assert "004、005、006、007、008、009、010、011、012 数据库迁移完成" in script
     assert 'MYSQL_PWD="$DB_MIGRATION_PASSWORD" mysql' in script
     assert '--user="$DB_MIGRATION_USER"' in script
 

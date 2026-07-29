@@ -30,7 +30,7 @@ TL;DR：先备份 MySQL，再部署连接平台表和应用。保留旧模型上
 | `ADMIN_SESSION_TTL_MIN` | 管理会话有效分钟数 |
 | `CREDENTIAL_KEY` | 凭证加密密钥，生产至少 32 个 UTF-8 字节 |
 | `MCP_TOKEN_HMAC_KEY` | Token 基于哈希的消息认证码（HMAC）密钥，生产至少 32 个 UTF-8 字节，必须使用非示例值 |
-| `MCP_TOKEN_PLAINTEXT_KEY` | 可揭示服务 Token 的密文密钥，生产至少 32 个 UTF-8 字节，必须使用非示例值 |
+| `MCP_TOKEN_PLAINTEXT_KEY` | 可揭示连接/服务 Token 的密文密钥，生产至少 32 个 UTF-8 字节，必须使用非示例值 |
 | `MCP_SERVICE_ENABLED` | 存量服务级 MCP 端点兼容开关；不会开放租户管理入口或默认服务回填 |
 | `CONNECTOR_ALLOWLIST` | 已审核连接器入口名的逗号分隔精确列表 |
 | `MCP_BASE_URL` | 对外 HTTPS 基础地址，也参与 Host 许可判断 |
@@ -45,7 +45,7 @@ TL;DR：先备份 MySQL，再部署连接平台表和应用。保留旧模型上
 
 - `CREDENTIAL_KEY`：先用旧密钥解密并用新密钥重加密全部连接/租户凭证，再切换。
 - `MCP_TOKEN_HMAC_KEY`：当前运行时只接受一个 HMAC key，没有双 key 验证窗口；旧 key 下“预签发”的 Token 切换后同样失效。先盘点并记录全部旧连接/服务 token ID 及使用方，在批准的维护窗口切换 key 并重启；随后只在新 key 下逐一签发、分发和验证新 Token，最后核对清单中所有旧 token ID 已失效/撤销。窗口内客户端会短暂不可用，不能声称预签发可保持连续可用。
-- `MCP_TOKEN_PLAINTEXT_KEY`：切换前必须把每条**未撤销**的 `mcp_service_token.encrypted_token` 用旧密钥解密、用新密钥重加密并完成数量核对；已撤销行的密文已清空，不能恢复也不需要迁移。无法完成重加密时应重新签发服务 Token，不得直接切换。
+- `MCP_TOKEN_PLAINTEXT_KEY`：切换前必须把每条**未撤销**的 `connection_token.encrypted_token` 与 `mcp_service_token.encrypted_token` 用旧密钥解密、用新密钥重加密并完成数量核对；已撤销行的密文已清空，不能恢复也不需要迁移。历史上未保存密文的连接 Token 同样不能恢复。无法完成重加密时应重新签发对应 Token，不得直接切换。
 
 `CONNECTOR_ALLOWLIST` 使用 `wbsysc.connectors` 入口名，不使用 Python 包导入路径。平台去除首尾空白，将名称转为小写，并把连续的 `-`、`_`、`.` 归一为单个 `-`，然后执行精确匹配。例如，已审核入口 `reviewed_connector_name` 应写为 `reviewed-connector-name`。
 

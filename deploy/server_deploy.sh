@@ -392,6 +392,7 @@ MIGRATIONS=(
   "sql/009_tenant_identity_boundary.sql"
   "sql/010_connection_domain_verify.sql"
   "sql/011_declarative_record.sql"
+  "sql/012_connection_token_reveal.sql"
 )
 for migration in "${MIGRATIONS[@]}"; do
   if [ ! -f "$APP_DIR/$migration" ]; then
@@ -400,7 +401,7 @@ for migration in "${MIGRATIONS[@]}"; do
   fi
 done
 
-echo "使用宿主 mysql CLI 按 004 → 005 → 006 → 007 → 008 → 009 → 010 → 011 执行迁移（迁移主机默认 127.0.0.1，可用 DB_MIGRATION_HOST 覆盖）"
+echo "使用宿主 mysql CLI 按 004 → 005 → 006 → 007 → 008 → 009 → 010 → 011 → 012 执行迁移（迁移主机默认 127.0.0.1，可用 DB_MIGRATION_HOST 覆盖）"
 for migration in "${MIGRATIONS[@]}"; do
   echo "执行 $migration"
   if ! MYSQL_PWD="$DB_MIGRATION_PASSWORD" mysql --protocol=TCP \
@@ -411,7 +412,7 @@ for migration in "${MIGRATIONS[@]}"; do
   fi
 done
 unset DB_PASSWORD DB_MIGRATION_USER DB_MIGRATION_PASSWORD
-echo "✓ 004、005、006、007、008、009、010、011 数据库迁移完成"
+echo "✓ 004、005、006、007、008、009、010、011、012 数据库迁移完成"
 
 echo ""
 echo "===== 5. 拉取镜像（GitHub Actions 已构建推送到 GHCR） ====="

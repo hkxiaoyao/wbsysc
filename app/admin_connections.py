@@ -3,15 +3,20 @@ from __future__ import annotations
 
 import hashlib
 import inspect
+import json
 import logging
 import math
 import re
+import threading
+import time
 import uuid
+from collections import OrderedDict, deque
 from collections.abc import Mapping
 from dataclasses import replace
 from typing import Any, Literal
 
 from fastapi import APIRouter, Depends, File, HTTPException, Request, Response, UploadFile
+from fastapi.routing import APIRoute
 from pydantic import BaseModel, ConfigDict, Field
 
 from . import admin
@@ -34,9 +39,10 @@ from .domain_verify import (
     normalize_domain,
     save_verify_file_for_connection,
 )
-from .mcp_audit import write_event
+from .mcp_audit import client_ip_from_scope, request_id_from_scope, write_event
 from .mcp_log_models import McpLogEvent
 from .mcp_services import store as service_store
+from .tenant_auth.dependencies import require_same_origin
 
 
 logger = logging.getLogger(__name__)
@@ -85,10 +91,56 @@ def _require_admin(request: Request) -> None:
     admin._require_auth(request)
 
 
+class _AdminConnectionRoute(APIRoute):
+    def get_route_handler(self):
+        handler = super().get_route_handler()
+        protects_reveal = self.path.endswith("/reveal")
+
+        async def reveal_failures(request: Request):
+            try:
+                return await handler(request)
+            except HTTPException as exc:
+                if not protects_reveal:
+                    raise
+                if not getattr(request.state, "connection_reveal_audited", False):
+                    _audit_reveal(
+                        request,
+                        principal_type="admin",
+                        tenant_id=request.path_params.get("tenant_id", ""),
+                        connection_id=request.path_params.get("connection_id", ""),
+                        token_id=request.path_params.get("token_id", ""),
+                        result="denied",
+                    )
+                raise _no_store_exception(exc) from None
+            except Exception as exc:
+                if not protects_reveal:
+                    raise
+                logger.warning(
+                    "Admin connection reveal route failed type=%s",
+                    type(exc).__name__,
+                )
+                _audit_reveal(
+                    request,
+                    principal_type="admin",
+                    tenant_id=request.path_params.get("tenant_id", ""),
+                    connection_id=request.path_params.get("connection_id", ""),
+                    token_id=request.path_params.get("token_id", ""),
+                    result="error",
+                )
+                raise HTTPException(
+                    500,
+                    "connection operation failed",
+                    headers=_NO_STORE_HEADERS,
+                ) from None
+
+        return reveal_failures
+
+
 router = APIRouter(
     prefix="/admin",
     tags=["admin-connections"],
     dependencies=[Depends(_require_admin)],
+    route_class=_AdminConnectionRoute,
 )
 
 
@@ -826,6 +878,115 @@ def _audit(record: ConnectionRecord, event_name: str, *, status: str = "ok") -> 
         logger.warning("Connection management audit failed type=%s", type(exc).__name__)
 
 
+class RevealLimiter:
+    def __init__(
+        self,
+        *,
+        limit: int = 10,
+        window_seconds: float = 60.0,
+        max_buckets: int = 4096,
+    ) -> None:
+        self.limit = max(1, int(limit))
+        self.window_seconds = max(0.001, float(window_seconds))
+        self.max_buckets = max(1, int(max_buckets))
+        self._buckets: OrderedDict[tuple[str, str, str], deque[float]] = OrderedDict()
+        self._lock = threading.Lock()
+
+    def allow(self, key: tuple[str, str, str], *, now: float | None = None) -> bool:
+        timestamp = time.monotonic() if now is None else float(now)
+        cutoff = timestamp - self.window_seconds
+        with self._lock:
+            for stale_key in list(self._buckets):
+                timestamps = self._buckets[stale_key]
+                while timestamps and timestamps[0] <= cutoff:
+                    timestamps.popleft()
+                if timestamps:
+                    break
+                del self._buckets[stale_key]
+            timestamps = self._buckets.pop(key, deque())
+            while timestamps and timestamps[0] <= cutoff:
+                timestamps.popleft()
+            if len(timestamps) >= self.limit:
+                self._buckets[key] = timestamps
+                return False
+            if len(self._buckets) >= self.max_buckets:
+                self._buckets.popitem(last=False)
+            timestamps.append(timestamp)
+            self._buckets[key] = timestamps
+            return True
+
+
+_reveal_limiter = RevealLimiter()
+
+
+def reset_reveal_limiter() -> None:
+    global _reveal_limiter
+    _reveal_limiter = RevealLimiter()
+
+
+def _audit_reveal(
+    request: Request,
+    *,
+    principal_type: Literal["tenant", "admin"],
+    tenant_id: str,
+    connection_id: str,
+    token_id: str,
+    result: Literal["ok", "denied", "error"],
+) -> bool:
+    params = {"principal_type": principal_type}
+    if result == "ok":
+        params.update({"connection_id": connection_id, "token_id": token_id})
+    try:
+        accepted = write_event(
+            McpLogEvent(
+                tenant_id=tenant_id,
+                connection_id=connection_id if result == "ok" else None,
+                category="auth",
+                event_name="connection_token_reveal",
+                params_summary=json.dumps(
+                    params,
+                    ensure_ascii=True,
+                    separators=(",", ":"),
+                ),
+                result_status=result,
+                request_id=request_id_from_scope(request.scope),
+                client_ip=client_ip_from_scope(request.scope),
+            )
+        )
+    except Exception as exc:
+        logger.warning("Connection token reveal audit failed type=%s", type(exc).__name__)
+        return False
+    return accepted is True
+
+
+def _no_store_exception(exc: HTTPException) -> HTTPException:
+    exc.headers = {**(exc.headers or {}), **_NO_STORE_HEADERS}
+    return exc
+
+
+def _reveal_guard(
+    request: Request,
+    *,
+    principal_type: Literal["tenant", "admin"],
+    tenant_id: str,
+    connection_id: str,
+    token_id: str,
+) -> None:
+    try:
+        require_same_origin(request)
+    except HTTPException as exc:
+        request.state.connection_reveal_audited = True
+        _audit_reveal(
+            request,
+            principal_type=principal_type,
+            tenant_id=tenant_id,
+            connection_id=connection_id,
+            token_id=token_id,
+            result="denied",
+        )
+        raise _no_store_exception(exc) from None
+
+
 def _mutate(operation, *args, **kwargs):
     """Execute a store mutation without exposing its inputs or exception text."""
     try:
@@ -1290,6 +1451,154 @@ def rotate_connection_token_global(
     response.headers.update(_NO_STORE_HEADERS)
     return rotate_connection_token_use_case(
         _global_owner(connection_id).tenant_id, connection_id, body, request
+    )
+
+
+def reveal_connection_token_use_case(
+    tenant_id: str,
+    connection_id: str,
+    token_id: str,
+    request: Request,
+    *,
+    principal_type: Literal["tenant", "admin"] = "admin",
+    principal_key: str = "admin",
+):
+    if not _reveal_limiter.allow((principal_type, principal_key, token_id)):
+        request.state.connection_reveal_audited = True
+        _audit_reveal(
+            request,
+            principal_type=principal_type,
+            tenant_id=tenant_id,
+            connection_id=connection_id,
+            token_id=token_id,
+            result="denied",
+        )
+        raise HTTPException(
+            429,
+            "request rate limit exceeded",
+            headers=_NO_STORE_HEADERS,
+        )
+
+    record = store.get_connection(connection_id, tenant_id)
+    if record is None:
+        request.state.connection_reveal_audited = True
+        _audit_reveal(
+            request,
+            principal_type=principal_type,
+            tenant_id=tenant_id,
+            connection_id=connection_id,
+            token_id=token_id,
+            result="denied",
+        )
+        raise HTTPException(404, "resource not found", headers=_NO_STORE_HEADERS)
+    try:
+        raw_value = store.reveal_connection_token(connection_id, tenant_id, token_id)
+    except store.TokenUnavailableError:
+        request.state.connection_reveal_audited = True
+        _audit_reveal(
+            request,
+            principal_type=principal_type,
+            tenant_id=tenant_id,
+            connection_id=connection_id,
+            token_id=token_id,
+            result="denied",
+        )
+        raise HTTPException(404, "resource not found", headers=_NO_STORE_HEADERS) from None
+    except Exception as exc:
+        request.state.connection_reveal_audited = True
+        logger.warning("Connection token reveal failed type=%s", type(exc).__name__)
+        _audit_reveal(
+            request,
+            principal_type=principal_type,
+            tenant_id=tenant_id,
+            connection_id=connection_id,
+            token_id=token_id,
+            result="error",
+        )
+        raise HTTPException(
+            500,
+            "connection operation failed",
+            headers=_NO_STORE_HEADERS,
+        ) from None
+
+    accepted = _audit_reveal(
+        request,
+        principal_type=principal_type,
+        tenant_id=record.tenant_id,
+        connection_id=record.connection_id,
+        token_id=token_id,
+        result="ok",
+    )
+    if not accepted:
+        raw_value = ""
+        request.state.connection_reveal_audited = True
+        logger.warning("Connection token reveal success audit was not accepted")
+        raise HTTPException(
+            500,
+            "connection operation failed",
+            headers=_NO_STORE_HEADERS,
+        )
+    return {"token": raw_value}
+
+
+@router.post(
+    "/tenants/{tenant_id}/connections/{connection_id}/tokens/{token_id}/reveal"
+)
+def reveal_connection_token(
+    tenant_id: str,
+    connection_id: str,
+    token_id: str,
+    request: Request,
+    response: Response,
+):
+    response.headers.update(_NO_STORE_HEADERS)
+    _reveal_guard(
+        request,
+        principal_type="admin",
+        tenant_id=tenant_id,
+        connection_id=connection_id,
+        token_id=token_id,
+    )
+    return reveal_connection_token_use_case(
+        tenant_id,
+        connection_id,
+        token_id,
+        request,
+    )
+
+
+@router.post("/connections/{connection_id}/tokens/{token_id}/reveal")
+def reveal_connection_token_global(
+    connection_id: str,
+    token_id: str,
+    request: Request,
+    response: Response,
+):
+    response.headers.update(_NO_STORE_HEADERS)
+    _reveal_guard(
+        request,
+        principal_type="admin",
+        tenant_id="",
+        connection_id=connection_id,
+        token_id=token_id,
+    )
+    record = store.get_connection(connection_id)
+    if record is None:
+        request.state.connection_reveal_audited = True
+        _audit_reveal(
+            request,
+            principal_type="admin",
+            tenant_id="",
+            connection_id=connection_id,
+            token_id=token_id,
+            result="denied",
+        )
+        raise HTTPException(404, "resource not found", headers=_NO_STORE_HEADERS)
+    return reveal_connection_token_use_case(
+        record.tenant_id,
+        connection_id,
+        token_id,
+        request,
     )
 
 

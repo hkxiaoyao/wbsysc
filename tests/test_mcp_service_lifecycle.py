@@ -279,8 +279,8 @@ class _StatefulRetirementConnection(_TenantRetirementConnection):
                 {"id": "stb", "service_id": "service-b", "revoked": False, "encrypted": "cipher-b"},
             ],
             "connection_tokens": [
-                {"id": "cta", "connection_id": "conn-a", "revoked": False},
-                {"id": "ctb", "connection_id": "conn-b", "revoked": False},
+                {"id": "cta", "connection_id": "conn-a", "revoked": False, "encrypted": "cipher-a"},
+                {"id": "ctb", "connection_id": "conn-b", "revoked": False, "encrypted": "cipher-b"},
             ],
             "accounts": {"tenant-a", "tenant-b"},
             "sessions": {"tenant-a": ["sa"], "tenant-b": ["sb"]},
@@ -334,8 +334,11 @@ class _StatefulRetirementConnection(_TenantRetirementConnection):
             count = 0
             for token in self.state["connection_tokens"]:
                 owner = self.state["connections"].get(token["connection_id"])
-                if owner and owner["tenant_id"] == tenant_id and not token["revoked"]:
+                if owner and owner["tenant_id"] == tenant_id and (
+                    not token["revoked"] or token["encrypted"] is not None
+                ):
                     token["revoked"] = True
+                    token["encrypted"] = None
                     count += 1
             result = _Result(rowcount=count)
         elif sql.startswith("DELETE FROM tenant_session"):
@@ -495,10 +498,12 @@ def test_successful_retirement_isolates_tenant_b_and_retry_catches_new_token(mon
         for token in connection.state["service_tokens"]
         if token["service_id"] == "service-a"
     )
-    assert next(
+    retired_connection_token = next(
         token for token in connection.state["connection_tokens"]
         if token["connection_id"] == "conn-a"
-    )["revoked"] is True
+    )
+    assert retired_connection_token["revoked"] is True
+    assert retired_connection_token["encrypted"] is None
     assert connection.state["connections"]["conn-b"] == before_b["connections"]["conn-b"]
     assert connection.state["services"]["service-b"] == before_b["services"]["service-b"]
     assert next(token for token in connection.state["service_tokens"] if token["id"] == "stb") == next(

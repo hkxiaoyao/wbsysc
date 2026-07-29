@@ -329,6 +329,41 @@ def test_admin_reveal_requires_accepted_success_audit(monkeypatch, audit_behavio
     assert len(events) == 1
 
 
+def test_admin_connection_reveal_auth_csrf_and_boundaries_are_safe(monkeypatch):
+    from app import admin_connections
+
+    events = []
+    calls = []
+    app = FastAPI()
+    app.include_router(admin_connections.router)
+    client = TestClient(app)
+    path = "/admin/tenants/tenant-a/connections/conn-a/tokens/token-a/reveal"
+    monkeypatch.setattr(admin_connections, "write_event", lambda event: events.append(event) or True)
+    monkeypatch.setattr(
+        admin_connections.store,
+        "get_connection",
+        lambda connection_id, tenant_id=None: None,
+    )
+    monkeypatch.setattr(
+        admin_connections.store,
+        "reveal_connection_token",
+        lambda *args: calls.append(args) or "mcp_must_not_run",
+    )
+    admin_connections.reset_reveal_limiter()
+
+    unauthenticated = client.post(path, headers={"Origin": "http://testserver"})
+    monkeypatch.setattr(admin, "_require_auth", lambda request: None)
+    cross_site = client.post(path, headers={"Origin": "https://attacker.invalid"})
+    foreign = client.post(path, headers={"Origin": "http://testserver"})
+
+    assert [response.status_code for response in (unauthenticated, cross_site, foreign)] == [401, 403, 404]
+    assert all(response.headers["cache-control"] == "no-store" for response in (unauthenticated, cross_site, foreign))
+    assert foreign.json() == {"detail": "resource not found"}
+    assert calls == []
+    assert [event.result_status for event in events] == ["denied", "denied", "denied"]
+    assert all(event.params_summary == '{"principal_type":"admin"}' for event in events)
+
+
 def test_admin_issue_threads_normalized_expiry(monkeypatch):
     from app.mcp_services import router as service_router
 

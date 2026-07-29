@@ -13,7 +13,7 @@ import {
   canEnableWriteTool, closeTokenModal, copyConnectionMcpConfig, emptyWecomCredentialFields, safeServerError,
   apiClientEndpoint, connectionCollectionEndpoint, connectionResourceEndpoint,
   createConnectionMutationSequence, createRequestSequence, isActiveDeclarativeConfigReadOnly, selectActiveTokenHint,
-  setExplicitToolPolicy, wecomConfigFormValues,
+  setExplicitToolPolicy, tokenCopyStatus, wecomConfigFormValues,
 } from './connectionView.js'
 import { CONNECTOR_CARDS, connectorCard } from './servicesView.js'
 import './Connections.css'
@@ -358,7 +358,7 @@ export default function Connections({ scope = 'admin', apiClient = defaultApi, t
       setSelectedConnector('wecom')
       setCreateOpen(false)
       showToken(connection, response.data.initial_token)
-      messageApi.success('连接已创建；Token 只显示这一次')
+      messageApi.success('连接已创建；请安全保存 Token，新 Token 可随时复制 MCP 配置')
       await load()
       if (isCurrent() && declarative) openDetail(connection, true)
     } catch (error) {
@@ -521,6 +521,38 @@ export default function Connections({ scope = 'admin', apiClient = defaultApi, t
       await refreshDrawerDetail(connection, ticket, controller)
     } catch (error) {
       if (isDrawerMutationCurrent(ticket, controller)) messageApi.error(safeServerError(error, 'Token 操作失败'))
+    } finally {
+      if (isDrawerMutationCurrent(ticket, controller)) setDrawerBusy('')
+    }
+  }
+
+  const copyTokenConfig = async (token) => {
+    if (!detail || tokenCopyStatus(token) !== 'revealable') return
+    const connection = detail
+    const { ticket, controller } = beginDrawerMutation(connection.connection_id)
+    setDrawerBusy(`token-reveal:${token.token_id}`)
+    try {
+      const response = await apiClient.post(
+        apiClientEndpoint(apiClient, connectionResourceEndpoint(scope, connection.connection_id, `tokens/${encodeURIComponent(token.token_id)}/reveal`)),
+        undefined,
+        { signal: controller.signal },
+      )
+      if (!isDrawerMutationCurrent(ticket, controller)) return
+      const rawToken = response.data?.token
+      const { copied } = await copyConnectionMcpConfig(
+        { connection_id: connection.connection_id, token: rawToken },
+        window.location.origin,
+        navigator.clipboard?.writeText?.bind(navigator.clipboard),
+      )
+      if (!isDrawerMutationCurrent(ticket, controller)) return
+      if (copied) {
+        messageApi.success('MCP 配置已复制')
+      } else {
+        showToken(connection, rawToken)
+        messageApi.warning('剪贴板不可用，请从弹窗手动复制 MCP 配置')
+      }
+    } catch (error) {
+      if (isDrawerMutationCurrent(ticket, controller)) messageApi.error(safeServerError(error, 'MCP 配置复制失败'))
     } finally {
       if (isDrawerMutationCurrent(ticket, controller)) setDrawerBusy('')
     }
@@ -698,7 +730,7 @@ export default function Connections({ scope = 'admin', apiClient = defaultApi, t
       ),
     },
     {
-      key: 'tokens', label: `Token · ${tokens.length}`, children: <div className="connection-editor"><Alert type="info" showIcon message="Token 原文只在签发后显示一次" description="一键复制会签发一个新的独立 Token，不会撤销或影响已有客户端。" /><Input aria-label="Token 用途标签" maxLength={128} value={tokenLabel} placeholder="用途标签（可选）" onChange={(event) => setTokenLabel(event.target.value)} /><Space wrap><Button type="primary" icon={<CopyOutlined />} loading={drawerBusy === 'token'} onClick={() => issueToken(false, true)}>一键生成并复制 MCP 配置</Button><Button loading={drawerBusy === 'token'} onClick={() => issueToken(false)}>仅签发新 Token</Button><Button danger loading={drawerBusy === 'token'} onClick={() => issueToken(true)}>轮换并撤销旧 Token</Button></Space><div className="connection-token-list">{tokens.map((token) => { const revoked = Boolean(token.revoked_at || token.revoked === true || token.status === 'revoked'); return <div key={token.token_id}><Text code>{token.prefix || token.token_prefix || 'token'}</Text><Text type="secondary">{token.label || token.token_label || '未命名'}</Text>{revoked ? <Tag>已撤销{token.revoked_at ? ` · ${new Date(token.revoked_at).toLocaleString('zh-CN')}` : ''}</Tag> : <Button danger type="link" size="small" onClick={() => revokeToken(token)}>撤销</Button>}</div> })}</div></div>,
+      key: 'tokens', label: `Token · ${tokens.length}`, children: <div className="connection-editor"><Alert type="info" showIcon message="新 Token 可随时复制 MCP 配置" description="签发后仍会显示 Token 与配置弹窗；之后也可从有效 Token 行再次复制 MCP 配置。" /><Input aria-label="Token 用途标签" maxLength={128} value={tokenLabel} placeholder="用途标签（可选）" onChange={(event) => setTokenLabel(event.target.value)} /><Space wrap><Button type="primary" icon={<CopyOutlined />} loading={drawerBusy === 'token'} onClick={() => issueToken(false, true)}>一键生成并复制 MCP 配置</Button><Button loading={drawerBusy === 'token'} onClick={() => issueToken(false)}>仅签发新 Token</Button><Button danger loading={drawerBusy === 'token'} onClick={() => issueToken(true)}>轮换并撤销旧 Token</Button></Space><div className="connection-token-list">{tokens.map((token) => { const copyStatus = tokenCopyStatus(token); const revoked = copyStatus === 'revoked'; return <div key={token.token_id}><Text code>{token.prefix || token.token_prefix || 'token'}</Text><Text type="secondary">{token.label || token.token_label || '未命名'}</Text>{copyStatus === 'revealable' && <Button type="link" size="small" icon={<CopyOutlined />} loading={drawerBusy === `token-reveal:${token.token_id}`} onClick={() => copyTokenConfig(token)}>复制 MCP 配置</Button>}{copyStatus === 'historical' && <Text type="warning">历史 Token 不可复制，请重新签发</Text>}{revoked ? <Tag>已撤销{token.revoked_at ? ` · ${new Date(token.revoked_at).toLocaleString('zh-CN')}` : ''}</Tag> : <Button danger type="link" size="small" onClick={() => revokeToken(token)}>撤销</Button>}</div> })}</div></div>,
     },
     {
       key: 'tools', label: `工具 · ${tools.length}`, children: <div className="connection-editor"><Alert type="warning" showIcon message="写操作需要双重确认" /><div className="connection-tools">{tools.map((tool, index) => <div key={tool.tool_key}><div><Text code>{tool.mcp_name || tool.tool_key}</Text><Tag color={tool.operation_kind === 'write' ? 'orange' : 'blue'}>{tool.operation_kind}</Tag></div><Space wrap><Switch aria-label={`${tool.tool_key} 启用状态`} checked={Boolean(tool.enabled)} checkedChildren="启用" unCheckedChildren="停用" onChange={(enabled) => setTools((current) => current.map((item, i) => i === index ? { ...item, ...setExplicitToolPolicy(item, item, enabled), policy: { ...(item.policy || {}), allow_write: false } } : item))} />{tool.operation_kind === 'write' && <Switch aria-label={`${tool.tool_key} 写入同意`} checked={Boolean(tool.policy?.allow_write)} disabled={!tool.enabled} checkedChildren="同意写入" unCheckedChildren="未授权写入" onChange={(allow_write) => setTools((current) => current.map((item, i) => i === index ? { ...item, policy: { ...(item.policy || {}), allow_write } } : item))} />}</Space></div>)}</div><Button type="primary" loading={drawerBusy === 'tools'} onClick={saveTools}>保存工具策略</Button></div>,
@@ -762,7 +794,7 @@ export default function Connections({ scope = 'admin', apiClient = defaultApi, t
             <Alert type="info" showIcon message="连接将以草稿创建" description="创建后进入声明式向导导入 JSON/YAML；这里不会接受代码、模板或预置凭据。" />
           ) : selectedConnector === 'wecom' ? (
             <>
-              <Alert type="info" showIcon message="企业微信配置使用独立字段" description="数据 Schema 由后端创建；MCP Token 将在创建成功后单独显示一次。" />
+              <Alert type="info" showIcon message="企业微信配置使用独立字段" description="数据 Schema 由后端创建；MCP Token 会在创建成功后显示，新 Token 之后也可随时复制 MCP 配置。" />
               <Form.Item name="corpid" label="CorpID" rules={[{ required: true, whitespace: true, message: '请输入企业微信 CorpID' }]}><Input aria-label="新连接企业微信 CorpID" maxLength={64} /></Form.Item>
               <Form.Item name="enabled_modules" label="同步模块" rules={[{ required: true, message: '请选择至少一个同步模块' }]}><Select aria-label="新连接企业微信同步模块" mode="multiple" options={WECOM_MODULE_OPTIONS} /></Form.Item>
               <Form.Item name="sync_interval_min" label="同步间隔（分钟）" rules={[{ required: true }]}><InputNumber aria-label="新连接企业微信同步间隔" min={1} max={1440} precision={0} style={{ width: '100%' }} /></Form.Item>
@@ -777,9 +809,9 @@ export default function Connections({ scope = 'admin', apiClient = defaultApi, t
         </Form>
       </Modal>
 
-      <Modal title="Token 仅显示一次" open={tokenModal.open} onCancel={dismissToken} footer={<Button type="primary" onClick={dismissToken}>我已安全保存并关闭</Button>} closable maskClosable={false}>
-        <Alert type="warning" showIcon message="关闭后无法再次查看此 Token" />
-        <div className="connection-token-once"><Text code copyable={{ text: tokenModal.rawToken, tooltips: ['复制 Token', '已复制'] }}>{tokenModal.rawToken}</Text><Button icon={<CopyOutlined />} onClick={() => navigator.clipboard?.writeText(buildConnectionMcpConfig({ connection_id: tokenModal.connectionId, initial_token: tokenModal.rawToken }, window.location.origin))}>复制 MCP 配置</Button><Input.TextArea aria-label="一次性 MCP JSON 配置" readOnly rows={9} value={tokenModal.open ? buildConnectionMcpConfig({ connection_id: tokenModal.connectionId, initial_token: tokenModal.rawToken }, window.location.origin) : ''} /></div>
+      <Modal title="Token 与 MCP 配置" open={tokenModal.open} onCancel={dismissToken} footer={<Button type="primary" onClick={dismissToken}>我已安全保存并关闭</Button>} closable maskClosable={false}>
+        <Alert type="warning" showIcon message="请安全保存 Token；新 Token 可随时复制 MCP 配置" />
+        <div className="connection-token-once"><Text code copyable={{ text: tokenModal.rawToken, tooltips: ['复制 Token', '已复制'] }}>{tokenModal.rawToken}</Text><Button icon={<CopyOutlined />} onClick={() => navigator.clipboard?.writeText(buildConnectionMcpConfig({ connection_id: tokenModal.connectionId, initial_token: tokenModal.rawToken }, window.location.origin))}>复制 MCP 配置</Button><Input.TextArea aria-label="MCP JSON 配置" readOnly rows={9} value={tokenModal.open ? buildConnectionMcpConfig({ connection_id: tokenModal.connectionId, initial_token: tokenModal.rawToken }, window.location.origin) : ''} /></div>
       </Modal>
     </main>
   )

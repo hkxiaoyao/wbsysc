@@ -1,0 +1,13 @@
+{
+  "id": "persistent-mcp-config-copy",
+  "title": "支持随时复制已有 Token 的 MCP 配置",
+  "status": "completed",
+  "complexity": "L+",
+  "risk": "high",
+  "domain": "fullstack",
+  "currentPhase": "completed",
+  "nextAction": "none",
+  "createdAt": "2026-07-29T09:48:38+08:00",
+  "updatedAt": "2026-07-29T10:33:00+08:00",
+  "branch": "main"
+}

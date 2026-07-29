@@ -18,6 +18,7 @@ _RAW_RESPONSE_SUFFIXES = (
     "/connections",
     "/tokens",
     "/tokens/rotate",
+    "/reveal",
 )
 
 
@@ -75,6 +76,49 @@ def _mutation_principal(request: Request) -> TenantPrincipal:
     require_same_origin(request)
     _reject_query(request)
     return principal
+
+
+def _reveal_principal(
+    request: Request,
+    connection_id: str,
+    token_id: str,
+) -> TenantPrincipal:
+    principal: TenantPrincipal | None = None
+    try:
+        principal = require_tenant_principal(request)
+        require_same_origin(request)
+        _reject_query(request)
+        return principal
+    except HTTPException as exc:
+        request.state.connection_reveal_audited = True
+        connections._audit_reveal(
+            request,
+            principal_type="tenant",
+            tenant_id=principal.tenant_id if principal is not None else "",
+            connection_id=connection_id,
+            token_id=token_id,
+            result="denied",
+        )
+        raise _no_store_exception(exc) from None
+    except Exception as exc:
+        request.state.connection_reveal_audited = True
+        logger.warning(
+            "Tenant connection reveal guard failed type=%s",
+            type(exc).__name__,
+        )
+        connections._audit_reveal(
+            request,
+            principal_type="tenant",
+            tenant_id=principal.tenant_id if principal is not None else "",
+            connection_id=connection_id,
+            token_id=token_id,
+            result="error",
+        )
+        raise HTTPException(
+            500,
+            "tenant connection operation failed",
+            headers=_NO_STORE_HEADERS,
+        ) from None
 
 
 def _reject_query(request: Request) -> None:
@@ -253,6 +297,26 @@ async def revoke_connection_token(
     await _require_empty_body(request)
     return connections.revoke_connection_token_use_case(
         principal.tenant_id, connection_id, token_id, request
+    )
+
+
+@router.post("/connections/{connection_id}/tokens/{token_id}/reveal")
+async def reveal_connection_token(
+    connection_id: str,
+    token_id: str,
+    request: Request,
+    response: Response,
+    principal: TenantPrincipal = Depends(_reveal_principal),
+):
+    response.headers.update(_NO_STORE_HEADERS)
+    await _require_empty_body(request)
+    return connections.reveal_connection_token_use_case(
+        principal.tenant_id,
+        connection_id,
+        token_id,
+        request,
+        principal_type="tenant",
+        principal_key=principal.tenant_id,
     )
 
 
