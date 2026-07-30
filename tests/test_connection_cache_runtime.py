@@ -137,6 +137,26 @@ async def test_declared_ttl_serves_a_repeated_read_from_cache() -> None:
 
 
 @pytest.mark.asyncio
+async def test_explicit_bypass_executes_a_cached_read_against_the_connector() -> None:
+    connector = _CountingConnector()
+    runtime = _runtime(connector)
+    context = _context()
+
+    cached = await runtime.execute(context, "reports.list", {})
+    repeated = await runtime.execute(context, "reports.list", {})
+    fresh = await runtime.execute(
+        context,
+        "reports.list",
+        {},
+        bypass_cache=True,
+    )
+
+    assert cached.data == repeated.data == {"call": 1}
+    assert fresh.data == {"call": 2}
+    assert len(connector.calls) == 2
+
+
+@pytest.mark.asyncio
 async def test_direct_mode_honors_an_explicit_tool_cache_ttl() -> None:
     connector = _CountingConnector()
     runtime = _runtime(connector)

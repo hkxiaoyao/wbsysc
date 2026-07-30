@@ -1,7 +1,7 @@
 import { useEffect, useMemo, useRef, useState } from 'react'
 import { Alert, Button, Checkbox, Form, Input, InputNumber, Space, Steps, Tag, Typography, Upload, message } from 'antd'
 import { InboxOutlined, SafetyCertificateOutlined } from '@ant-design/icons'
-import api from '../api.js'
+import defaultApi from '../api.js'
 import DeclarativeToolBuilder from './DeclarativeToolBuilder.jsx'
 import {
   buildMcpToolsExtension,
@@ -12,6 +12,8 @@ import {
 } from './declarativeToolView.js'
 import {
   canEnableWriteTool,
+  apiClientEndpoint,
+  connectionResourceEndpoint,
   createWizardState,
   hasExplicitPolicies,
   invalidateWizardState,
@@ -37,7 +39,13 @@ function schemaSummary(value) {
   return JSON.stringify(value, null, 2)
 }
 
-export default function DeclarativeSpecWizard({ connection, active = true, onChanged = () => {} }) {
+export default function DeclarativeSpecWizard({
+  connection,
+  active = true,
+  apiClient = defaultApi,
+  scope = 'admin',
+  onChanged = () => {},
+}) {
   const [state, setState] = useState(() => createWizardState(connection))
   const [tools, setTools] = useState([])
   const [policies, setPolicies] = useState([])
@@ -81,7 +89,10 @@ export default function DeclarativeSpecWizard({ connection, active = true, onCha
     if (!active) setCredentialsText('{}')
   }, [active])
 
-  const base = `/admin/connections/${encodeURIComponent(connection.connection_id)}`
+  const base = apiClientEndpoint(
+    apiClient,
+    connectionResourceEndpoint(scope, connection.connection_id),
+  )
   const policyComplete = useMemo(() => hasExplicitPolicies(tools, policies), [tools, policies])
   const requiredCredentials = useMemo(() => requiredCredentialKeys(credentialSchema), [credentialSchema])
   const patchState = (patch) => setState((current) => ({ ...current, ...patch }))
@@ -130,7 +141,7 @@ export default function DeclarativeSpecWizard({ connection, active = true, onCha
   }
 
   const disableActive = async () => {
-    const result = await run('disable', () => api.post(`${base}/disable`), '连接已停用，可以安全准备待激活修订')
+    const result = await run('disable', () => apiClient.post(`${base}/disable`), '连接已停用，可以安全准备待激活修订')
     if (result) {
       patchState({ mustDisable: false })
       onChanged(result.data?.connection)
@@ -158,7 +169,7 @@ export default function DeclarativeSpecWizard({ connection, active = true, onCha
     setCompositeImported(false)
     setCompositeValidated(false)
     setValidationPreview(null)
-    const result = await run('import', () => api.post(`${base}/specs/import`, {
+    const result = await run('import', () => apiClient.post(`${base}/specs/import`, {
       document: sourceText,
       spec_id: identity.specId,
       revision: identity.revision,
@@ -178,7 +189,7 @@ export default function DeclarativeSpecWizard({ connection, active = true, onCha
   const validate = async () => {
     const identity = captureIdentity()
     const ticket = sourceGeneration.current.begin({ ...identity, phase: 'source-validate' })
-    const result = await run('validate', () => api.post(
+    const result = await run('validate', () => apiClient.post(
       `${base}/specs/${encodeURIComponent(identity.specId)}/revisions/${identity.revision}/validate`,
     ), '原始规范后端验证通过', () => sourceGeneration.current.isCurrent(ticket) && identityIsCurrent(identity))
     if (!result || !sourceGeneration.current.isCurrent(ticket) || !identityIsCurrent(identity)) return
@@ -247,7 +258,7 @@ export default function DeclarativeSpecWizard({ connection, active = true, onCha
       version: identityVersion.current,
     }
     const ticket = sourceGeneration.current.begin({ ...nextIdentity, phase: 'merged-import' })
-    const result = await run('composite-import', () => api.post(`${base}/specs/import`, {
+    const result = await run('composite-import', () => apiClient.post(`${base}/specs/import`, {
       document: mergedDocument,
       spec_id: nextIdentity.specId,
       revision: nextIdentity.revision,
@@ -270,7 +281,7 @@ export default function DeclarativeSpecWizard({ connection, active = true, onCha
     if (!compositeImported) return
     const identity = captureIdentity()
     const ticket = sourceGeneration.current.begin({ ...identity, phase: 'merged-validate' })
-    const result = await run('composite-validate', () => api.post(
+    const result = await run('composite-validate', () => apiClient.post(
       `${base}/specs/${encodeURIComponent(identity.specId)}/revisions/${identity.revision}/validate`,
     ), '组合工具草稿后端验证通过', () => sourceGeneration.current.isCurrent(ticket) && identityIsCurrent(identity))
     if (!result || !sourceGeneration.current.isCurrent(ticket) || !identityIsCurrent(identity)) return
@@ -292,11 +303,11 @@ export default function DeclarativeSpecWizard({ connection, active = true, onCha
   const publish = async () => {
     const identity = captureIdentity()
     const ticket = sourceGeneration.current.begin({ ...identity, phase: 'publish' })
-    const result = await run('publish', () => api.post(
+    const result = await run('publish', () => apiClient.post(
       `${base}/specs/${encodeURIComponent(identity.specId)}/revisions/${identity.revision}/publish`,
     ), '待激活修订已发布', () => sourceGeneration.current.isCurrent(ticket) && identityIsCurrent(identity))
     if (!result || !sourceGeneration.current.isCurrent(ticket) || !identityIsCurrent(identity)) return
-    const toolResponse = await run('tools', () => api.get(`${base}/tools`), '', () => (
+    const toolResponse = await run('tools', () => apiClient.get(`${base}/tools`), '', () => (
       sourceGeneration.current.isCurrent(ticket) && identityIsCurrent(identity)
     ))
     if (!toolResponse || !sourceGeneration.current.isCurrent(ticket) || !identityIsCurrent(identity)) return
@@ -322,7 +333,7 @@ export default function DeclarativeSpecWizard({ connection, active = true, onCha
     const identity = captureIdentity()
     let credentials
     try { credentials = jsonObject(credentialsText) } catch (parseError) { setError(parseError.message); return }
-    const result = await run('credentials', () => api.put(`${base}/credentials`, { credentials }), '待激活修订凭据已替换')
+    const result = await run('credentials', () => apiClient.put(`${base}/credentials`, { credentials }), '待激活修订凭据已替换')
     if (result && identityIsCurrent(identity)) {
       setCredentialsText('{}')
       patchState({ credentialsSaved: true, step: 5 })
@@ -349,20 +360,20 @@ export default function DeclarativeSpecWizard({ connection, active = true, onCha
     }
     const identity = captureIdentity()
     const submittedPolicies = policies.map((policy) => ({ ...policy }))
-    const result = await run('policies', () => api.put(`${base}/tools`, { policies: submittedPolicies }), '工具策略已保存')
+    const result = await run('policies', () => apiClient.put(`${base}/tools`, { policies: submittedPolicies }), '工具策略已保存')
     if (result && identityIsCurrent(identity)) patchState({ policiesSaved: true, step: 6 })
   }
 
   const testConnection = async () => {
     if (!state.published || !state.mappingReviewed || !state.credentialsSaved || !state.policiesSaved) return
     const identity = captureIdentity()
-    const result = await run('test', () => api.post(`${base}/test`), '真实安全只读连接测试通过')
+    const result = await run('test', () => apiClient.post(`${base}/test`), '真实安全只读连接测试通过')
     if (result && identityIsCurrent(identity)) patchState({ tested: true, step: 7 })
   }
 
   const activate = async () => {
     const identity = captureIdentity()
-    const result = await run('activate', () => api.post(
+    const result = await run('activate', () => apiClient.post(
       `${base}/specs/${encodeURIComponent(identity.specId)}/revisions/${identity.revision}/activate`,
     ), '连接已激活')
     if (result && identityIsCurrent(identity)) {

@@ -368,6 +368,36 @@ async def sync_connection(
     )
 
 
+@router.post("/connections/{connection_id}/openapi/analyze")
+def analyze_openapi_connection(
+    connection_id: str,
+    body: connections.OpenApiAnalyzeRequest,
+    request: Request,
+    principal: TenantPrincipal = Depends(_mutation_principal),
+):
+    return connections.analyze_openapi_connection_use_case(
+        principal.tenant_id,
+        connection_id,
+        body,
+        request,
+    )
+
+
+@router.post("/connections/{connection_id}/openapi/activate")
+async def activate_openapi_connection(
+    connection_id: str,
+    body: connections.OpenApiActivateRequest,
+    request: Request,
+    principal: TenantPrincipal = Depends(_mutation_principal),
+):
+    return await connections.activate_openapi_connection_use_case(
+        principal.tenant_id,
+        connection_id,
+        body,
+        request,
+    )
+
+
 @router.post("/connections/{connection_id}/specs/import", status_code=201)
 def import_connection_spec(
     connection_id: str,

@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import hashlib
+import hmac
 import inspect
 import json
 import logging
@@ -228,6 +229,19 @@ class OpenApiImportRequest(_StrictModel):
     revision: int = Field(ge=1)
     allowed_hosts: list[str] | None = None
     sync_spec: dict[str, Any] | None = None
+
+
+class OpenApiAnalyzeRequest(_StrictModel):
+    document: Any
+
+
+class OpenApiActivateRequest(_StrictModel):
+    spec_id: str = Field(pattern=r"^[A-Za-z0-9][A-Za-z0-9_.-]{0,63}$")
+    revision: int = Field(ge=1)
+    expected_config_version: int = Field(ge=1)
+    analysis_digest: str = Field(pattern=r"^[0-9a-f]{64}$")
+    credentials: Any = Field(default_factory=dict)
+    enabled_write_tools: list[str] = Field(default_factory=list, max_length=512)
 
 
 def _registry(request: Request):
@@ -813,6 +827,48 @@ def _declarative_preview(revision: Any) -> dict[str, Any]:
 _OMIT = object()
 
 
+def _openapi_analysis_digest(
+    record: ConnectionRecord,
+    revision: Any,
+) -> str:
+    """Bind a quick-onboarding analysis to its owned compiled revision."""
+    try:
+        if (
+            (
+                revision.spec_id != record.public_config.get("spec_id")
+                and revision.spec_id
+                != record.public_config.get("pending_spec_id")
+            )
+            or revision.tenant_id != record.tenant_id
+            or revision.connection_id != record.connection_id
+        ):
+            raise ValueError("revision identity mismatch")
+        payload = {
+            "tenant_id": record.tenant_id,
+            "connection_id": record.connection_id,
+            "spec_id": revision.spec_id,
+            "revision": revision.revision,
+            "compiled": revision.storage_document(),
+        }
+        canonical = json.dumps(
+            payload,
+            ensure_ascii=False,
+            allow_nan=False,
+            sort_keys=True,
+            separators=(",", ":"),
+        ).encode("utf-8")
+    except (
+        AttributeError,
+        SpecValidationError,
+        TypeError,
+        ValueError,
+        OverflowError,
+        RecursionError,
+    ):
+        raise HTTPException(409, "openapi analysis is unavailable") from None
+    return hashlib.sha256(canonical).hexdigest()
+
+
 def _safe_connection(record: ConnectionRecord, spec: ConnectorSpec) -> dict[str, Any]:
     return {
         "connection_id": record.connection_id,
@@ -1345,8 +1401,15 @@ def replace_connection_credentials_use_case(
     connection_id: str,
     body: CredentialReplaceRequest,
     request: Request,
+    *,
+    expected_config_version: int | None = None,
 ):
     record = _owned(tenant_id, connection_id)
+    if (
+        expected_config_version is not None
+        and record.config_version != expected_config_version
+    ):
+        raise HTTPException(409, "connection configuration changed")
     values = _credentials(body.credentials)
     _validate_schema(
         values, _credential_spec_for_record(request, record).credential_schema
@@ -1672,8 +1735,15 @@ def update_connection_tools_use_case(
     connection_id: str,
     body: ToolPoliciesRequest,
     request: Request,
+    *,
+    expected_config_version: int | None = None,
 ):
     record = _owned(tenant_id, connection_id)
+    if (
+        expected_config_version is not None
+        and record.config_version != expected_config_version
+    ):
+        raise HTTPException(409, "connection configuration changed")
     spec = _management_spec_for_record(request, record)
     declared = {tool.tool_key: tool for tool in spec.tools}
     policies: list[ToolPolicy] = []
@@ -1721,7 +1791,11 @@ def update_connection_tools_global(connection_id: str, body: ToolPoliciesRequest
 
 
 async def test_connection_use_case(
-    tenant_id: str, connection_id: str, request: Request
+    tenant_id: str,
+    connection_id: str,
+    request: Request,
+    *,
+    bypass_cache: bool = False,
 ):
     record = _owned(tenant_id, connection_id)
     execution_record = _management_record(record)
@@ -1751,7 +1825,19 @@ async def test_connection_use_case(
         )
         if tool is None:
             raise HTTPException(409, "connection test is unsupported")
-        result = await gateway._runtime.execute(execution_context, tool.tool_key, {})
+        if bypass_cache:
+            result = await gateway._runtime.execute(
+                execution_context,
+                tool.tool_key,
+                {},
+                bypass_cache=True,
+            )
+        else:
+            result = await gateway._runtime.execute(
+                execution_context,
+                tool.tool_key,
+                {},
+            )
     except HTTPException:
         raise
     except Exception as exc:
@@ -2026,9 +2112,16 @@ def activate_connection_spec_use_case(
     spec_id: str,
     revision: int,
     request: Request,
+    *,
+    expected_config_version: int | None = None,
 ):
     current = _owned(tenant_id, connection_id)
     _require_declarative(current)
+    if (
+        expected_config_version is not None
+        and current.config_version != expected_config_version
+    ):
+        raise HTTPException(409, "connection configuration changed")
     if _pending_revision_identity(current) != (spec_id, revision):
         raise HTTPException(409, "pending declarative revision is unavailable")
     spec = _declarative_candidate_spec(
@@ -2082,5 +2175,285 @@ def activate_connection_spec_global(connection_id: str, spec_id: str, revision: 
         connection_id,
         spec_id,
         revision,
+        request,
+    )
+
+
+def _published_openapi_revision(
+    record: ConnectionRecord,
+    spec_id: str,
+    revision: int,
+) -> Any:
+    try:
+        stored = store.get_declarative_revision(
+            spec_id,
+            revision,
+            record.tenant_id,
+            record.connection_id,
+        )
+        if stored is None:
+            raise HTTPException(409, "openapi analysis is unavailable")
+        compiled = validate_revision(stored, data_mode=record.data_mode)
+        if (
+            compiled.status != "published"
+            or compiled.spec_id != spec_id
+            or compiled.revision != revision
+            or compiled.tenant_id != record.tenant_id
+            or compiled.connection_id != record.connection_id
+        ):
+            raise HTTPException(409, "openapi analysis is unavailable")
+        compiled.connector_spec()
+        return compiled
+    except HTTPException:
+        raise
+    except (
+        AttributeError,
+        SpecValidationError,
+        TypeError,
+        ValueError,
+        OverflowError,
+        RecursionError,
+    ):
+        raise HTTPException(409, "openapi analysis is unavailable") from None
+
+
+def _require_openapi_analysis(
+    tenant_id: str,
+    connection_id: str,
+    body: OpenApiActivateRequest,
+    *,
+    check_expected_version: bool,
+) -> tuple[ConnectionRecord, Any]:
+    current = _owned(tenant_id, connection_id)
+    _require_declarative(current)
+    if (
+        check_expected_version
+        and current.config_version != body.expected_config_version
+    ):
+        raise HTTPException(409, "connection configuration changed")
+    if _pending_revision_identity(current) != (body.spec_id, body.revision):
+        raise HTTPException(409, "openapi analysis changed")
+    compiled = _published_openapi_revision(
+        current,
+        body.spec_id,
+        body.revision,
+    )
+    digest = _openapi_analysis_digest(current, compiled)
+    if not hmac.compare_digest(digest, body.analysis_digest):
+        raise HTTPException(409, "openapi analysis changed")
+    return current, compiled
+
+
+def analyze_openapi_connection_use_case(
+    tenant_id: str,
+    connection_id: str,
+    body: OpenApiAnalyzeRequest,
+    request: Request,
+):
+    current = _owned(tenant_id, connection_id)
+    _require_declarative(current)
+    if current.status not in {"draft", "disabled"}:
+        raise HTTPException(409, "disable connection before changing revision")
+
+    spec_id = f"quick-{uuid.uuid4().hex}"
+    revision = 1
+    imported = OpenApiImportRequest(
+        document=body.document,
+        spec_id=spec_id,
+        revision=revision,
+    )
+    import_connection_spec_use_case(
+        tenant_id,
+        connection_id,
+        imported,
+        request,
+    )
+    validate_connection_spec_use_case(
+        tenant_id,
+        connection_id,
+        spec_id,
+        revision,
+        request,
+    )
+    publish_connection_spec_use_case(
+        tenant_id,
+        connection_id,
+        spec_id,
+        revision,
+        request,
+    )
+
+    published_record = _owned(tenant_id, connection_id)
+    if _pending_revision_identity(published_record) != (spec_id, revision):
+        raise HTTPException(409, "openapi analysis changed")
+    compiled = _published_openapi_revision(
+        published_record,
+        spec_id,
+        revision,
+    )
+    spec = _declarative_candidate_spec(
+        request,
+        published_record,
+        spec_id,
+        revision,
+    )
+    return {
+        "spec_id": spec_id,
+        "revision": revision,
+        "status": "published",
+        "config_version": published_record.config_version,
+        "analysis_digest": _openapi_analysis_digest(
+            published_record,
+            compiled,
+        ),
+        "credential_schema": _plain_schema_metadata(spec.credential_schema),
+        "preview": _declarative_preview(compiled),
+    }
+
+
+async def activate_openapi_connection_use_case(
+    tenant_id: str,
+    connection_id: str,
+    body: OpenApiActivateRequest,
+    request: Request,
+):
+    current, _compiled = _require_openapi_analysis(
+        tenant_id,
+        connection_id,
+        body,
+        check_expected_version=True,
+    )
+    if not isinstance(body.credentials, Mapping):
+        _schema_error()
+    values = _credentials(body.credentials)
+    spec = _declarative_candidate_spec(
+        request,
+        current,
+        body.spec_id,
+        body.revision,
+    )
+    _validate_schema(values, spec.credential_schema)
+
+    declared = {tool.tool_key: tool for tool in spec.tools}
+    enabled_write_tools = set(body.enabled_write_tools)
+    if len(enabled_write_tools) != len(body.enabled_write_tools) or any(
+        tool_key not in declared
+        or declared[tool_key].operation_kind != "write"
+        for tool_key in enabled_write_tools
+    ):
+        raise HTTPException(422, "invalid write tool selection")
+    policies = [
+        PolicyInput(
+            tool_key=tool.tool_key,
+            enabled=(
+                tool.operation_kind == "read"
+                or tool.tool_key in enabled_write_tools
+            ),
+            allow_write=(
+                tool.operation_kind == "write"
+                and tool.tool_key in enabled_write_tools
+            ),
+        )
+        for tool in spec.tools
+    ]
+
+    replace_connection_credentials_use_case(
+        tenant_id,
+        connection_id,
+        CredentialReplaceRequest(credentials=values),
+        request,
+        expected_config_version=current.config_version,
+    )
+    after_credentials, _ = _require_openapi_analysis(
+        tenant_id,
+        connection_id,
+        body,
+        check_expected_version=False,
+    )
+    if after_credentials.config_version != current.config_version + 1:
+        raise HTTPException(409, "connection configuration changed")
+    update_connection_tools_use_case(
+        tenant_id,
+        connection_id,
+        ToolPoliciesRequest(policies=policies),
+        request,
+        expected_config_version=after_credentials.config_version,
+    )
+    test_record, _ = _require_openapi_analysis(
+        tenant_id,
+        connection_id,
+        body,
+        check_expected_version=False,
+    )
+    if test_record.config_version != after_credentials.config_version + 1:
+        raise HTTPException(409, "connection configuration changed")
+    await test_connection_use_case(
+        tenant_id,
+        connection_id,
+        request,
+        bypass_cache=True,
+    )
+    after_test, _ = _require_openapi_analysis(
+        tenant_id,
+        connection_id,
+        body,
+        check_expected_version=False,
+    )
+    if after_test.config_version != test_record.config_version:
+        raise HTTPException(409, "connection configuration changed")
+    expected_policies = {
+        item.tool_key: ToolPolicy(
+            connection_id,
+            item.tool_key,
+            item.enabled,
+            {"allow_write": item.allow_write},
+        )
+        for item in policies
+    }
+    configured_policies = store.list_tool_policies(connection_id)
+    if (
+        len(configured_policies) != len(expected_policies)
+        or {
+            policy.tool_name: policy for policy in configured_policies
+        }
+        != expected_policies
+    ):
+        raise HTTPException(409, "connection configuration changed")
+    return activate_connection_spec_use_case(
+        tenant_id,
+        connection_id,
+        body.spec_id,
+        body.revision,
+        request,
+        expected_config_version=after_test.config_version,
+    )
+
+
+@router.post("/connections/{connection_id}/openapi/analyze")
+def analyze_openapi_connection_global(
+    connection_id: str,
+    body: OpenApiAnalyzeRequest,
+    request: Request,
+):
+    require_same_origin(request)
+    return analyze_openapi_connection_use_case(
+        _global_owner(connection_id).tenant_id,
+        connection_id,
+        body,
+        request,
+    )
+
+
+@router.post("/connections/{connection_id}/openapi/activate")
+async def activate_openapi_connection_global(
+    connection_id: str,
+    body: OpenApiActivateRequest,
+    request: Request,
+):
+    require_same_origin(request)
+    return await activate_openapi_connection_use_case(
+        _global_owner(connection_id).tenant_id,
+        connection_id,
+        body,
         request,
     )

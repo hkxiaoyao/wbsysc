@@ -306,6 +306,241 @@ def _compiled_preview_with_bounds(
     )
 
 
+def _quick_openapi_revision(*, status="published"):
+    document = {
+        "openapi": "3.0.3",
+        "servers": [{"url": "https://api.example.com"}],
+        "components": {
+            "securitySchemes": {
+                "ApiKey": {
+                    "type": "apiKey",
+                    "in": "header",
+                    "name": "X-API-Key",
+                    "x-credential-key": "api_key",
+                }
+            }
+        },
+        "security": [{"ApiKey": []}],
+        "paths": {
+            "/health": {
+                "get": {
+                    "operationId": "health.check",
+                    "responses": {
+                        "200": {
+                            "description": "ok",
+                            "content": {
+                                "application/json": {
+                                    "schema": {
+                                        "type": "object",
+                                        "properties": {
+                                            "ok": {"type": "boolean"}
+                                        },
+                                    }
+                                }
+                            },
+                        }
+                    },
+                }
+            },
+            "/items": {
+                "post": {
+                    "operationId": "items.create",
+                    "x-write-enabled": True,
+                    "responses": {
+                        "200": {
+                            "description": "ok",
+                            "content": {
+                                "application/json": {
+                                    "schema": {
+                                        "type": "object",
+                                        "properties": {
+                                            "id": {"type": "string"}
+                                        },
+                                    }
+                                }
+                            },
+                        }
+                    },
+                }
+            },
+            "/items/archive": {
+                "post": {
+                    "operationId": "items.archive",
+                    "x-write-enabled": True,
+                    "responses": {
+                        "200": {
+                            "description": "ok",
+                            "content": {
+                                "application/json": {
+                                    "schema": {
+                                        "type": "object",
+                                        "properties": {
+                                            "id": {"type": "string"}
+                                        },
+                                    }
+                                }
+                            },
+                        }
+                    },
+                }
+            },
+        },
+    }
+    return import_openapi_revision(
+        document,
+        spec_id="quick-analysis",
+        revision=1,
+        tenant_id="tenant-a",
+        connection_id="conn-a",
+        status=status,
+    )
+
+
+def _install_quick_activation(
+    monkeypatch,
+    client,
+    *,
+    execute_error=None,
+    credential_version_increment=1,
+    policy_version_increment=1,
+):
+    compiled = _quick_openapi_revision()
+    state = {
+        "record": _record(
+            connector_key="http_declarative",
+            status="draft",
+            public_config={"spec_id": compiled.spec_id, "revision": 1},
+            config_version=8,
+        )
+    }
+    captured = {
+        "credentials": None,
+        "policies": [],
+        "executed": [],
+        "bypass_cache": [],
+        "activated": [],
+    }
+
+    monkeypatch.setattr(
+        admin_connections.store,
+        "get_connection",
+        lambda connection_id, tenant_id=None: state["record"],
+    )
+    monkeypatch.setattr(
+        admin_connections.store,
+        "get_declarative_revision",
+        lambda *args: compiled,
+    )
+    monkeypatch.setattr(
+        admin_connections,
+        "_declarative_candidate_spec",
+        lambda *args: compiled.connector_spec(),
+    )
+
+    def replace_credentials(connection_id, tenant_id, credentials, **kwargs):
+        assert kwargs["expected_config_version"] == state["record"].config_version
+        captured["credentials"] = dict(credentials)
+        state["record"] = replace(
+            state["record"],
+            config_version=(
+                state["record"].config_version + credential_version_increment
+            ),
+        )
+        return True
+
+    def replace_policies(connection_id, tenant_id, policies, **kwargs):
+        assert kwargs["expected_config_version"] == state["record"].config_version
+        captured["policies"] = list(policies)
+        state["record"] = replace(
+            state["record"],
+            config_version=(
+                state["record"].config_version + policy_version_increment
+            ),
+        )
+        return True
+
+    def activate_revision(*args, **kwargs):
+        assert kwargs["expected_config_version"] == state["record"].config_version
+        captured["activated"].append((args[0], args[1]))
+        state["record"] = replace(
+            state["record"],
+            status="active",
+            config_version=state["record"].config_version + 1,
+        )
+        return state["record"]
+
+    monkeypatch.setattr(
+        admin_connections.store, "replace_credentials", replace_credentials
+    )
+    monkeypatch.setattr(
+        admin_connections.store, "replace_tool_policies", replace_policies
+    )
+    monkeypatch.setattr(
+        admin_connections.store,
+        "list_tool_policies",
+        lambda connection_id: list(captured["policies"]),
+    )
+    monkeypatch.setattr(
+        admin_connections.store,
+        "activate_declarative_revision",
+        activate_revision,
+    )
+    monkeypatch.setattr(admin_connections, "write_event", lambda event: True)
+
+    class Resolver:
+        def execution_context(self, ctx):
+            return ConnectionContext(
+                connection=replace(
+                    state["record"], public_config=dict(ctx.public_config)
+                ),
+                credentials=dict(captured["credentials"] or {}),
+            )
+
+    class Runtime:
+        def list_enabled_tools(self, context):
+            enabled = {
+                policy.tool_name
+                for policy in captured["policies"]
+                if policy.enabled
+            }
+            return tuple(
+                tool
+                for tool in compiled.connector_spec().tools
+                if tool.tool_key in enabled
+            )
+
+        async def execute(
+            self,
+            context,
+            tool_key,
+            args,
+            *,
+            bypass_cache=False,
+        ):
+            captured["executed"].append((tool_key, args))
+            captured["bypass_cache"].append(bypass_cache)
+            if execute_error is not None:
+                raise execute_error
+            return SimpleNamespace(status="ok")
+
+    client.app.state.mcp_gateway = SimpleNamespace(
+        resolver=Resolver(),
+        _runtime=Runtime(),
+    )
+    digest = admin_connections._openapi_analysis_digest(
+        state["record"], compiled
+    )
+    body = {
+        "spec_id": compiled.spec_id,
+        "revision": 1,
+        "expected_config_version": 8,
+        "analysis_digest": digest,
+        "credentials": {"api_key": "quick-secret-value"},
+        "enabled_write_tools": ["items.create"],
+    }
+    return state, captured, body
+
+
 def _client(monkeypatch, *, authed=True):
     app = FastAPI()
     app.state.connector_registry = ConnectorRegistry([_Connector()])
@@ -319,6 +554,295 @@ def test_connection_api_requires_admin_session(monkeypatch):
     client = _client(monkeypatch, authed=False)
     assert client.get("/admin/tenants/tenant-a/connections").status_code == 401
     assert client.post("/admin/tenants/tenant-a/connections", json={}).status_code == 401
+
+
+@pytest.mark.parametrize(
+    ("path", "payload"),
+    (
+        (
+            "/admin/connections/conn-a/openapi/analyze",
+            {"document": {"openapi": "3.0.3", "paths": {}}},
+        ),
+        (
+            "/admin/connections/conn-a/openapi/activate",
+            {
+                "spec_id": "quick-analysis",
+                "revision": 1,
+                "expected_config_version": 8,
+                "analysis_digest": "a" * 64,
+                "credentials": {},
+                "enabled_write_tools": [],
+            },
+        ),
+    ),
+)
+def test_quick_openapi_admin_mutations_require_same_origin_before_lookup(
+    monkeypatch,
+    path,
+    payload,
+):
+    calls = []
+    monkeypatch.setattr(
+        admin_connections.store,
+        "get_connection",
+        lambda *args: calls.append(args),
+    )
+    client = _client(monkeypatch)
+
+    missing = client.post(path, json=payload)
+    cross_site = client.post(
+        path,
+        json=payload,
+        headers={"Origin": "https://attacker.invalid"},
+    )
+
+    assert missing.status_code == 403
+    assert cross_site.status_code == 403
+    assert calls == []
+
+
+def test_quick_openapi_analyze_imports_validates_and_publishes(monkeypatch):
+    client = _client(monkeypatch)
+    spec_id = "quick-" + "a" * 32
+    initial = _record(
+        connector_key="http_declarative",
+        status="draft",
+        public_config={},
+        config_version=7,
+    )
+    state = {"record": initial, "revision": None}
+    calls = []
+    template = _quick_openapi_revision(status="draft")
+    derived_spec = template.connector_spec()
+    credential_properties = dict(derived_spec.credential_schema["properties"])
+    candidate_spec = replace(
+        derived_spec,
+        credential_schema={
+            "type": "object",
+            "properties": credential_properties,
+            "required": sorted(credential_properties),
+            "additionalProperties": False,
+        },
+    )
+    monkeypatch.setattr(
+        admin_connections.uuid,
+        "uuid4",
+        lambda: SimpleNamespace(hex="a" * 32),
+    )
+    monkeypatch.setattr(
+        admin_connections.store,
+        "get_connection",
+        lambda connection_id, tenant_id=None: state["record"],
+    )
+
+    def importer(document, **kwargs):
+        calls.append(("import", kwargs["spec_id"], kwargs["revision"]))
+        return replace(
+            template,
+            spec_id=kwargs["spec_id"],
+            revision=kwargs["revision"],
+        )
+
+    def save_revision(revision, **kwargs):
+        assert kwargs["expected_config_version"] == 7
+        state["revision"] = revision
+
+    def publish_revision(
+        requested_spec_id,
+        revision,
+        tenant_id,
+        connection_id,
+        **kwargs,
+    ):
+        calls.append(("publish", requested_spec_id, revision))
+        assert kwargs["expected_config_version"] == 7
+        state["revision"] = replace(state["revision"], status="published")
+        state["record"] = replace(
+            state["record"],
+            public_config={"spec_id": requested_spec_id, "revision": revision},
+            config_version=8,
+        )
+        return state["revision"]
+
+    monkeypatch.setattr(admin_connections, "import_openapi_revision", importer)
+    monkeypatch.setattr(
+        admin_connections.store, "save_declarative_revision", save_revision
+    )
+    monkeypatch.setattr(
+        admin_connections.store,
+        "get_declarative_revision",
+        lambda *args: state["revision"],
+    )
+    monkeypatch.setattr(
+        admin_connections.store,
+        "publish_declarative_revision",
+        publish_revision,
+    )
+    monkeypatch.setattr(
+        admin_connections,
+        "_declarative_candidate_spec",
+        lambda *args: candidate_spec,
+    )
+    monkeypatch.setattr(admin_connections, "write_event", lambda event: True)
+
+    response = client.post(
+        "/admin/connections/conn-a/openapi/analyze",
+        json={"document": {"openapi": "3.0.3", "secret": "raw-secret"}},
+        headers={"Origin": "http://testserver"},
+    )
+
+    assert response.status_code == 200
+    result = response.json()
+    assert result["spec_id"] == spec_id
+    assert result["revision"] == 1
+    assert result["status"] == "published"
+    assert result["config_version"] == 8
+    assert len(result["analysis_digest"]) == 64
+    assert result["credential_schema"]["properties"] == {
+        "api_key": {"type": "string", "writeOnly": True}
+    }
+    assert result["credential_schema"]["required"] == ["api_key"]
+    assert result["credential_schema"]["additionalProperties"] is False
+    assert {
+        tool["tool_key"]: tool["operation_kind"]
+        for tool in result["preview"]["tools"]
+    } == {
+        "health.check": "read",
+        "items.create": "write",
+        "items.archive": "write",
+    }
+    assert calls == [("import", spec_id, 1), ("publish", spec_id, 1)]
+    assert "raw-secret" not in repr(result)
+
+
+def test_quick_openapi_activate_builds_complete_safe_policies(monkeypatch):
+    client = _client(monkeypatch)
+    state, captured, body = _install_quick_activation(monkeypatch, client)
+
+    response = client.post(
+        "/admin/connections/conn-a/openapi/activate",
+        json=body,
+        headers={"Origin": "http://testserver"},
+    )
+
+    assert response.status_code == 200
+    assert state["record"].status == "active"
+    assert state["record"].config_version == 11
+    assert captured["activated"] == [("quick-analysis", 1)]
+    assert captured["executed"] == [("health.check", {})]
+    assert captured["bypass_cache"] == [True]
+    assert [
+        (policy.tool_name, policy.enabled, policy.policy)
+        for policy in captured["policies"]
+    ] == [
+        ("health.check", True, {"allow_write": False}),
+        ("items.create", True, {"allow_write": True}),
+        ("items.archive", False, {"allow_write": False}),
+    ]
+    assert "quick-secret-value" not in response.text
+
+
+@pytest.mark.parametrize(
+    "enabled_write_tools",
+    [["unknown.tool"], ["health.check"], ["items.create", "items.create"]],
+)
+def test_quick_openapi_activate_rejects_invalid_write_confirmation(
+    monkeypatch,
+    enabled_write_tools,
+):
+    client = _client(monkeypatch)
+    state, captured, body = _install_quick_activation(monkeypatch, client)
+    body["enabled_write_tools"] = enabled_write_tools
+
+    response = client.post(
+        "/admin/connections/conn-a/openapi/activate",
+        json=body,
+        headers={"Origin": "http://testserver"},
+    )
+
+    assert response.status_code == 422
+    assert response.json()["detail"] == "invalid write tool selection"
+    assert state["record"].config_version == 8
+    assert captured["credentials"] is None
+    assert captured["policies"] == []
+
+
+def test_quick_openapi_activate_rejects_stale_version_and_digest(monkeypatch):
+    client = _client(monkeypatch)
+    state, captured, body = _install_quick_activation(monkeypatch, client)
+
+    stale_version = client.post(
+        "/admin/connections/conn-a/openapi/activate",
+        json={**body, "expected_config_version": 7},
+        headers={"Origin": "http://testserver"},
+    )
+    stale_digest = client.post(
+        "/admin/connections/conn-a/openapi/activate",
+        json={**body, "analysis_digest": "0" * 64},
+        headers={"Origin": "http://testserver"},
+    )
+
+    assert stale_version.status_code == 409
+    assert stale_version.json()["detail"] == "connection configuration changed"
+    assert stale_digest.status_code == 409
+    assert stale_digest.json()["detail"] == "openapi analysis changed"
+    assert state["record"].config_version == 8
+    assert captured["credentials"] is None
+
+
+@pytest.mark.parametrize(
+    ("credential_version_increment", "policy_version_increment"),
+    ((2, 1), (1, 2)),
+)
+def test_quick_openapi_activate_rejects_concurrent_mutation_between_stages(
+    monkeypatch,
+    credential_version_increment,
+    policy_version_increment,
+):
+    client = _client(monkeypatch)
+    state, captured, body = _install_quick_activation(
+        monkeypatch,
+        client,
+        credential_version_increment=credential_version_increment,
+        policy_version_increment=policy_version_increment,
+    )
+
+    response = client.post(
+        "/admin/connections/conn-a/openapi/activate",
+        json=body,
+        headers={"Origin": "http://testserver"},
+    )
+
+    assert response.status_code == 409
+    assert response.json()["detail"] == "connection configuration changed"
+    assert state["record"].status == "draft"
+    assert captured["activated"] == []
+    assert captured["executed"] == []
+
+
+def test_quick_openapi_test_failure_never_activates_or_leaks_sensitive_detail(
+    monkeypatch,
+):
+    client = _client(monkeypatch)
+    state, captured, body = _install_quick_activation(
+        monkeypatch,
+        client,
+        execute_error=RuntimeError(
+            "upstream response exposed quick-secret-value"
+        ),
+    )
+
+    response = client.post(
+        "/admin/connections/conn-a/openapi/activate",
+        json=body,
+        headers={"Origin": "http://testserver"},
+    )
+
+    assert response.status_code == 502
+    assert response.json()["detail"] == "connection test failed"
+    assert state["record"].status == "draft"
+    assert captured["activated"] == []
+    assert "quick-secret-value" not in response.text
 
 
 def test_validated_update_passes_owned_version_to_atomic_store_mutation(monkeypatch):

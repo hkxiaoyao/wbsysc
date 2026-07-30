@@ -1,6 +1,6 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
 import {
-  Alert, Button, Drawer, Empty, Form, Grid, Input, InputNumber, Modal, Select, Space, Switch, Table, Tabs, Tag, Typography, Upload, message,
+  Alert, Button, Collapse, Drawer, Empty, Form, Grid, Input, InputNumber, Modal, Select, Space, Switch, Table, Tabs, Tag, Typography, Upload, message,
 } from 'antd'
 import {
   ApiOutlined, CopyOutlined, FileSearchOutlined, PlusOutlined, ReloadOutlined,
@@ -8,6 +8,7 @@ import {
 } from '@ant-design/icons'
 import defaultApi from '../api.js'
 import DeclarativeSpecWizard from './DeclarativeSpecWizard.jsx'
+import OpenApiQuickOnboarding from './OpenApiQuickOnboarding.jsx'
 import {
   buildConnectionMcpConfig, buildWecomCredentials, buildWecomPublicConfig,
   canEnableWriteTool, closeTokenModal, copyConnectionMcpConfig, emptyWecomCredentialFields, safeServerError,
@@ -68,6 +69,7 @@ export default function Connections({ scope = 'admin', apiClient = defaultApi, t
   const [domainFileList, setDomainFileList] = useState([])
   const [tokenLabel, setTokenLabel] = useState('')
   const [activeTab, setActiveTab] = useState('config')
+  const [advancedOpen, setAdvancedOpen] = useState(false)
   const [tokenModal, setTokenModal] = useState(closeTokenModal)
   const [form] = Form.useForm()
   const [messageApi, contextHolder] = message.useMessage()
@@ -179,6 +181,7 @@ export default function Connections({ scope = 'admin', apiClient = defaultApi, t
     setDomainFileList([])
     setTokenLabel('')
     setTokenModal(closeTokenModal())
+    setAdvancedOpen(false)
   }, [tenantId])
   useEffect(() => {
     load()
@@ -211,7 +214,8 @@ export default function Connections({ scope = 'admin', apiClient = defaultApi, t
     const controller = new AbortController()
     detailController.current = controller
     setDetail(row)
-    setActiveTab('config')
+    setActiveTab(row.connector_key === 'http_declarative' ? 'wizard' : 'config')
+    setAdvancedOpen(false)
     setTools([])
     setTokens([])
     setConfigText(JSON.stringify(row.public_config || {}, null, 2))
@@ -259,6 +263,7 @@ export default function Connections({ scope = 'admin', apiClient = defaultApi, t
     setDomainFileList([])
     setTokenLabel('')
     setTokenModal(closeTokenModal())
+    setAdvancedOpen(false)
     openedInitialConnection.current = ''
   }, [initialConnectionId])
   useEffect(() => {
@@ -298,6 +303,7 @@ export default function Connections({ scope = 'admin', apiClient = defaultApi, t
     setTokenLabel('')
     setTokenModal(closeTokenModal())
     setActiveTab('config')
+    setAdvancedOpen(false)
   }
 
   const showToken = (connection, rawToken) => {
@@ -738,7 +744,39 @@ export default function Connections({ scope = 'admin', apiClient = defaultApi, t
     {
       key: 'operate', label: '测试与同步', children: <div className="connection-editor"><div className="connection-operation-grid"><Button icon={<SafetyCertificateOutlined />} loading={drawerBusy === 'test'} onClick={() => action('test', 'test', '安全连接测试通过')}>安全测试</Button><Button icon={<SyncOutlined />} disabled={detail.data_mode === 'direct' || detail.status !== 'active'} loading={drawerBusy === 'sync'} onClick={() => action('sync', 'sync', '同步已触发')}>立即同步</Button><Button danger disabled={detail.status === 'disabled'} loading={drawerBusy === 'disable'} onClick={() => action('disable', 'disable', '连接已停用')}>停用连接</Button><Button icon={<FileSearchOutlined />} onClick={() => onViewLogs(detail)}>查看该连接日志</Button></div></div>,
     },
-    ...(!tenantScope && detail.connector_key === 'http_declarative' ? [{ key: 'wizard', label: '声明式向导', children: <DeclarativeSpecWizard active={activeTab === 'wizard'} connection={detail} onChanged={(next) => { if (next && openDetailId.current === next.connection_id) setDetail(next); load() }} /> }] : []),
+    ...(detail.connector_key === 'http_declarative' ? [{
+      key: 'wizard',
+      label: 'OpenAPI 接入',
+      children: (
+        <>
+          <OpenApiQuickOnboarding
+            active={activeTab === 'wizard'}
+            apiClient={apiClient}
+            scope={scope}
+            connection={detail}
+            onChanged={(next) => { if (next && openDetailId.current === next.connection_id) setDetail(next); load() }}
+          />
+          <Collapse
+            style={{ marginTop: 16 }}
+            activeKey={advancedOpen ? ['advanced'] : []}
+            onChange={(keys) => setAdvancedOpen((Array.isArray(keys) ? keys : [keys]).includes('advanced'))}
+            items={[{
+              key: 'advanced',
+              label: '高级模式：组合工具与手工修订',
+              children: (
+                <DeclarativeSpecWizard
+                  active={activeTab === 'wizard' && advancedOpen}
+                  apiClient={apiClient}
+                  scope={scope}
+                  connection={detail}
+                  onChanged={(next) => { if (next && openDetailId.current === next.connection_id) setDetail(next); load() }}
+                />
+              ),
+            }]}
+          />
+        </>
+      ),
+    }] : []),
   ] : []
 
   return (
@@ -766,7 +804,7 @@ export default function Connections({ scope = 'admin', apiClient = defaultApi, t
       </section>
 
       <Drawer rootClassName="connection-drawer" title={detail ? `${detail.display_name} · 连接工作台` : '连接工作台'} open={Boolean(detail)} onClose={closeDetail} width={screens.lg ? 960 : screens.sm ? '92vw' : '100vw'} loading={drawerBusy === 'detail'} extra={detail && <Tag color={(STATUS_META[detail.status] || STATUS_META.disabled).color}>{(STATUS_META[detail.status] || STATUS_META.disabled).label}</Tag>}>
-        {detail && <><div className="connection-drawer-rail"><span><ApiOutlined /> {detail.connector_key}</span><span>{DATA_MODE[detail.data_mode] || detail.data_mode}</span><Text code>{endpoint(detail.connection_id)}</Text></div><Tabs activeKey={activeTab} items={tabs} onChange={(key) => { setActiveTab(key); if (key !== 'credentials') { setCredentialsText('{}'); setWecomCredentials(emptyWecomCredentialFields()) } }} /></>}
+        {detail && <><div className="connection-drawer-rail"><span><ApiOutlined /> {detail.connector_key}</span><span>{DATA_MODE[detail.data_mode] || detail.data_mode}</span><Text code>{endpoint(detail.connection_id)}</Text></div><Tabs activeKey={activeTab} items={tabs} onChange={(key) => { setActiveTab(key); if (key !== 'credentials') { setCredentialsText('{}'); setWecomCredentials(emptyWecomCredentialFields()) } if (key !== 'wizard') setAdvancedOpen(false) }} /></>}
       </Drawer>
 
       <Modal title="新建连接实例" open={createOpen} onCancel={closeCreate} onOk={create} confirmLoading={createBusy} okText="创建连接" cancelText="取消" width={620}>

@@ -91,6 +91,21 @@ def _create_payload():
     }
 
 
+def _openapi_analyze_payload():
+    return {"document": {"openapi": "3.0.3", "paths": {}}}
+
+
+def _openapi_activate_payload():
+    return {
+        "spec_id": "quick-spec-a",
+        "revision": 1,
+        "expected_config_version": 2,
+        "analysis_digest": "a" * 64,
+        "credentials": {"api_key": "credential-secret"},
+        "enabled_write_tools": ["items.create"],
+    }
+
+
 def test_tenant_domain_verification_cannot_cross_connection_owner(monkeypatch):
     client = _client(monkeypatch)
     monkeypatch.setattr(
@@ -146,6 +161,16 @@ _BODY_SURFACE = (
         "post",
         "/tenant/connections/conn-a/specs/import",
         {"document": {}, "spec_id": "spec-a", "revision": 1},
+    ),
+    (
+        "post",
+        "/tenant/connections/conn-a/openapi/analyze",
+        _openapi_analyze_payload(),
+    ),
+    (
+        "post",
+        "/tenant/connections/conn-a/openapi/activate",
+        _openapi_activate_payload(),
     ),
 )
 
@@ -274,6 +299,8 @@ def test_hostile_origin_rejects_every_mutation_before_domain_or_side_effect(
         "delete_connection_spec_use_case",
         "publish_connection_spec_use_case",
         "activate_connection_spec_use_case",
+        "analyze_openapi_connection_use_case",
+        "activate_openapi_connection_use_case",
     )
     for name in use_cases:
         monkeypatch.setattr(
@@ -359,6 +386,71 @@ def test_existing_tenant_connection_list_uses_session_scope(monkeypatch):
     assert response.status_code == 200
     assert response.json() == {"items": []}
     assert calls == ["tenant-a"]
+
+
+def test_tenant_openapi_analyze_adapts_session_scope_and_body(monkeypatch):
+    calls = []
+
+    def analyze(tenant_id, connection_id, body, request):
+        calls.append((tenant_id, connection_id, body, request))
+        return {"status": "published"}
+
+    monkeypatch.setattr(
+        admin_connections,
+        "analyze_openapi_connection_use_case",
+        analyze,
+    )
+
+    response = _client(monkeypatch).post(
+        "/tenant/connections/conn-a/openapi/analyze",
+        json=_openapi_analyze_payload(),
+    )
+
+    assert response.status_code == 200
+    assert response.json() == {"status": "published"}
+    assert len(calls) == 1
+    tenant_id, connection_id, body, request = calls[0]
+    assert tenant_id == "tenant-a"
+    assert connection_id == "conn-a"
+    assert isinstance(body, admin_connections.OpenApiAnalyzeRequest)
+    assert body.document == _openapi_analyze_payload()["document"]
+    assert request.url.path == "/tenant/connections/conn-a/openapi/analyze"
+
+
+def test_tenant_openapi_activate_awaits_shared_use_case_with_session_scope(
+    monkeypatch,
+):
+    calls = []
+
+    async def activate(tenant_id, connection_id, body, request):
+        calls.append((tenant_id, connection_id, body, request))
+        return {"status": "active"}
+
+    monkeypatch.setattr(
+        admin_connections,
+        "activate_openapi_connection_use_case",
+        activate,
+    )
+
+    response = _client(monkeypatch).post(
+        "/tenant/connections/conn-a/openapi/activate",
+        json=_openapi_activate_payload(),
+    )
+
+    assert response.status_code == 200
+    assert response.json() == {"status": "active"}
+    assert len(calls) == 1
+    tenant_id, connection_id, body, request = calls[0]
+    assert tenant_id == "tenant-a"
+    assert connection_id == "conn-a"
+    assert isinstance(body, admin_connections.OpenApiActivateRequest)
+    assert body.spec_id == "quick-spec-a"
+    assert body.revision == 1
+    assert body.expected_config_version == 2
+    assert body.analysis_digest == "a" * 64
+    assert body.credentials == {"api_key": "credential-secret"}
+    assert body.enabled_write_tools == ["items.create"]
+    assert request.url.path == "/tenant/connections/conn-a/openapi/activate"
 
 
 def test_tenant_validation_returns_shared_safe_operation_catalog(monkeypatch):

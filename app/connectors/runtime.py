@@ -382,9 +382,13 @@ class ConnectorRuntime:
         context: ConnectionContext,
         tool_key: str,
         args: dict[str, Any],
+        *,
+        bypass_cache: bool = False,
     ) -> ExecutionResult:
         if not isinstance(args, dict):
             raise TypeError("args must be a dict")
+        if not isinstance(bypass_cache, bool):
+            raise TypeError("bypass_cache must be a bool")
         if context.connection.status != "active":
             raise ConnectionUnavailableError("connection is unavailable")
 
@@ -437,7 +441,12 @@ class ConnectorRuntime:
         started_at = self._clock()
         try:
             result = await asyncio.wait_for(
-                self._execute_with_data_mode(context, tool, args),
+                self._execute_with_data_mode(
+                    context,
+                    tool,
+                    args,
+                    bypass_cache=bypass_cache,
+                ),
                 timeout=resolved_policy.timeout_ms / 1000,
             )
             if not isinstance(result, ExecutionResult):
@@ -474,13 +483,19 @@ class ConnectorRuntime:
         context: ConnectionContext,
         tool: ToolSpec,
         args: dict[str, Any],
+        *,
+        bypass_cache: bool = False,
     ) -> ExecutionResult:
         spec = self._connector_resolver.spec_for(context)
         if context.data_mode not in spec.supports_data_modes:
             raise UnsupportedDataModeError("connection data mode is not supported")
         # Stored reads already come from the connection's local projection;
         # caching them again only risks serving rows past a completed sync.
-        if not self._is_cacheable(tool) or context.data_mode == "stored":
+        if (
+            bypass_cache
+            or not self._is_cacheable(tool)
+            or context.data_mode == "stored"
+        ):
             return await self._execute_uncached(context, tool, args)
 
         # Only the successful projection is retained.  ``ConnectionCache``
