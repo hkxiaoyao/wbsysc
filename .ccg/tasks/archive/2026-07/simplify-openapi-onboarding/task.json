@@ -1,0 +1,13 @@
+{
+  "id": "simplify-openapi-onboarding",
+  "title": "评估并设计更简单的 OpenAPI 接入方式",
+  "status": "completed",
+  "complexity": "M",
+  "risk": "medium",
+  "domain": "architecture",
+  "currentPhase": "completed",
+  "nextAction": "none",
+  "createdAt": "2026-07-30T23:37:25+08:00",
+  "updatedAt": "2026-07-30T23:48:30+08:00",
+  "branch": "main"
+}
