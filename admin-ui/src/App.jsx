@@ -6,7 +6,7 @@ import Tenants from './pages/Tenants.jsx'
 import Connections from './pages/Connections.jsx'
 import { parseLogLocation, serializeLogFilters } from './pages/mcpLogsView.js'
 import { parseConnectionLocation, serializeConnectionLocation } from './pages/connectionView.js'
-import api, { getToken, setToken, clearToken } from './api.js'
+import api, { getToken, setToken, clearToken, subscribeAdminSessionExpired } from './api.js'
 
 const { Header, Content } = Layout
 
@@ -50,6 +50,10 @@ export default function App() {
     const restoreLocation = () => setLocationState(readAdminLocation())
     window.addEventListener('popstate', restoreLocation)
     return () => window.removeEventListener('popstate', restoreLocation)
+  }, [])
+
+  useEffect(() => {
+    return subscribeAdminSessionExpired(() => setAuthed(false))
   }, [])
 
   const onLogin = (token) => {
