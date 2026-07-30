@@ -1,0 +1,13 @@
+{
+  "id": "diagnose-openapi-connector-401",
+  "title": "诊断 OpenAPI 连接器创建请求返回 401",
+  "status": "completed",
+  "complexity": "M",
+  "risk": "high",
+  "domain": "fullstack",
+  "currentPhase": "completed",
+  "nextAction": "none",
+  "createdAt": "2026-07-30T21:34:26+08:00",
+  "updatedAt": "2026-07-30T22:23:12+08:00",
+  "branch": "main"
+}
