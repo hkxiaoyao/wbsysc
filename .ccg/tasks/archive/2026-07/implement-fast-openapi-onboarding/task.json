@@ -1,0 +1,13 @@
+{
+  "id": "implement-fast-openapi-onboarding",
+  "title": "实现 OpenAPI 极速接入第一期",
+  "status": "completed",
+  "complexity": "L+",
+  "risk": "high",
+  "domain": "fullstack",
+  "currentPhase": "completed",
+  "nextAction": "归档任务并提交变更",
+  "createdAt": "2026-07-30T23:50:39+08:00",
+  "updatedAt": "2026-07-31T01:18:00+08:00",
+  "branch": "main"
+}
