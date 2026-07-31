@@ -1,0 +1,13 @@
+{
+  "id": "push-and-deploy-openapi-onboarding",
+  "title": "推送并部署 OpenAPI 极速接入",
+  "status": "completed",
+  "complexity": "M",
+  "risk": "high",
+  "domain": "devops",
+  "currentPhase": "completed",
+  "nextAction": "无，任务已完成并归档",
+  "createdAt": "2026-07-31T01:25:00+08:00",
+  "updatedAt": "2026-07-31T10:15:00+08:00",
+  "branch": "main"
+}
